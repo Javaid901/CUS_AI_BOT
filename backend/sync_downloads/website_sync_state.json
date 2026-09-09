@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "hours": 0,
+  "last_counts": null,
+  "last_run_at": null,
+  "next_run_at": null,
+  "runtime": {
+    "message": "Idle",
+    "progress": null,
+    "state": "Disconnected"
+  },
+  "schedule": "disabled"
+}

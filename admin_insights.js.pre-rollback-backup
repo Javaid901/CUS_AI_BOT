@@ -1,0 +1,1598 @@
+(function () {
+  "use strict";
+
+  if (!window.CUS_API_BASE) throw new Error("CUS_API_BASE not defined");
+  var API = window.CUS_API_BASE;
+  var BASE = API + "/api/admin/analytics";
+
+  var COLORS = ["#0F5132","#145A32","#1E7E34","#28A745","#34CE7C","#6FCF97","#A3E4C4","#C8E6D3","#E8F5E9","#FFF3CD","#FED7AA","#FB923C","#FDBA74","#F97316","#DC2626","#991B1B"];
+
+var token = localStorage.getItem("cus_admin_token") || null;
+  var deleting = false;
+  var bulkDeleting = false;
+  function authHeaders() { var h = {}; if (token) h.Authorization = "Bearer " + token; return h }
+  function log(m) { console.log("[CUS-Insights] " + m); }
+
+  // ===== Toast notifications =====
+  var toastContainer = document.getElementById("toastContainer");
+  function toast(msg, type) {
+    type = type || "info";
+    var icons = { success: "\u2705", error: "\u274c", info: "\u2139\ufe0f", warning: "\u26a0\ufe0f" };
+    var el = document.createElement("div");
+    el.className = "toast toast-" + type;
+    el.innerHTML = '<span class="toast-icon">' + (icons[type] || "") + '</span><span>' + esc(msg) + '</span><button class="toast-close">&times;</button>';
+    el.querySelector(".toast-close").onclick = function () { removeToast(el); };
+    if (toastContainer) toastContainer.appendChild(el);
+    setTimeout(function () { removeToast(el); }, type === "error" ? 6000 : 3500);
+  }
+  function removeToast(el) {
+    if (el.classList.contains("removing")) return;
+    el.classList.add("removing");
+    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 300);
+  }
+
+  var _charts = {};
+  function destroyChart(id) { if (_charts[id]) { try { _charts[id].destroy(); } catch(e) {} delete _charts[id]; } }
+
+  function fetchJSON(url, options) {
+    options = options || {};
+    var headers = { ...authHeaders() };
+    if (options.headers) {
+      headers = { ...headers, ...options.headers };
+    }
+    log((options.method || "GET") + " " + url);
+    return fetch(url, { ...options, headers: headers }).then(function (r) {
+      if (r.status === 401) { log("Unauthorized, reloading"); window.location.reload(); throw new Error("Unauthorized"); }
+      if (!r.ok) { log("HTTP " + r.status + " for " + url); throw new Error("HTTP " + r.status); }
+      return r.json();
+    });
+  }
+
+  function resolveGap(gapId) {
+    if (!confirm("Resolve this knowledge gap?")) return;
+    fetchJSON(BASE + "/knowledge-gaps/" + gapId + "/resolve", {
+      method: "POST",
+      headers: authHeaders()
+    }).then(function (result) {
+      log("Resolved gap: " + gapId);
+      loadGaps(getPeriod());
+    }).catch(function (err) {
+      alert("Resolve failed: " + err.message);
+    });
+  }
+
+  // ========== Empty state renderer ==========
+  function emptyState(id, msg) {
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = '<div class="insight-empty"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#aaa" stroke-width="1.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg><p>' + (msg || "No analytics available yet. Data will appear once users interact with the chatbot.") + '</p></div>';
+  }
+
+  function showLoading(id) {
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = '<div class="insight-loading"><div class="spinner"></div><span>Loading analytics…</span></div>';
+  }
+
+  // ========== Initialize ==========
+  var initialized = false;
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    log("Initializing AI Insights dashboard");
+
+    // Sub-navigation
+    var navBtns = document.querySelectorAll(".insight-nav-btn");
+    navBtns.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        navBtns.forEach(function (b) { b.classList.remove("active"); b.style.background = "transparent"; b.style.color = "var(--text)"; b.style.borderColor = "var(--border)"; });
+        btn.classList.add("active"); btn.style.background = "var(--green)"; btn.style.color = "#fff"; btn.style.borderColor = "var(--green)";
+        document.querySelectorAll(".insight-section").forEach(function (s) { s.style.display = "none"; });
+        var sid = "insightSection" + btn.dataset.section.charAt(0).toUpperCase() + btn.dataset.section.slice(1);
+        var sec = document.getElementById(sid);
+        if (sec) sec.style.display = "block";
+        loadSection(btn.dataset.section);
+      });
+    });
+
+    // Period
+    var ps = document.getElementById("insightPeriod");
+    if (ps) ps.addEventListener("change", function () {
+      var a = document.querySelector(".insight-nav-btn.active");
+      if (a) loadSection(a.dataset.section);
+    });
+
+    // Filter
+    document.querySelectorAll(".insight-filter-btn").forEach(function (b) {
+      b.addEventListener("click", function () {
+        document.querySelectorAll(".insight-filter-btn").forEach(function (x) { x.classList.remove("active"); });
+        b.classList.add("active");
+        var a = document.querySelector(".insight-nav-btn.active");
+        if (a) loadSection(a.dataset.section);
+      });
+    });
+
+    // Search
+    var sb = document.getElementById("insightSearchBtn");
+    if (sb) sb.addEventListener("click", function () { doSearch(); });
+    var si = document.getElementById("insightSearchInput");
+    if (si) si.addEventListener("keydown", function (e) { if (e.key === "Enter") doSearch(); });
+
+    // Export
+    var eb = document.getElementById("insightExportBtn");
+    if (eb) eb.addEventListener("click", doExport);
+    var ef = document.getElementById("insightExportFormat");
+    if (ef) ef.addEventListener("change", doExport);
+
+    // Load overview
+    loadSection("overview");
+  }
+
+  function getPeriod() {
+    var s = document.getElementById("insightPeriod");
+    return s ? s.value : "month";
+  }
+
+  function loadSection(section) {
+    var period = getPeriod();
+    var map = {
+      overview: loadOverview,
+      trending: loadTrending,
+      courses: loadCourses,
+      colleges: loadColleges,
+      services: loadServices,
+      knowledge: loadKnowledge,
+      gaps: loadGaps,
+      conversations: loadConversations,
+      queries: loadQueries,
+      performance: loadPerformance,
+      insights: loadInsights,
+    };
+    window._insightLoaders = map;
+    if (map[section]) map[section](period);
+  }
+
+  // ===================================================================
+  // 1. OVERVIEW
+  // ===================================================================
+  function loadOverview() {
+    showLoading("overviewContent");
+    var html = "";
+    fetchJSON(BASE + "/overview?period=all").then(function (data) {
+      var periods = ["today","week","month","year"];
+      var labels = {today:"Today",week:"This Week",month:"This Month",year:"This Year"};
+      html = '<div class="insight-overview-grid">';
+      var hasAny = false;
+      periods.forEach(function (p) {
+        var d = data[p] || {};
+        if (d.total_messages > 0) hasAny = true;
+        html += '<div class="admin-card insight-period-card">';
+        html += '<h3 class="insight-period-title">' + labels[p] + '</h3><div class="kpi">';
+        html += '<div class="box"><div class="n">' + (d.total_messages||0) + '</div><div class="l">Messages</div></div>';
+        html += '<div class="box"><div class="n">' + (d.unique_sessions||0) + '</div><div class="l">Sessions</div></div>';
+        html += '<div class="box"><div class="n">' + (d.avg_response_time_ms||0) + 'ms</div><div class="l">Avg Response</div></div>';
+        html += '<div class="box"><div class="n">' + (d.service_requests||0) + '</div><div class="l">Services</div></div>';
+        html += '</div><div class="kpi">';
+        html += '<div class="box"><div class="n">' + (d.rag_requests||0) + '</div><div class="l">RAG</div></div>';
+        html += '<div class="box"><div class="n">' + (d.cache_hit_ratio ? Math.round(d.cache_hit_ratio*100)+"%" : "0%") + '</div><div class="l">Cache</div></div>';
+        html += '<div class="box"><div class="n">' + (d.completion_rate ? Math.round(d.completion_rate*100)+"%" : "0%") + '</div><div class="l">Completed</div></div>';
+        html += '<div class="box"><div class="n">' + (d.query_corrections||0) + '</div><div class="l">Corrections</div></div>';
+        html += '</div></div>';
+      });
+      html += '</div>';
+
+      if (!hasAny) {
+        html += '<div class="admin-card"><div class="insight-empty"><p>No analytics data yet. Analytics will appear once users interact with the chatbot.</p></div></div>';
+      }
+
+      // Charts from /charts endpoint
+      fetchJSON(BASE + "/charts?period=" + getPeriod()).then(function (chartData) {
+        html += renderOverviewCharts(chartData);
+        document.getElementById("overviewContent").innerHTML = html;
+        renderCharts("overview", chartData);
+      }).catch(function () {
+        document.getElementById("overviewContent").innerHTML = html;
+      });
+
+    }).catch(function (err) {
+      html = '<div class="admin-card"><div class="insight-empty"><p>Could not load analytics data. ' + err.message + '</p></div></div>';
+      document.getElementById("overviewContent").innerHTML = html;
+    });
+  }
+
+  function renderOverviewCharts(data) {
+    if (!data || !data.daily_conversations || !data.daily_conversations.length) return '';
+    return '<div class="charts-row">' +
+      '<div class="admin-card chart-card"><h3>Daily Conversations</h3><div class="chart-container"><canvas id="chartDailyLine" height="220"></canvas></div></div>' +
+      '<div class="admin-card chart-card"><h3>Hourly Activity</h3><div class="chart-container"><canvas id="chartHourlyBar" height="220"></canvas></div></div>' +
+      '</div>' +
+      '<div class="charts-row">' +
+      '<div class="admin-card chart-card-sm"><h3>Query Sources</h3><div class="chart-container-sm"><canvas id="chartSourcesPie" height="220"></canvas></div></div>' +
+      '<div class="admin-card chart-card-sm"><h3>Response Performance</h3><div class="chart-container-sm"><canvas id="chartPerfBar" height="220"></canvas></div></div>' +
+      '</div>';
+  }
+
+  function renderCharts(prefix, data) {
+    if (!data) return;
+    // Daily line chart
+    var daily = data.daily_conversations || [];
+    if (daily.length) {
+      destroyChart("chartDailyLine");
+      var c1 = document.getElementById("chartDailyLine");
+      if (c1) {
+        _charts["chartDailyLine"] = new Chart(c1.getContext("2d"), {
+          type: "line",
+          data: {
+            labels: daily.map(function(d){return d.date ? d.date.slice(5) : "";}),
+            datasets: [
+              { label: "Messages", data: daily.map(function(d){return d.messages||0;}), borderColor: COLORS[0], backgroundColor: COLORS[0]+"22", fill: true, tension: 0.3, pointRadius: 2 },
+            ]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, grid: { color: "#eee" } }, x: { grid: { display: false }, ticks: { maxTicksLimit: 10, font: { size: 10 } } } }
+          }
+        });
+      }
+    }
+    // Hourly bar
+    var hourly = data.hourly_activity || [];
+    if (hourly.length) {
+      destroyChart("chartHourlyBar");
+      var c2 = document.getElementById("chartHourlyBar");
+      if (c2) {
+        _charts["chartHourlyBar"] = new Chart(c2.getContext("2d"), {
+          type: "bar",
+          data: {
+            labels: hourly.map(function(d){return d.hour + ":00";}),
+            datasets: [{ label: "Messages", data: hourly.map(function(d){return d.count||0;}), backgroundColor: COLORS[4] }]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, grid: { color: "#eee" } }, x: { grid: { display: false }, ticks: { maxTicksLimit: 12, font: { size: 9 } } } }
+          }
+        });
+      }
+    }
+    // Sources pie
+    var sources = data.query_distribution || [];
+    if (sources.length) {
+      destroyChart("chartSourcesPie");
+      var c3 = document.getElementById("chartSourcesPie");
+      if (c3) {
+        _charts["chartSourcesPie"] = new Chart(c3.getContext("2d"), {
+          type: "doughnut",
+          data: {
+            labels: sources.map(function(s){return s.source;}),
+            datasets: [{ data: sources.map(function(s){return s.count;}), backgroundColor: COLORS }]
+          },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "right", labels: { boxWidth: 10, padding: 6, font: { size: 10 } } } } }
+        });
+      }
+    }
+    // Perf bar
+    var perf = data.performance || {};
+    if (perf.total_samples > 0) {
+      destroyChart("chartPerfBar");
+      var c4 = document.getElementById("chartPerfBar");
+      if (c4) {
+        _charts["chartPerfBar"] = new Chart(c4.getContext("2d"), {
+          type: "bar",
+          data: {
+            labels: ["Avg", "P50", "P90", "P99"],
+            datasets: [{ label: "ms", data: [perf.avg_response_time_ms||0, perf.p50||0, perf.p90||0, perf.p99||0], backgroundColor: COLORS.slice(0,4) }]
+          },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+        });
+      }
+    }
+  }
+
+  // ===================================================================
+  // 2. TRENDING (Master Activity/Query Log)
+  // ===================================================================
+  var _trendingState = {
+    page: 1,
+    pageSize: 50,
+    totalPages: 1,
+    total: 0,
+    filters: {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    },
+    logs: [],
+    selectedLogs: new Set(),
+  };
+
+  // ===================================================================
+  // Queries Log State
+  // ===================================================================
+  var _queriesLogState = {
+    page: 1,
+    pageSize: 50,
+    totalPages: 1,
+    total: 0,
+    filters: {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    },
+    logs: [],
+    selectedLogs: new Set(),
+  };
+
+  function loadTrending(period) {
+    _trendingState.filters = {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    };
+    _trendingState.page = 1;
+    _trendingState.selectedLogs.clear();
+    loadTrendingLogs(period);
+    loadTrendingSummary(period);
+  }
+
+  function loadTrendingSummary(period) {
+    // Load the existing trending summary (topics, programmes, etc.)
+    fetchJSON(BASE + "/trending?period=" + period + "&limit=20").then(function (data) {
+      var html = '<div class="insight-columns">';
+      html += '<div class="admin-card"><h3>Top Topics</h3>' + renderBarList(data.topics, "term", "count") + '</div>';
+      html += '<div class="admin-card"><h3>Top Programmes</h3>' + renderBarList(data.programmes, "term", "count") + '</div>';
+      html += '<div class="admin-card"><h3>Top Colleges</h3>' + renderBarList(data.colleges, "term", "count") + '</div>';
+      html += '<div class="admin-card"><h3>Top Services</h3>' + renderBarList(data.services, "term", "count") + '</div>';
+      html += '</div>';
+      document.getElementById("trendingSummary").innerHTML = html;
+    }).catch(function () {
+      document.getElementById("trendingSummary").innerHTML = '<div class="admin-card"><div class="insight-empty"><p>Could not load trending summary.</p></div></div>';
+    });
+  }
+
+  function loadTrendingLogs(period) {
+    showLoading("trendingLogsContent");
+    var params = new URLSearchParams();
+    params.append("period", period);
+    params.append("page", _trendingState.page);
+    params.append("page_size", _trendingState.pageSize);
+    var f = _trendingState.filters;
+    if (f.search) params.append("search", f.search);
+    if (f.activity_type) params.append("activity_type", f.activity_type);
+    if (f.result_status) params.append("result_status", f.result_status);
+    if (f.category) params.append("category", f.category);
+    if (f.programme) params.append("programme", f.programme);
+    if (f.college) params.append("college", f.college);
+    if (f.service) params.append("service", f.service);
+    if (f.date_from) params.append("date_from", f.date_from);
+    if (f.date_to) params.append("date_to", f.date_to);
+
+    fetchJSON(BASE + "/logs?" + params.toString()).then(function (data) {
+      _trendingState.logs = data.logs || [];
+      _trendingState.total = data.total || 0;
+      _trendingState.totalPages = data.total_pages || 1;
+      _trendingState.page = data.page || 1;
+
+      renderTrendingLogs(data);
+      renderTrendingPagination();
+    }).catch(function (err) {
+      emptyState("trendingLogsContent", "Could not load activity log: " + err.message);
+    });
+  }
+
+  function renderTrendingLogs(data) {
+    var logs = data.logs || [];
+    var html = '';
+
+    // Filters bar
+    html += '<div class="admin-card trending-filters">';
+    html += '<div class="filter-row">';
+    html += '<input type="text" id="trendingSearchInput" placeholder="Search queries..." class="filter-input" style="flex:1; max-width:300px;">';
+    html += '<select id="trendingTypeFilter" class="filter-select"><option value="">All Types</option><option value="rag">Knowledge Query</option><option value="structured">Structured Lookup</option><option value="connector">Student Service</option><option value="navigation">Navigation</option><option value="authority">Authority Referral</option><option value="grievance">Grievance</option><option value="catalogue">Catalogue</option><option value="news">News</option><option value="welcome">Welcome</option><option value="clarification">Clarification</option></select>';
+    html += '<select id="trendingResultFilter" class="filter-select"><option value="">All Results</option><option value="knowledge_gap">Knowledge Gap</option><option value="answered">Answered</option><option value="completed">Completed</option><option value="unanswered">Unanswered</option><option value="abandoned">Abandoned</option></select>';
+    html += '<select id="trendingCategoryFilter" class="filter-select"><option value="">All Categories</option><option value="courses">Courses</option><option value="colleges">Colleges</option><option value="services">Services</option><option value="authorities">Authorities</option><option value="knowledge">Knowledge</option><option value="gaps">Gaps</option></select>';
+    html += '<input type="date" id="trendingDateFrom" class="filter-input" style="width:140px;">';
+    html += '<input type="date" id="trendingDateTo" class="filter-input" style="width:140px;">';
+    html += '<button class="btn sm green" onclick="applyTrendingFilters()">Apply</button>';
+    html += '<button class="btn sm" onclick="clearTrendingFilters()">Clear</button>';
+    html += '</div>';
+    html += '<div class="filter-row" style="margin-top:8px;">';
+    html += '<span class="filter-label">Page size:</span>';
+    html += '<select id="trendingPageSize" class="filter-select" style="width:80px;"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select>';
+    html += '<span class="filter-label" style="margin-left:16px;">' + _trendingState.total + ' total logs</span>';
+    if (_trendingState.selectedLogs.size > 0) {
+      html += '<span class="filter-label" style="margin-left:16px;color:var(--green);">' + _trendingState.selectedLogs.size + ' selected</span>';
+      html += '<button class="btn sm red" style="margin-left:8px;" onclick="deleteSelectedTrendingLogs()">Delete Selected</button>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    // Logs table
+    html += '<div class="admin-card trending-logs-table-wrapper">';
+    if (logs.length === 0) {
+      html += '<div class="insight-empty"><p>No activity logs found for the current filters.</p></div>';
+    } else {
+      html += '<table class="insight-table trending-logs-table">';
+      html += '<thead><tr>';
+      html += '<th style="width:40px;"><input type="checkbox" id="trendingSelectAll" onchange="toggleTrendingSelectAll(this)"></th>';
+      html += '<th>Time</th><th>Type</th><th>Query / Action</th><th>Category</th><th>Programme</th><th>Result</th><th>Time (ms)</th><th style="width:40px;">Actions</th>';
+      html += '</tr></thead><tbody>';
+      logs.forEach(function (log) {
+        var isSelected = _trendingState.selectedLogs.has(log.id);
+        html += '<tr' + (isSelected ? ' class="selected"' : '') + ' data-log-id="' + esc(log.id) + '">';
+        html += '<td><input type="checkbox" class="trending-row-checkbox" value="' + esc(log.id) + '"' + (isSelected ? ' checked' : '') + ' onchange="toggleTrendingRowSelect(this)"></td>';
+        html += '<td>' + esc(log.time_display) + '</td>';
+        html += '<td><span class="badge badge-' + getBadgeClass(log.activity_type) + '">' + esc(log.activity_label) + '</span></td>';
+        html += '<td class="query-cell">' + esc(log.query_text || log.activity_label) + '</td>';
+        html += '<td>' + esc(log.category) + '</td>';
+        html += '<td>' + esc(log.programme || "–") + '</td>';
+        html += '<td><span class="badge badge-' + getResultBadgeClass(log.result_status) + '">' + esc(log.result_status) + '</span></td>';
+        html += '<td>' + (log.response_time_ms ? log.response_time_ms + "ms" : "–") + '</td>';
+        html += '<td><button class="btn sm red" onclick="deleteTrendingLogDetail(\'' + esc(log.id) + '\')" title="Delete log">🗑</button></td>';
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+
+    document.getElementById("trendingLogsContent").innerHTML = html;
+
+    // Bind filter events
+    bindTrendingFilterEvents();
+  }
+
+  function renderTrendingPagination() {
+    var html = '<div class="trending-pagination">';
+    if (_trendingState.totalPages <= 1) {
+      document.getElementById("trendingPagination").innerHTML = "";
+      return;
+    }
+    html += '<button class="btn sm" onclick="changeTrendingPage(' + (_trendingState.page - 1) + ')"' + (_trendingState.page <= 1 ? ' disabled' : '') + '>Previous</button>';
+    html += '<span class="page-info">Page ' + _trendingState.page + ' of ' + _trendingState.totalPages + '</span>';
+    html += '<button class="btn sm" onclick="changeTrendingPage(' + (_trendingState.page + 1) + ')"' + (_trendingState.page >= _trendingState.totalPages ? ' disabled' : '') + '>Next</button>';
+    document.getElementById("trendingPagination").innerHTML = html;
+  }
+
+  function bindTrendingFilterEvents() {
+    var searchInput = document.getElementById("trendingSearchInput");
+    if (searchInput) {
+      searchInput.addEventListener("keydown", function (e) { if (e.key === "Enter") applyTrendingFilters(); });
+    }
+    document.getElementById("trendingTypeFilter").addEventListener("change", applyTrendingFilters);
+    document.getElementById("trendingResultFilter").addEventListener("change", applyTrendingFilters);
+    document.getElementById("trendingCategoryFilter").addEventListener("change", applyTrendingFilters);
+    document.getElementById("trendingDateFrom").addEventListener("change", applyTrendingFilters);
+    document.getElementById("trendingDateTo").addEventListener("change", applyTrendingFilters);
+    document.getElementById("trendingPageSize").addEventListener("change", function (e) {
+      _trendingState.pageSize = parseInt(e.target.value);
+      _trendingState.page = 1;
+      loadTrendingLogs(getPeriod());
+    });
+    var selectAll = document.getElementById("trendingSelectAll");
+    if (selectAll) {
+      selectAll.addEventListener("change", function (e) {
+        document.querySelectorAll(".trending-row-checkbox").forEach(function (cb) {
+          cb.checked = e.target.checked;
+          toggleTrendingRowSelect(cb);
+        });
+      });
+    }
+  }
+
+  function applyTrendingFilters() {
+    _trendingState.filters.search = document.getElementById("trendingSearchInput").value.trim();
+    _trendingState.filters.activity_type = document.getElementById("trendingTypeFilter").value;
+    _trendingState.filters.result_status = document.getElementById("trendingResultFilter").value;
+    _trendingState.filters.category = document.getElementById("trendingCategoryFilter").value;
+    _trendingState.filters.date_from = document.getElementById("trendingDateFrom").value;
+    _trendingState.filters.date_to = document.getElementById("trendingDateTo").value;
+    _trendingState.page = 1;
+    loadTrendingLogs(getPeriod());
+  }
+
+  function clearTrendingFilters() {
+    _trendingState.filters = {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    };
+    _trendingState.page = 1;
+    document.getElementById("trendingSearchInput").value = "";
+    document.getElementById("trendingTypeFilter").value = "";
+    document.getElementById("trendingResultFilter").value = "";
+    document.getElementById("trendingCategoryFilter").value = "";
+    document.getElementById("trendingDateFrom").value = "";
+    document.getElementById("trendingDateTo").value = "";
+    loadTrendingLogs(getPeriod());
+  }
+
+  function changeTrendingPage(page) {
+    if (page < 1 || page > _trendingState.totalPages) return;
+    _trendingState.page = page;
+    loadTrendingLogs(getPeriod());
+  }
+
+  function toggleTrendingSelectAll(headerCheckbox) {
+    var checked = headerCheckbox.checked;
+    document.querySelectorAll(".trending-row-checkbox").forEach(function (cb) {
+      cb.checked = checked;
+      toggleTrendingRowSelect(cb);
+    });
+  }
+
+  function toggleTrendingRowSelect(checkbox) {
+    var id = checkbox.value;
+    var row = checkbox.closest("tr");
+    if (checkbox.checked) {
+      _trendingState.selectedLogs.add(id);
+      if (row) row.classList.add("selected");
+    } else {
+      _trendingState.selectedLogs.delete(id);
+      if (row) row.classList.remove("selected");
+    }
+    var headerCheckbox = document.getElementById("trendingSelectAll");
+    if (headerCheckbox) {
+      var allChecked = document.querySelectorAll(".trending-row-checkbox:checked").length === document.querySelectorAll(".trending-row-checkbox").length;
+      headerCheckbox.checked = allChecked;
+    }
+    updateSelectedCountDisplay();
+  }
+
+  function updateSelectedCountDisplay() {
+    var countEl = document.querySelector(".filter-label[style*='color:var(--green)']");
+    var deleteBtn = document.querySelector(".trending-filters .btn.red");
+    if (_trendingState.selectedLogs.size > 0) {
+      if (!countEl) {
+        // Will be added on next render
+      }
+      if (!deleteBtn) {
+        // Will be added on next render
+      }
+    } else {
+      if (countEl) countEl.remove();
+      if (deleteBtn) deleteBtn.remove();
+    }
+  }
+
+  function deleteSelectedTrendingLogs() {
+    if (_trendingState.selectedLogs.size === 0) return;
+    if (!confirm("Delete " + _trendingState.selectedLogs.size + " selected activity logs?")) return;
+    var ids = Array.from(_trendingState.selectedLogs);
+    fetchJSON(BASE + "/logs/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ ids: ids })
+    }).then(function (result) {
+      log("Deleted: " + result.deleted + ", Failed: " + result.failed);
+      _trendingState.selectedLogs.clear();
+      loadTrendingLogs(getPeriod());
+    }).catch(function (err) {
+      alert("Delete failed: " + err.message);
+    });
+  }
+
+  function viewTrendingLogDetail(logId) {
+    fetchJSON(BASE + "/logs/" + logId).then(function (detail) {
+      showTrendingLogDetailModal(detail);
+    }).catch(function (err) {
+      alert("Could not load log detail: " + err.message);
+    });
+  }
+
+  function deleteTrendingLogDetail(logId) {
+    if (!confirm("Delete this activity log?")) return;
+    fetchJSON(BASE + "/logs/" + logId, {
+      method: "DELETE",
+      headers: authHeaders()
+    }).then(function () {
+      log("Deleted log: " + logId);
+      loadTrendingLogs(getPeriod());
+    }).catch(function (err) {
+      alert("Delete failed: " + err.message);
+    });
+  }
+
+  function showTrendingLogDetailModal(detail) {
+    var html = '<div class="modal-overlay" onclick="closeTrendingLogDetailModal(event)">';
+    html += '<div class="modal-content" onclick="event.stopPropagation()">';
+    html += '<div class="modal-header"><h3>Activity Log Detail</h3><button class="modal-close" onclick="closeTrendingLogDetailModal()">✕</button></div>';
+    html += '<div class="modal-body">';
+    html += '<div class="detail-grid">';
+    html += '<div><strong>Time:</strong> ' + esc(detail.date_display + " " + detail.time_display) + '</div>';
+    html += '<div><strong>Type:</strong> <span class="badge badge-' + getBadgeClass(detail.activity_type) + '">' + esc(detail.activity_label) + '</span></div>';
+    html += '<div><strong>Query / Action:</strong> ' + esc(detail.query_text || detail.activity_label) + '</div>';
+    html += '<div><strong>Category:</strong> ' + esc(detail.category) + '</div>';
+    html += '<div><strong>Intent:</strong> ' + esc(detail.intent || "–") + '</div>';
+    html += '<div><strong>Programme:</strong> ' + esc(detail.programme || "–") + '</div>';
+    html += '<div><strong>College:</strong> ' + esc(detail.college || "–") + '</div>';
+    html += '<div><strong>Topic:</strong> ' + esc(detail.topic || "–") + '</div>';
+    html += '<div><strong>Service:</strong> ' + esc(detail.service || "–") + '</div>';
+    html += '<div><strong>Result:</strong> <span class="badge badge-' + getResultBadgeClass(detail.result_status) + '">' + esc(detail.result_status) + '</span></div>';
+    html += '<div><strong>Knowledge Gap:</strong> ' + (detail.knowledge_gap ? '<span class="badge badge-red">Yes</span>' : '<span class="badge badge-green">No</span>') + '</div>';
+    html += '<div><strong>Response Time:</strong> ' + (detail.response_time_ms ? detail.response_time_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>Planner Latency:</strong> ' + (detail.planner_latency_ms ? detail.planner_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>RAG Latency:</strong> ' + (detail.rag_latency_ms ? detail.rag_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>LLM Latency:</strong> ' + (detail.llm_latency_ms ? detail.llm_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>Session:</strong> ' + esc(detail.anon_session_id || "–") + '</div>';
+    html += '<div><strong>Conversation:</strong> ' + esc(detail.conversation_id || "–") + '</div>';
+    if (detail.knowledge_gap && detail.gap_info) {
+      html += '<hr style="margin:16px 0;">';
+      html += '<div><strong>Gap Type:</strong> ' + esc(detail.gap_info.gap_type) + '</div>';
+      html += '<div><strong>Frequency:</strong> ' + detail.gap_info.frequency + '</div>';
+      html += '<div><strong>Confidence:</strong> ' + (detail.gap_info.confidence_score != null ? Math.round(detail.gap_info.confidence_score * 100) + "%" : "–") + '</div>';
+      html += '<div><strong>Suggestion:</strong> ' + esc(detail.gap_info.suggestion || "–") + '</div>';
+    }
+    html += '</div>';
+    html += '<div class="modal-actions">';
+    html += '<button class="btn red" onclick="deleteTrendingLogDetail(\'' + esc(detail.id) + '\')">Delete Log</button>';
+    html += '<button class="btn" onclick="closeTrendingLogDetailModal()">Close</button>';
+    html += '</div>';
+    html += '</div></div>';
+    html += '</div>';
+
+    var container = document.getElementById("trendingLogDetailModal");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "trendingLogDetailModal";
+      document.body.appendChild(container);
+    }
+    container.innerHTML = html;
+    container.style.display = "flex";
+  }
+
+  window.closeTrendingLogDetailModal = function (e) {
+    if (e && e.target !== e.currentTarget) return;
+    var container = document.getElementById("trendingLogDetailModal");
+    if (container) container.style.display = "none";
+  };
+
+  function getBadgeClass(type) {
+    var map = {
+      "rag": "blue", "structured": "green", "llm": "purple", "connector": "orange",
+      "navigation": "gray", "authority": "red", "grievance": "red", "catalogue": "teal",
+      "news": "blue", "welcome": "gray", "clarification": "yellow", "comparison": "indigo",
+      "slot_fill": "pink", "authority": "red",
+    };
+    return map[type] || "gray";
+  }
+
+  function getResultBadgeClass(status) {
+    var map = {
+      "knowledge_gap": "red", "answered": "green", "completed": "green",
+      "unanswered": "orange", "abandoned": "red", "clarified": "blue",
+    };
+    return map[status] || "gray";
+  }
+
+  // ===================================================================
+  // Category Log Loader (shared by Courses, Colleges, Services, Knowledge, Gaps)
+  // ===================================================================
+  function loadCategoryLogs(containerId, period, category) {
+    var logContainer = document.createElement("div");
+    logContainer.id = containerId + "Logs";
+    logContainer.className = "category-logs";
+    logContainer.style.marginTop = "24px";
+
+    var targetContainer = document.getElementById(containerId);
+    if (targetContainer) {
+      targetContainer.appendChild(logContainer);
+    } else {
+      return;
+    }
+
+    showLoading(containerId + "Logs");
+
+    var params = new URLSearchParams();
+    params.append("period", period);
+    params.append("page", 1);
+    params.append("page_size", 20);
+    params.append("category", category);
+
+    fetchJSON(BASE + "/logs?" + params.toString()).then(function (data) {
+      var logs = data.logs || [];
+      var total = data.total || 0;
+
+      var html = '<div class="admin-card category-logs-card">';
+      html += '<h3>Recent ' + category.charAt(0).toUpperCase() + category.slice(1) + ' Activity (' + total + ' total)</h3>';
+
+      if (logs.length === 0) {
+        html += '<div class="insight-empty"><p>No ' + category + ' activity yet.</p></div>';
+      } else {
+        html += '<div class="category-logs-table-wrapper">';
+        html += '<table class="insight-table category-logs-table">';
+        html += '<thead><tr><th>Time</th><th>Type</th><th>Query / Action</th><th>Programme</th><th>Result</th><th>Time (ms)</th><th>Actions</th></tr></thead><tbody>';
+        logs.forEach(function (log) {
+          html += '<tr data-log-id="' + esc(log.id) + '">';
+          html += '<td>' + esc(log.time_display) + '</td>';
+          html += '<td><span class="badge badge-' + getBadgeClass(log.activity_type) + '">' + esc(log.activity_label) + '</span></td>';
+          html += '<td class="query-cell">' + esc(log.query_text || log.activity_label) + '</td>';
+          html += '<td>' + esc(log.programme || "–") + '</td>';
+          html += '<td><span class="badge badge-' + getResultBadgeClass(log.result_status) + '">' + esc(log.result_status) + '</span></td>';
+          html += '<td>' + (log.response_time_ms ? log.response_time_ms + "ms" : "–") + '</td>';
+html += '<td><button class="btn sm red" onclick="deleteTrendingLogDetail(\'' + esc(log.id) + '\')" title="Delete log">🗑</button></td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+        html += '</div>';
+      }
+      html += '</div>';
+
+      logContainer.innerHTML = html;
+    }).catch(function (err) {
+      var logContainer = document.getElementById(containerId + "Logs");
+      if (logContainer) {
+        logContainer.innerHTML = '<div class="admin-card"><div class="insight-empty"><p>Could not load ' + category + ' activity: ' + err.message + '</p></div></div>';
+      }
+    });
+  }
+
+  function renderTrendCharts(data) {
+    var topics = data.topics || [];
+    if (topics.length) {
+      destroyChart("trendTopicsBar");
+      var c = document.getElementById("trendTopicsBar");
+      if (c) {
+        _charts["trendTopicsBar"] = new Chart(c.getContext("2d"), {
+          type: "bar",
+          data: {
+            labels: topics.slice(0, 10).map(function(t){return fmt(t.term);}),
+            datasets: [{ label: "Count", data: topics.slice(0, 10).map(function(t){return t.count;}), backgroundColor: COLORS[3] }]
+          },
+          options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }
+        });
+      }
+    }
+    var progs = data.programmes || [];
+    if (progs.length) {
+      destroyChart("trendProgsBar");
+      var c = document.getElementById("trendProgsBar");
+      if (c) {
+        _charts["trendProgsBar"] = new Chart(c.getContext("2d"), {
+          type: "bar",
+          data: {
+            labels: progs.slice(0, 10).map(function(p){return p.term.toUpperCase();}),
+            datasets: [{ label: "Count", data: progs.slice(0, 10).map(function(p){return p.count;}), backgroundColor: COLORS[0] }]
+          },
+          options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }
+        });
+      }
+    }
+  }
+
+  // ===================================================================
+  // 3. COURSES (filtered activity log)
+  // ===================================================================
+  function loadCourses(period) {
+    showLoading("coursesContent");
+    // Keep the aggregate summary at top
+    fetchJSON(BASE + "/courses?period=" + period).then(function (data) {
+      var pms = data.most_searched_programmes || [];
+      var tbs = data.topic_breakdown || [];
+      var html = '<div class="insight-columns">';
+      html += '<div class="admin-card"><h3>Most Searched Programmes</h3>' + renderBarList(pms, "id", "count") + '</div>';
+      html += '<div class="admin-card"><h3>Topic Breakdown</h3>' + renderBarList(tbs, "topic", "count") + '</div>';
+      html += '</div>';
+      if (pms.length) {
+        html += '<div class="admin-card"><h3>Programme Distribution</h3><div class="chart-container-sm"><canvas id="coursePie" height="250"></canvas></div></div>';
+      }
+      document.getElementById("coursesContent").innerHTML = html;
+      if (pms.length) renderPie("coursePie", pms.slice(0, 8), "id", "count");
+    }).catch(function (err) {
+      emptyState("coursesContent", "Could not load course analytics: " + err.message);
+    });
+
+    // Load filtered activity log for courses
+    loadCategoryLogs("coursesContent", period, "courses");
+  }
+
+  // ===================================================================
+  // 4. COLLEGES (filtered activity log)
+  // ===================================================================
+  function loadColleges(period) {
+    showLoading("collegesContent");
+    fetchJSON(BASE + "/colleges?period=" + period).then(function (data) {
+      var colleges = data.colleges || [];
+      var html = '<div class="admin-card"><h3>College Query Volume</h3>';
+      if (colleges.length) {
+        html += renderBarList(colleges, "college", "queries");
+        html += '</div><div class="admin-card"><h3>Top Colleges</h3><div class="chart-container-sm"><canvas id="collegeChart" height="250"></canvas></div></div>';
+      } else {
+        html += '<div class="insight-empty"><p>No college data yet.</p></div></div>';
+      }
+      document.getElementById("collegesContent").innerHTML = html;
+      if (colleges.length) renderBar("collegeChart", colleges.slice(0, 10), "college", "queries", "Queries");
+    }).catch(function (err) {
+      emptyState("collegesContent", "Could not load college analytics: " + err.message);
+    });
+
+    // Load filtered activity log for colleges
+    loadCategoryLogs("collegesContent", period, "colleges");
+  }
+
+// ===================================================================
+  // 5. SERVICES (filtered activity log)
+  // ===================================================================
+  function loadServices(period) {
+    showLoading("servicesContent");
+    fetchJSON(BASE + "/services?period=" + period).then(function (data) {
+      var svcs = data.services || [];
+      var html = '<div class="admin-card"><h3>Service Usage</h3>';
+      if (svcs.length) {
+        html += '<table class="insight-table"><tr><th>Service</th><th>Requests</th><th>Success Rate</th><th>Avg Time</th></tr>';
+        svcs.forEach(function (s) { html += '<tr><td>' + esc(fmt(s.service)) + '</td><td>' + s.count + '</td><td>' + (s.success_rate ? Math.round(s.success_rate*100)+"%" : "–") + '</td><td>' + (s.avg_response_time_ms ? s.avg_response_time_ms+"ms" : "–") + '</td></tr>'; });
+        html += '</table></div>';
+        html += '<div class="admin-card"><div class="chart-container-sm"><canvas id="servicesChart" height="250"></canvas></div></div>';
+      } else {
+        html += '<div class="insight-empty"><p>No service usage data yet.</p></div></div>';
+      }
+      document.getElementById("servicesContent").innerHTML = html;
+      if (svcs.length) renderBar("servicesChart", svcs.slice(0, 10), "service", "count", "Requests");
+    }).catch(function (err) {
+      emptyState("servicesContent", "Could not load service analytics: " + err.message);
+    });
+
+    // Load filtered activity log for services
+    loadCategoryLogs("servicesContent", period, "services");
+  }
+
+  // ===================================================================
+  // 6. KNOWLEDGE (filtered activity log)
+  // ===================================================================
+  function loadKnowledge() {
+    showLoading("knowledgeContent");
+    fetchJSON(BASE + "/knowledge").then(function (data) {
+      var html = '<div class="kpi">';
+      html += '<div class="box"><div class="n">' + (data.total_rag_uses||0) + '</div><div class="l">RAG Requests</div></div>';
+      html += '<div class="box"><div class="n">' + (data.knowledge_sync_references||0) + '</div><div class="l">Sync References</div></div>';
+      html += '</div>';
+      // KB stats
+      fetchJSON(BASE + "/kb-stats").then(function (kb) {
+        html += '<div class="kpi">';
+        html += '<div class="box"><div class="n">' + (kb.documents||0) + '</div><div class="l">Documents</div></div>';
+        html += '<div class="box"><div class="n">' + (kb.chunks||0) + '</div><div class="l">Chunks</div></div>';
+        html += '<div class="box"><div class="n">' + (kb.vectors||0) + '</div><div class="l">Vectors</div></div>';
+        html += '</div>';
+        document.getElementById("knowledgeContent").innerHTML = html;
+      }).catch(function () {
+        document.getElementById("knowledgeContent").innerHTML = html;
+      });
+    }).catch(function (err) {
+      emptyState("knowledgeContent", "Could not load knowledge data: " + err.message);
+    });
+
+    // Load filtered activity log for knowledge
+    loadCategoryLogs("knowledgeContent", "month", "knowledge");
+  }
+
+  // ===================================================================
+  // 7. GAPS (filtered activity log)
+  // ===================================================================
+  function loadGaps() {
+    showLoading("gapsContent");
+    fetchJSON(BASE + "/knowledge-gaps?limit=50").then(function (data) {
+      var gaps = data || [];
+      var html = '';
+      if (!gaps.length) {
+        html = '<div class="admin-card"><div class="insight-empty"><p>No knowledge gaps detected yet. Gaps are identified when the chatbot cannot answer a question.</p></div></div>';
+      } else {
+        html = '<div class="admin-card"><h3>Unresolved Knowledge Gaps</h3>';
+        html += '<table class="insight-table"><tr><th>Type</th><th>Query</th><th>Freq</th><th>Confidence</th><th>Suggestion</th><th>Action</th></tr>';
+        gaps.forEach(function (g) {
+          html += '<tr><td>' + esc(g.gap_type) + '</td><td>' + esc(g.query_text||"") + '</td><td>' + g.frequency + '</td><td>' + (g.confidence_score != null ? Math.round(g.confidence_score*100)+"%" : "–") + '</td><td>' + esc(g.suggestion||"") + '</td>';
+          html += '<td><button class="btn sm green resolve-gap" data-gap-id="' + esc(g.id) + '">Resolve</button></td></tr>';
+        });
+        html += '</table></div>';
+      }
+      document.getElementById("gapsContent").innerHTML = html;
+      document.querySelectorAll(".resolve-gap").forEach(function (btn) {
+        btn.addEventListener("click", function () { window.resolveGap(btn.getAttribute("data-gap-id")); });
+      });
+    }).catch(function (err) {
+      emptyState("gapsContent", "Could not load knowledge gaps: " + err.message);
+    });
+
+    // Load filtered activity log for gaps
+    loadCategoryLogs("gapsContent", "month", "gaps");
+  }
+
+  // ===================================================================
+  // 8. CONVERSATIONS
+  // ===================================================================
+  function loadConversations(period) {
+    showLoading("conversationsContent");
+    fetchJSON(BASE + "/conversations?period=" + period).then(function (data) {
+      var html = '<div class="kpi">';
+      html += '<div class="box"><div class="n">' + (data.total_conversations||0) + '</div><div class="l">Conversations</div></div>';
+      html += '<div class="box"><div class="n">' + (data.avg_depth||0) + '</div><div class="l">Avg Depth</div></div>';
+      html += '<div class="box"><div class="n">' + (data.completion_rate ? Math.round(data.completion_rate*100)+"%" : "0%") + '</div><div class="l">Completed</div></div>';
+      html += '<div class="box"><div class="n">' + (data.total_clarifications||0) + '</div><div class="l">Clarifications</div></div>';
+      html += '<div class="box"><div class="n">' + (data.restarts||0) + '</div><div class="l">Restarts</div></div>';
+      html += '<div class="box"><div class="n">' + (data.abandoned||0) + '</div><div class="l">Abandoned</div></div>';
+      html += '</div>';
+      html += '<div class="admin-card"><div class="chart-container-sm"><canvas id="convChart" height="200"></canvas></div></div>';
+      document.getElementById("conversationsContent").innerHTML = html;
+      renderPie("convChart", [
+        {label:"Completed", val:data.completed||0},
+        {label:"Abandoned", val:data.abandoned||0},
+      ], "label", "val");
+    }).catch(function (err) {
+      emptyState("conversationsContent", "Could not load conversation data: " + err.message);
+    });
+  }
+
+  // ===================================================================
+  // 9. QUERIES
+  // ===================================================================
+  function loadQueries(period) {
+    showLoading("queriesContent");
+    fetchJSON(BASE + "/queries?period=" + period + "&limit=50").then(function (data) {
+      var html = '<div class="kpi">';
+      html += '<div class="box"><div class="n">' + (data.total_queries||0) + '</div><div class="l">Total Queries</div></div>';
+      html += '<div class="box"><div class="n">' + (data.corrected_queries||0) + '</div><div class="l">Corrected</div></div>';
+      html += '<div class="box"><div class="n">' + (data.correction_rate ? Math.round(data.correction_rate*100)+"%" : "0%") + '</div><div class="l">Correction Rate</div></div>';
+      html += '</div>';
+      var corrs = data.common_corrections || [];
+      if (corrs.length) {
+        html += '<div class="admin-card"><h3>Common Corrections</h3><table class="insight-table"><tr><th>Original</th><th>Count</th></tr>';
+        corrs.forEach(function (c) { html += '<tr><td>' + esc(c.original) + '</td><td>' + c.count + '</td></tr>'; });
+        html += '</table></div>';
+      } else {
+        html += '<div class="admin-card"><div class="insight-empty"><p>No query corrections recorded yet.</p></div></div>';
+      }
+
+      // Query / Activity Log section
+      html += '<div id="queriesLogContent" style="margin-top:24px;"></div>';
+
+      document.getElementById("queriesContent").innerHTML = html;
+
+      // Load the query/activity log
+      loadQueriesLog(period);
+    }).catch(function (err) {
+      emptyState("queriesContent", "Could not load query data: " + err.message);
+    });
+  }
+
+  function loadQueriesLog(period) {
+    // Reset filters on initial load
+    _queriesLogState.filters = {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    };
+    _queriesLogState.page = 1;
+    _queriesLogState.selectedLogs.clear();
+    fetchQueriesLogs(period);
+  }
+
+  function fetchQueriesLogs(period) {
+    showLoading("queriesLogContent");
+    var params = new URLSearchParams();
+    params.append("period", period);
+    params.append("page", _queriesLogState.page);
+    params.append("page_size", _queriesLogState.pageSize);
+    var f = _queriesLogState.filters;
+    if (f.search) params.append("search", f.search);
+    if (f.activity_type) params.append("activity_type", f.activity_type);
+    if (f.result_status) params.append("result_status", f.result_status);
+    if (f.category) params.append("category", f.category);
+    if (f.programme) params.append("programme", f.programme);
+    if (f.college) params.append("college", f.college);
+    if (f.service) params.append("service", f.service);
+    if (f.date_from) params.append("date_from", f.date_from);
+    if (f.date_to) params.append("date_to", f.date_to);
+
+    fetchJSON(BASE + "/logs?" + params.toString()).then(function (data) {
+      _queriesLogState.logs = data.logs || [];
+      _queriesLogState.total = data.total || 0;
+      _queriesLogState.totalPages = data.total_pages || 1;
+      _queriesLogState.page = data.page || 1;
+
+      renderQueriesLogs(data);
+      renderQueriesLogPagination();
+    }).catch(function (err) {
+      emptyState("queriesLogContent", "Could not load activity log: " + err.message);
+    });
+  }
+
+  function renderQueriesLogs(data) {
+    var logs = data.logs || [];
+    var html = '';
+
+    // Filters bar
+    html += '<div class="admin-card queries-log-filters">';
+    html += '<h3>Query / Activity Log</h3>';
+    html += '<div class="filter-row">';
+    html += '<input type="text" id="queriesLogSearchInput" placeholder="Search queries..." class="filter-input" style="flex:1; max-width:300px;" value="' + _queriesLogState.filters.search + '">';
+    html += '<select id="queriesLogTypeFilter" class="filter-select">' +
+      '<option value="">All Types' + (_queriesLogState.filters.activity_type === 'rag' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'structured' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'connector' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'navigation' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'authority' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'grievance' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'catalogue' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'news' ? ', selected' : '') +
+      (_queriesLogState.filters.activity_type === 'clarification' ? ', selected' : '') + '>' +
+      '<option value="rag">Knowledge Query</option>' +
+      '<option value="structured">Structured Lookup</option>' +
+      '<option value="connector">Student Service</option>' +
+      '<option value="navigation">Navigation</option>' +
+      '<option value="authority">Authority Referral</option>' +
+      '<option value="grievance">Grievance</option>' +
+      '<option value="catalogue">Catalogue</option>' +
+      '<option value="news">News</option>' +
+      '<option value="clarification">Clarification</option>' +
+      '</select>';
+    html += '<select id="queriesLogResultFilter" class="filter-select">' +
+      '<option value="">All Results' + (_queriesLogState.filters.result_status === 'knowledge_gap' ? ', selected' : '') +
+      (_queriesLogState.filters.result_status === 'answered' ? ', selected' : '') +
+      (_queriesLogState.filters.result_status === 'completed' ? ', selected' : '') +
+      (_queriesLogState.filters.result_status === 'unanswered' ? ', selected' : '') +
+      (_queriesLogState.filters.result_status === 'abandoned' ? ', selected' : '') + '>' +
+      '<option value="knowledge_gap">Knowledge Gap</option>' +
+      '<option value="answered">Answered</option>' +
+      '<option value="completed">Completed</option>' +
+      '<option value="unanswered">Unanswered</option>' +
+      '<option value="abandoned">Abandoned</option>' +
+      '</select>';
+    html += '<select id="queriesLogCategoryFilter" class="filter-select">' +
+      '<option value="">All Categories' + (_queriesLogState.filters.category === 'courses' ? ', selected' : '') +
+      (_queriesLogState.filters.category === 'colleges' ? ', selected' : '') +
+      (_queriesLogState.filters.category === 'services' ? ', selected' : '') +
+      (_queriesLogState.filters.category === 'authorities' ? ', selected' : '') +
+      (_queriesLogState.filters.category === 'knowledge' ? ', selected' : '') +
+      (_queriesLogState.filters.category === 'gaps' ? ', selected' : '') + '>' +
+      '<option value="courses">Courses</option>' +
+      '<option value="colleges">Colleges</option>' +
+      '<option value="services">Services</option>' +
+      '<option value="authorities">Authorities</option>' +
+      '<option value="knowledge">Knowledge</option>' +
+      '<option value="gaps">Gaps</option>' +
+      '</select>';
+    html += '<input type="date" id="queriesLogDateFrom" class="filter-input" style="width:140px;" value="' + _queriesLogState.filters.date_from + '">';
+    html += '<input type="date" id="queriesLogDateTo" class="filter-input" style="width:140px;" value="' + _queriesLogState.filters.date_to + '">';
+    html += '<button class="btn sm green" onclick="applyQueriesLogFilters()">Apply</button>';
+    html += '<button class="btn sm" onclick="clearQueriesLogFilters()">Clear</button>';
+    html += '</div>';
+    html += '<div class="filter-row" style="margin-top:8px;">';
+    html += '<span class="filter-label">Page size:</span>';
+    html += '<select id="queriesLogPageSize" class="filter-select" style="width:80px;"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select>';
+    html += '<span class="filter-label" style="margin-left:16px;" id="queriesLogTotalCount">' + _queriesLogState.total + ' total logs</span>';
+    if (_queriesLogState.selectedLogs.size > 0) {
+      html += '<span class="filter-label" style="margin-left:16px;color:var(--green);" id="queriesLogSelectedCount">' + _queriesLogState.selectedLogs.size + ' selected</span>';
+      html += '<button class="btn sm red" style="margin-left:8px;" onclick="deleteSelectedQueriesLogs()" id="queriesLogDeleteSelectedBtn">Delete Selected</button>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    // Logs table
+    html += '<div class="admin-card queries-logs-table-wrapper">';
+    if (logs.length === 0) {
+      html += '<div class="insight-empty"><p>No activity logs found for the current filters.</p></div>';
+    } else {
+      html += '<table class="insight-table queries-logs-table">';
+      html += '<thead><tr>';
+      html += '<th style="width:40px;"><input type="checkbox" id="queriesLogSelectAll"></th>';
+      html += '<th>Date</th><th>Time</th><th>Type</th><th>Query / Action</th><th>Category</th><th>Programme</th><th>College</th><th>Service</th><th>Result</th><th>Time (ms)</th><th style="width:60px;">Actions</th>';
+      html += '</tr></thead><tbody>';
+      logs.forEach(function (log) {
+        var isSelected = _queriesLogState.selectedLogs.has(log.id);
+        var dateDisplay = log.date_display || (log.timestamp ? log.timestamp.split('T')[0] : '–');
+        var timeDisplay = log.time_display || (log.timestamp ? log.timestamp.split('T')[1]?.substring(0,8) : '–');
+        html += '<tr' + (isSelected ? ' class="selected"' : '') + ' data-log-id="' + esc(log.id) + '">';
+        html += '<td><input type="checkbox" class="queries-log-row-checkbox" value="' + esc(log.id) + '"' + (isSelected ? ' checked' : '') + '></td>';
+        html += '<td>' + esc(dateDisplay) + '</td>';
+        html += '<td>' + esc(timeDisplay) + '</td>';
+        html += '<td><span class="badge badge-' + getBadgeClass(log.activity_type) + '">' + esc(log.activity_label) + '</span></td>';
+        html += '<td class="query-cell">' + esc(log.query_text || log.activity_label) + '</td>';
+        html += '<td>' + esc(log.category) + '</td>';
+        html += '<td>' + esc(log.programme || "–") + '</td>';
+        html += '<td>' + esc(log.college || "–") + '</td>';
+        html += '<td>' + esc(log.service || "–") + '</td>';
+        html += '<td><span class="badge badge-' + getResultBadgeClass(log.result_status) + '">' + esc(log.result_status) + '</span></td>';
+        html += '<td>' + (log.response_time_ms ? log.response_time_ms + "ms" : "–") + '</td>';
+        html += '<td><button class="btn sm red" title="Delete log">🗑</button></td>';
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+
+    document.getElementById("queriesLogContent").innerHTML = html;
+
+    // Bind filter events
+    bindQueriesLogFilterEvents();
+  }
+
+  function renderQueriesLogPagination() {
+    var html = '<div class="queries-log-pagination">';
+    if (_queriesLogState.totalPages <= 1) {
+      document.getElementById("queriesLogPagination").innerHTML = "";
+      return;
+    }
+    html += '<button class="btn sm"' + (_queriesLogState.page <= 1 ? ' disabled' : '') + ' data-page="' + (_queriesLogState.page - 1) + '">Previous</button>';
+    html += '<span class="page-info">Page ' + _queriesLogState.page + ' of ' + _queriesLogState.totalPages + '</span>';
+    html += '<button class="btn sm"' + (_queriesLogState.page >= _queriesLogState.totalPages ? ' disabled' : '') + ' data-page="' + (_queriesLogState.page + 1) + '">Next</button>';
+    document.getElementById("queriesLogPagination").innerHTML = html;
+  }
+
+  function bindQueriesLogFilterEvents() {
+    var searchInput = document.getElementById("queriesLogSearchInput");
+    if (searchInput) {
+      searchInput.addEventListener("keydown", function (e) { if (e.key === "Enter") applyQueriesLogFilters(); });
+    }
+    document.getElementById("queriesLogTypeFilter").addEventListener("change", applyQueriesLogFilters);
+    document.getElementById("queriesLogResultFilter").addEventListener("change", applyQueriesLogFilters);
+    document.getElementById("queriesLogCategoryFilter").addEventListener("change", applyQueriesLogFilters);
+    document.getElementById("queriesLogDateFrom").addEventListener("change", applyQueriesLogFilters);
+    document.getElementById("queriesLogDateTo").addEventListener("change", applyQueriesLogFilters);
+    document.getElementById("queriesLogPageSize").addEventListener("change", function (e) {
+      _queriesLogState.pageSize = parseInt(e.target.value);
+      _queriesLogState.page = 1;
+      fetchQueriesLogs(getPeriod());
+    });
+var selectAll = document.getElementById("queriesLogSelectAll");
+    if (selectAll) {
+      selectAll.addEventListener("change", function (e) {
+        document.querySelectorAll(".queries-log-row-checkbox").forEach(function (cb) {
+          cb.checked = e.target.checked;
+          toggleQueriesLogRowSelect(cb);
+        });
+      });
+    }
+    // Bind individual row checkbox change
+    document.querySelectorAll(".queries-log-row-checkbox").forEach(function (cb) {
+      cb.addEventListener("change", function (e) {
+        toggleQueriesLogRowSelect(e.target);
+      });
+    });
+    // Bind delete button click - use event delegation on the table
+    document.querySelectorAll(".queries-logs-table tbody button").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var id = btn.getAttribute("data-id");
+        if (id) {
+          deleteQueriesLogDetail(id);
+        }
+      });
+    });
+    // Bind pagination page change - re-fetch the current page
+    document.querySelectorAll(".queries-log-pagination button").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var page = btn.dataset ? btn.dataset.page : null;
+        if (page !== null) {
+          changeQueriesLogPage(page);
+        }
+      });
+    });
+  }
+    // Bind individual row checkbox change
+    document.querySelectorAll(".queries-log-row-checkbox").forEach(function (cb) {
+      cb.addEventListener("change", function (e) {
+        toggleQueriesLogRowSelect(e.target);
+      });
+    });
+    // Bind delete button click
+    document.querySelectorAll(".queries-logs-table-wrapper tbody button").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        deleteQueriesLogDetail(btn.title.replace("Delete log", "").trim());
+      });
+    });
+    // Bind pagination page change
+    document.querySelectorAll(".queries-log-pagination button").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        changeQueriesLogPage(parseInt(btn.dataset.page));
+      });
+    });
+  }
+
+  function applyQueriesLogFilters() {
+    _queriesLogState.filters.search = document.getElementById("queriesLogSearchInput").value.trim();
+    _queriesLogState.filters.activity_type = document.getElementById("queriesLogTypeFilter").value;
+    _queriesLogState.filters.result_status = document.getElementById("queriesLogResultFilter").value;
+    _queriesLogState.filters.category = document.getElementById("queriesLogCategoryFilter").value;
+    _queriesLogState.filters.date_from = document.getElementById("queriesLogDateFrom").value;
+    _queriesLogState.filters.date_to = document.getElementById("queriesLogDateTo").value;
+    _queriesLogState.page = 1;
+    fetchQueriesLogs(getPeriod());
+  }
+
+  function clearQueriesLogFilters() {
+    _queriesLogState.filters = {
+      search: "",
+      activity_type: "",
+      result_status: "",
+      category: "",
+      programme: "",
+      college: "",
+      service: "",
+      date_from: "",
+      date_to: "",
+    };
+    _queriesLogState.page = 1;
+    document.getElementById("queriesLogSearchInput").value = "";
+    document.getElementById("queriesLogTypeFilter").value = "";
+    document.getElementById("queriesLogResultFilter").value = "";
+    document.getElementById("queriesLogCategoryFilter").value = "";
+    document.getElementById("queriesLogDateFrom").value = "";
+    document.getElementById("queriesLogDateTo").value = "";
+    fetchQueriesLogs(getPeriod());
+  }
+
+  function changeQueriesLogPage(page) {
+    if (page < 1 || page > _queriesLogState.totalPages) return;
+    _queriesLogState.page = page;
+    fetchQueriesLogs(getPeriod());
+  }
+
+  function toggleQueriesLogSelectAll(headerCheckbox) {
+    var checked = headerCheckbox.checked;
+    document.querySelectorAll(".queries-log-row-checkbox").forEach(function (cb) {
+      cb.checked = checked;
+      toggleQueriesLogRowSelect(cb);
+    });
+  }
+
+  function toggleQueriesLogRowSelect(checkbox) {
+    var id = checkbox.value;
+    var row = checkbox.closest("tr");
+    if (checkbox.checked) {
+      _queriesLogState.selectedLogs.add(id);
+      if (row) row.classList.add("selected");
+    } else {
+      _queriesLogState.selectedLogs.delete(id);
+      if (row) row.classList.remove("selected");
+    }
+    var headerCheckbox = document.getElementById("queriesLogSelectAll");
+    if (headerCheckbox) {
+      var allChecked = document.querySelectorAll(".queries-log-row-checkbox:checked").length === document.querySelectorAll(".queries-log-row-checkbox").length;
+      headerCheckbox.checked = allChecked;
+    }
+    updateQueriesLogSelectedCountDisplay();
+  }
+
+  function updateQueriesLogSelectedCountDisplay() {
+    var count = _queriesLogState.selectedLogs.size;
+    var countEl = document.getElementById("queriesLogSelectedCount");
+    var deleteBtn = document.getElementById("queriesLogDeleteSelectedBtn");
+    if (count > 0) {
+      if (countEl) countEl.textContent = count + ' selected';
+      if (deleteBtn) deleteBtn.style.display = '';
+    } else {
+      if (countEl) countEl.textContent = '';
+      if (deleteBtn) deleteBtn.style.display = 'none';
+    }
+  }
+
+  function deleteSelectedQueriesLogs() {
+    if (_queriesLogState.selectedLogs.size === 0) return;
+    if (!confirm("Delete " + _queriesLogState.selectedLogs.size + " selected activity logs?")) return;
+    var ids = Array.from(_queriesLogState.selectedLogs);
+    fetchJSON(BASE + "/logs/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ ids: ids })
+    }).then(function (result) {
+      var deleted = result.deleted || 0;
+      var failed = result.failed || 0;
+      if (failed > 0) {
+        toast(deleted + " query logs deleted successfully. " + failed + " failed.", "warning");
+      } else {
+        toast(deleted + " query logs deleted successfully.", "success");
+      }
+      _queriesLogState.selectedLogs.clear();
+      fetchQueriesLogs(getPeriod());
+      updateQueriesLogSelectedCountDisplay();
+    }).catch(function (err) {
+      toast("Failed to delete query logs. Please try again.", "error");
+    });
+  }
+
+  function viewQueriesLogDetail(logId) {
+    fetchJSON(BASE + "/logs/" + logId).then(function (detail) {
+      showQueriesLogDetailModal(detail);
+    }).catch(function (err) {
+      alert("Could not load log detail: " + err.message);
+    });
+  }
+
+  function deleteQueriesLogDetail(logId) {
+    if (!confirm("Delete this query log?")) return;
+    fetchJSON(BASE + "/logs/" + logId, {
+      method: "DELETE",
+      headers: authHeaders()
+    }).then(function () {
+      log("Deleted query log: " + logId);
+      _queriesLogState.selectedLogs.delete(logId);
+      updateQueriesLogSelectedCountDisplay();
+      fetchQueriesLogs(getPeriod());
+    }).catch(function (err) {
+      alert("Failed to delete query log. Please try again.", "error");
+    });
+  }
+
+  function showQueriesLogDetailModal(detail) {
+    var html = '<div class="modal-overlay" onclick="closeQueriesLogDetailModal(event)">';
+    html += '<div class="modal-content" onclick="event.stopPropagation()">';
+    html += '<div class="modal-header"><h3>Query / Activity Log Detail</h3><button class="modal-close" onclick="closeQueriesLogDetailModal()">✕</button></div>';
+    html += '<div class="modal-body">';
+    html += '<div class="detail-grid">';
+    html += '<div><strong>Date:</strong> ' + esc(detail.date_display || "–") + '</div>';
+    html += '<div><strong>Time:</strong> ' + esc(detail.time_display || "–") + '</div>';
+    html += '<div><strong>Type:</strong> <span class="badge badge-' + getBadgeClass(detail.activity_type) + '">' + esc(detail.activity_label) + '</span></div>';
+    html += '<div><strong>Query / Action:</strong> ' + esc(detail.query_text || detail.activity_label) + '</div>';
+    html += '<div><strong>Category:</strong> ' + esc(detail.category) + '</div>';
+    html += '<div><strong>Intent:</strong> ' + esc(detail.intent || "–") + '</div>';
+    html += '<div><strong>Programme:</strong> ' + esc(detail.programme || "–") + '</div>';
+    html += '<div><strong>College:</strong> ' + esc(detail.college || "–") + '</div>';
+    html += '<div><strong>Topic:</strong> ' + esc(detail.topic || "–") + '</div>';
+    html += '<div><strong>Service:</strong> ' + esc(detail.service || "–") + '</div>';
+    html += '<div><strong>Result:</strong> <span class="badge badge-' + getResultBadgeClass(detail.result_status) + '">' + esc(detail.result_status) + '</span></div>';
+    html += '<div><strong>Knowledge Gap:</strong> ' + (detail.knowledge_gap ? '<span class="badge badge-red">Yes</span>' : '<span class="badge badge-green">No</span>') + '</div>';
+    html += '<div><strong>Response Time:</strong> ' + (detail.response_time_ms ? detail.response_time_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>Planner Latency:</strong> ' + (detail.planner_latency_ms ? detail.planner_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>RAG Latency:</strong> ' + (detail.rag_latency_ms ? detail.rag_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>LLM Latency:</strong> ' + (detail.llm_latency_ms ? detail.llm_latency_ms + "ms" : "–") + '</div>';
+    html += '<div><strong>Session:</strong> ' + esc(detail.anon_session_id || "–") + '</div>';
+    html += '<div><strong>Conversation:</strong> ' + esc(detail.conversation_id || "–") + '</div>';
+    if (detail.knowledge_gap && detail.gap_info) {
+      html += '<hr style="margin:16px 0;">';
+      html += '<div><strong>Gap Type:</strong> ' + esc(detail.gap_info.gap_type) + '</div>';
+      html += '<div><strong>Frequency:</strong> ' + detail.gap_info.frequency + '</div>';
+      html += '<div><strong>Confidence:</strong> ' + (detail.gap_info.confidence_score != null ? Math.round(detail.gap_info.confidence_score * 100) + "%" : "–") + '</div>';
+      html += '<div><strong>Suggestion:</strong> ' + esc(detail.gap_info.suggestion || "–") + '</div>';
+    }
+    html += '</div>';
+    html += '<div class="modal-actions">';
+    html += '<button class="btn red" onclick="deleteQueriesLogDetail(\'' + esc(detail.id) + '\')">Delete Log</button>';
+    html += '<button class="btn" onclick="closeQueriesLogDetailModal()">Close</button>';
+    html += '</div>';
+    html += '</div></div>';
+    html += '</div>';
+
+    var container = document.getElementById("queriesLogDetailModal");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "queriesLogDetailModal";
+      document.body.appendChild(container);
+    }
+    container.innerHTML = html;
+    container.style.display = "flex";
+  }
+
+  window.closeQueriesLogDetailModal = function (e) {
+    if (e && e.target !== e.currentTarget) return;
+    var container = document.getElementById("queriesLogDetailModal");
+    if (container) container.style.display = "none";
+  };
+
+  function deleteQueriesLogDetail(logId) {
+    if (!confirm("Delete this activity log?")) return;
+    fetchJSON(BASE + "/logs/" + logId, {
+      method: "DELETE",
+      headers: authHeaders()
+    }).then(function () {
+      toast("Query log deleted successfully.", "success");
+      closeQueriesLogDetailModal();
+      fetchQueriesLogs(getPeriod());
+    }).catch(function (err) {
+      toast("Failed to delete query log. Please try again.", "error");
+    });
+  }
+
+  // ===================================================================
+  // 10. PERFORMANCE
+  // ===================================================================
+  function loadPerformance(period) {
+    showLoading("performanceContent");
+    fetchJSON(BASE + "/performance?period=" + period).then(function (data) {
+      var html = '<div class="kpi">';
+      html += '<div class="box"><div class="n">' + (data.avg_response_time_ms||0) + 'ms</div><div class="l">Avg Response</div></div>';
+      html += '<div class="box"><div class="n">' + (data.p50||0) + 'ms</div><div class="l">P50</div></div>';
+      html += '<div class="box"><div class="n">' + (data.p90||0) + 'ms</div><div class="l">P90</div></div>';
+      html += '<div class="box"><div class="n">' + (data.p99||0) + 'ms</div><div class="l">P99</div></div>';
+      html += '</div><div class="kpi">';
+      html += '<div class="box"><div class="n">' + (data.avg_planner_latency_ms||0) + 'ms</div><div class="l">Planner</div></div>';
+      html += '<div class="box"><div class="n">' + (data.avg_rag_latency_ms||0) + 'ms</div><div class="l">RAG</div></div>';
+      html += '<div class="box"><div class="n">' + (data.avg_llm_latency_ms||0) + 'ms</div><div class="l">LLM</div></div>';
+      html += '<div class="box"><div class="n">' + (data.cache_hit_ratio ? Math.round(data.cache_hit_ratio*100)+"%" : "0%") + '</div><div class="l">Cache</div></div>';
+      html += '</div>';
+      html += '<div class="admin-card"><div class="chart-container-sm"><canvas id="perfChart" height="200"></canvas></div></div>';
+      document.getElementById("performanceContent").innerHTML = html;
+      renderPerfChart(data);
+    }).catch(function (err) {
+      emptyState("performanceContent", "Could not load performance data: " + err.message);
+    });
+  }
+
+  function renderPerfChart(data) {
+    destroyChart("perfChart");
+    var c = document.getElementById("perfChart");
+    if (!c) return;
+    _charts["perfChart"] = new Chart(c.getContext("2d"), {
+      type: "bar",
+      data: {
+        labels: ["Response", "Planner", "RAG", "LLM"],
+        datasets: [{ label: "Avg Latency (ms)", data: [data.avg_response_time_ms||0, data.avg_planner_latency_ms||0, data.avg_rag_latency_ms||0, data.avg_llm_latency_ms||0], backgroundColor: COLORS.slice(0,4) }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+  }
+
+  // ===================================================================
+  // 11. SMART AI INSIGHTS
+  // ===================================================================
+  function loadInsights() {
+    showLoading("insightsContent");
+    fetchJSON(BASE + "/insights").then(function (data) {
+      var insights = data || [];
+      var html = '';
+      if (!insights.length) {
+        html = '<div class="admin-card"><div class="insight-empty"><p>No insights yet. Insights are generated after sufficient data collection.</p></div></div>';
+      } else {
+        html = '<div class="insight-insights">';
+        insights.forEach(function (ins) {
+          var sc = "insight-severity-" + (ins.severity || "info");
+          var icon = ins.type === "warning" ? "⚠️" : ins.type === "anomaly" ? "🔴" : ins.type === "trend" ? "📈" : "💡";
+          html += '<div class="insight-card ' + sc + '">';
+          html += '<div class="insight-icon">' + icon + '</div>';
+          html += '<div class="insight-body">';
+          html += '<div class="insight-message">' + esc(ins.message) + '</div>';
+          html += '<div class="insight-meta">' + esc(ins.type) + ' · ' + esc(ins.severity) + (ins.change_pct != null ? " · " + ins.change_pct + "% change" : "") + '</div>';
+          html += '</div></div>';
+        });
+        html += '</div>';
+      }
+      document.getElementById("insightsContent").innerHTML = html;
+    }).catch(function (err) {
+      emptyState("insightsContent", "Could not load AI insights: " + err.message);
+    });
+  }
+
+  // ===================================================================
+  // SEARCH
+  // ===================================================================
+  function doSearch() {
+    var q = document.getElementById("insightSearchInput");
+    if (!q) return;
+    var query = q.value.trim();
+    if (!query) return;
+    showLoading("searchResults");
+    fetchJSON(BASE + "/search?q=" + encodeURIComponent(query) + "&period=" + getPeriod() + "&limit=30").then(function (data) {
+      var results = data.results || [];
+      var html = '<div class="admin-card"><h3>Search Results for "' + esc(query) + '"</h3>';
+      html += '<p class="sub">' + (data.total_matches||0) + ' total matches</p>';
+      if (results.length) {
+        html += '<table class="insight-table"><tr><th>Programme</th><th>College</th><th>Topic</th><th>Service</th><th>Matches</th></tr>';
+        results.forEach(function (r) { html += '<tr><td>' + esc(r.programme||"") + '</td><td>' + esc(r.college||"") + '</td><td>' + esc(r.topic||"") + '</td><td>' + esc(r.service||"") + '</td><td>' + (r.count||1) + '</td></tr>'; });
+        html += '</table>';
+      } else {
+        html += '<div class="insight-empty"><p>No matching data found for "' + esc(query) + '".</p></div>';
+      }
+      html += '</div>';
+      document.getElementById("searchResults").innerHTML = html;
+    }).catch(function (err) {
+      emptyState("searchResults", "Search failed: " + err.message);
+    });
+  }
+
+  // ===================================================================
+  // EXPORT
+  // ===================================================================
+  function doExport() {
+    var fmt = document.getElementById("insightExportFormat");
+    var active = document.querySelector(".insight-nav-btn.active");
+    if (!fmt || !active) return;
+    var url = BASE + "/export/" + fmt.value + "?report=" + active.dataset.section + "&period=" + getPeriod();
+    log("Export: " + url);
+    // window.open cannot send the Authorization header; fetch + download instead.
+    fetch(url, { headers: authHeaders() })
+      .then(function (r) {
+        if (r.status === 401) { throw new Error("Unauthorized — re-login required"); }
+        if (!r.ok) { throw new Error("Export failed (" + r.status + ")"); }
+        return r.blob();
+      })
+      .then(function (blob) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "insights_export_" + active.dataset.section + "." + fmt.value;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+        log("Export downloaded");
+      })
+      .catch(function (err) { log("Export error: " + err.message); });
+  }
+
+  // ===================================================================
+  // RENDER HELPERS
+  // ===================================================================
+  function renderBarList(items, key, val) {
+    if (!items || !items.length) return '<div class="insight-empty-sm"><p>No data</p></div>';
+    var max = Math.max.apply(null, items.map(function(i){return i[val]||0;}));
+    var html = '<div class="insight-bar-list">';
+    items.slice(0, 15).forEach(function (item) {
+      var pct = max > 0 ? Math.round((item[val]||0)/max*100) : 0;
+      html += '<div class="insight-bar-item"><div class="insight-bar-label">' + esc(fmt(item[key])) + '</div>';
+      html += '<div class="insight-bar-track"><div class="insight-bar-fill" style="width:' + pct + '%"></div></div>';
+      html += '<div class="insight-bar-count">' + item[val] + '</div></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function renderPie(canvasId, items, labelKey, valKey) {
+    destroyChart(canvasId);
+    var canvas = document.getElementById(canvasId);
+    if (!canvas || !items || !items.length) return;
+    _charts[canvasId] = new Chart(canvas.getContext("2d"), {
+      type: "doughnut",
+      data: {
+        labels: items.map(function(i){return fmt(i[labelKey]);}),
+        datasets: [{ data: items.map(function(i){return i[valKey]||0;}), backgroundColor: COLORS }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "right", labels: { boxWidth: 12, padding: 8, font: { size: 11 } } } } }
+    });
+  }
+
+  function renderBar(canvasId, items, labelKey, valKey, label) {
+    destroyChart(canvasId);
+    var canvas = document.getElementById(canvasId);
+    if (!canvas || !items || !items.length) return;
+    _charts[canvasId] = new Chart(canvas.getContext("2d"), {
+      type: "bar",
+      data: {
+        labels: items.map(function(i){return fmt(i[labelKey]);}),
+        datasets: [{ label: label, data: items.map(function(i){return i[valKey]||0;}), backgroundColor: COLORS }]
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { beginAtZero: true, grid: { color: "#eee" } }, y: { grid: { display: false } } }
+      }
+    });
+  }
+
+  function fmt(s) { if (!s) return ""; return s.replace(/_/g, " ").replace(/\b\w/g, function(c){return c.toUpperCase();}); }
+  function esc(s) { if (typeof s !== "string") return String(s||""); return s.replace(/[&<>"']/g, function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];}); }
+
+  // ========== Expose ==========
+  window.CUS = window.CUS || {};
+  window.CUS.insightsInit = init;
+  window.CUS.insightsRefresh = loadSection;
+  log("Module loaded");
+})();

@@ -1,0 +1,122 @@
+2026-09-09T08:27:11 | INFO     | cus_ai | Embedding cache loaded (339 entries)
+2026-09-09T08:27:12 | INFO     | cus_ai | Starting CUS AI Assistant (env=development)
+2026-09-09T08:27:13 | INFO     | cus_ai | Academic catalogue seeded with 9 programmes
+2026-09-09T08:27:16 | INFO     | cus_ai | Embed model 'nomic-embed-text' warmed up
+2026-09-09T08:27:18 | INFO     | cus_ai | LLM model 'llama3' warmed up
+2026-09-09T08:27:18 | INFO     | cus_ai | Analytics scheduler started (agg=3600s, cleanup=86400s, insight=7200s)
+2026-09-09T08:27:18 | INFO     | cus_ai | Analytics background scheduler started
+2026-09-09T08:27:18 | INFO     | cus_ai | Intent centroids loaded from cache (12 intents)
+2026-09-09T08:27:18 | INFO     | cus_ai | Intent centroids ready from cache (12 intents) in 0.16s
+2026-09-09T08:27:18 | INFO     | cus_ai | Intent classifier warmed up
+2026-09-09T08:27:18 | INFO     | cus_ai | Website Sync scheduler started (poll 60s)
+2026-09-09T08:27:18 | INFO     | cus_ai | Website Sync scheduler started
+2026-09-09T08:27:18 | INFO     | cus_ai | Website Sync scheduler thread started
+2026-09-09T08:27:18 | INFO     | cus_ai | Background ingestion worker started
+2026-09-09T08:27:18 | INFO     | cus_ai | Request queue worker started
+2026-09-09T08:27:18 | INFO     | cus_ai | Authority cache loaded (7 offices)
+2026-09-09T08:27:18 | INFO     | cus_ai | Analytics module initialized
+2026-09-09T08:27:18 | INFO     | cus_ai | Background worker started (max_concurrent=2)
+2026-09-09T08:27:18 | INFO     | cus_ai | Worker pool starting (min=1, max=6)
+2026-09-09T08:27:18 | INFO     | cus_ai | Analytics aggregation completed in 0.03s: {'aggregated': {'daily': 0, 'weekly': 1, 'monthly': 1, 'yearly': 1}}
+2026-09-09T08:28:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
+2026-09-09T08:28:18 | INFO     | cus_ai | Generated 25 analytics insights
+INFO:     127.0.0.1:61093 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61093 - "GET /api/admin/students?page=1&page_size=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61093 - "GET /api/admin/results?page=1&page_size=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61093 - "GET /api/admin/admit-cards?page=1&page_size=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61093 - "GET /api/admin/exam-forms?page=1&page_size=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57496 - "GET /pages/admin.html HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57496 - "GET /css/main.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /css/responsive.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57538 - "GET /css/admin.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54797 - "GET /js/config.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65348 - "GET /js/admin.js?v=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /js/admin_insights.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /js/admin_catalogue.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57496 - "GET /js/admin_students.js?v=2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57538 - "GET /js/admin_student_results.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54797 - "GET /js/admin_student_admit_cards.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /js/admin_student_exam_forms.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54797 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57496 - "GET /api/admin/jobs/events HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54797 - "GET /api/admin/profile HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /api/documents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /api/admin/analytics/overview?period=all HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /api/admin/analytics/charts?period=month HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54797 - "GET /api/admin/catalogue/categories HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52485 - "GET /api/admin/catalogue/schemes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55375 - "GET /api/admin/catalogue/programmes HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/kb-health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/metrics/ingestion HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/students?q=&status=&page=1&page_size=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/college/list HTTP/1.1" 200 OK
+2026-09-09T08:29:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
+INFO:     127.0.0.1:60164 - "GET /api/admin/results?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/admit-cards?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/exam-forms?q=&form_status=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60164 - "GET /api/admin/students?q=&status=&page=1&page_size=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /pages/admin.html HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /css/main.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /css/responsive.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /js/config.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /css/admin.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /js/admin_insights.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /js/admin.js?v=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /js/admin_catalogue.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /js/admin_students.js?v=2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /js/admin_student_results.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51833 - "GET /js/admin_student_admit_cards.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51221 - "GET /js/admin_student_exam_forms.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50002 - "GET /api/documents HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:51221 - "GET /api/admin/profile HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:51833 - "GET /api/admin/kb-health HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:50373 - "GET /api/admin/jobs/events HTTP/1.1" 401 Unauthorized
+2026-09-09T08:30:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
+INFO:     127.0.0.1:62337 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62337 - "GET /api/admin/profile HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62337 - "GET /api/documents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62337 - "GET /api/admin/jobs/events HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52991 - "GET /api/admin/authorities/categories HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53719 - "GET /api/admin/authorities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/kb-health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/metrics/ingestion HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/authorities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62125 - "GET /api/admin/students?q=&status=&page=1&page_size=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51207 - "GET /api/admin/results?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51207 - "GET /api/admin/admit-cards?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51207 - "GET /api/admin/exam-forms?q=&form_status=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51207 - "GET /api/admin/results?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+2026-09-09T08:31:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
+INFO:     127.0.0.1:50954 - "GET /api/college/list HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /api/admin/authorities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /pages/admin.html HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /css/main.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /css/responsive.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /css/admin.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/config.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin.js?v=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_insights.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_catalogue.js?v=1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_students.js?v=2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_student_results.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_student_admit_cards.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /js/admin_student_exam_forms.js?v=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63693 - "GET /api/admin/jobs/events HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50954 - "GET /api/admin/profile HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55911 - "GET /api/documents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55911 - "GET /api/admin/authorities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55911 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55911 - "GET /api/admin/authority-admins?query=&status= HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55911 - "GET /api/admin/students?q=&status=&page=1&page_size=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/kb-health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/metrics/ingestion HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/results?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/admit-cards?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/exam-forms?q=&form_status=&page=1&page_size=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65216 - "GET /api/admin/results?q=&page=1&page_size=50 HTTP/1.1" 200 OK
+2026-09-09T08:32:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
+2026-09-09T08:33:18 | INFO     | cus_ai | Scheduler: master toggle OFF — skipping auto-crawl
