@@ -11,6 +11,13 @@ Tables:
   conversations    - a chat session.
   messages         - individual user/assistant messages within a conversation.
   audit_logs       - admin actions (login, upload, delete, reindex, chat requests, errors).
+  university_notices  - uploaded university notice documents (date sheets etc.),
+                        one row per physical file, with a verify + publish two-step
+                        lifecycle. Only VERIFIED + PUBLISHED notices are served.
+  date_sheet_entries  - individual schedule rows (date, day, time window, subject,
+                        paper code, venue, programme/stream/semester/batch) stored
+                        verbatim from the source document or admin entry. The
+                        assistant never fabricates schedule values.
 """
 
 from __future__ import annotations
@@ -214,16 +221,104 @@ class StudentSession(Base):
     student = relationship("Student")
 
 
+class UniversityNotice(Base):
+    """A university notice document (date sheet, exam notice, circular).
+
+    One row per physical file. Publication follows an admin-only two-step
+    lifecycle: upload/extract -> verify -> publish. Only notices flagged
+    VERIFIED and PUBLISHED (with their non-deleted VERIFIED schedule rows)
+    are ever served to end users. `deleted_at` performs soft delete.
+    """
+
+    __tablename__ = "university_notices"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title = Column(String(400), nullable=False)
+    notice_type = Column(String(30), nullable=False, default="notice", index=True)  # notice | date_sheet
+    filename = Column(String(400), nullable=False)            # sanitized stored filename
+    original_filename = Column(String(400), nullable=True)    # as uploaded
+    file_type = Column(String(20), nullable=True)             # pdf | docx
+    file_size = Column(Integer, nullable=True)                # bytes
+    sha256 = Column(String(64), nullable=True, index=True)    # dedup fingerprint
+    file_path = Column(String(600), nullable=False)           # server path (kept out of the public uploads mount)
+    categories = Column(Text, nullable=True)                  # JSON array of admin tags
+    programme_ids = Column(Text, nullable=True)               # JSON array of programme ids covered by this notice
+    exam_type = Column(String(60), nullable=True)             # e.g. annual | semester | supplementary
+    exam_session_label = Column(String(120), nullable=True)   # e.g. "June 2026"
+    notification_date = Column(DateTime(timezone=True), nullable=True)
+    extraction_status = Column(String(30), default="draft", nullable=False, index=True)
+    # extraction_status: draft | extracting | pending_verification | verified |
+    #                    extraction_failed | manual_entry
+    extraction_error = Column(Text, nullable=True)
+    validation_flags = Column(Text, nullable=True)            # JSON array of issue codes
+    is_verified = Column(Boolean, default=False, nullable=False)
+    is_published = Column(Boolean, default=False, nullable=False)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    source_kind = Column(String(20), default="upload", nullable=False)  # upload | manual | backfill
+    created_by = Column(_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    entries = relationship("DateSheetEntry", back_populates="notice", cascade="all, delete-orphan")
+
+
+class DateSheetEntry(Base):
+    """A single schedule row belonging to a UniversityNotice.
+
+    Every schedule fact (date, day, time window, subject, paper code, venue,
+    programme/stream/semester/batch) is stored verbatim from the source
+    document or from an admin manual entry. The assistant never fabricates
+    or infers values: read paths return ONLY rows whose notice is VERIFIED +
+    PUBLISHED and whose own `extraction_status` equals the verified marker.
+    """
+
+    __tablename__ = "date_sheet_entries"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    notice_id = Column(_UUID(as_uuid=True), ForeignKey("university_notices.id", ondelete="CASCADE"), nullable=False, index=True)
+    row_no = Column(Integer, nullable=False, default=0)
+    programme_id = Column(String(20), nullable=True, index=True)
+    programme_name = Column(String(200), nullable=True)
+    stream = Column(String(60), nullable=True)
+    semester = Column(String(10), nullable=True, index=True)
+    batch = Column(String(20), nullable=True)
+    exam_type = Column(String(60), nullable=True)
+    exam_date = Column(String(10), nullable=True)             # ISO yyyy-mm-dd (verbatim from source)
+    day = Column(String(12), nullable=True)
+    start_time = Column(String(8), nullable=True)             # 24h HH:MM
+    end_time = Column(String(8), nullable=True)
+    subject_code = Column(String(30), nullable=True)
+    subject = Column(String(300), nullable=True)
+    paper_code = Column(String(30), nullable=True)
+    venue = Column(String(200), nullable=True)
+    source_page = Column(Integer, nullable=True)
+    source_section = Column(String(200), nullable=True)
+    raw = Column(Text, nullable=True)                          # original line/table row text
+    extraction_status = Column(String(30), default="pending_verification", nullable=False, index=True)
+    # extraction_status: pending_verification | verified | marked_missing | discarded
+    is_manual = Column(Boolean, default=False, nullable=False)
+    is_corrected = Column(Boolean, default=False, nullable=False)
+    validation_flags = Column(Text, nullable=True)             # JSON array of issue codes
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    notice = relationship("UniversityNotice", back_populates="entries")
+
+
 __all__ = [
     "_UUID",
     "AuditLog",
     "Base",
     "Conversation",
+    "DateSheetEntry",
     "Document",
     "DocumentChunk",
     "Message",
     "RefreshToken",
     "Student",
     "StudentSession",
+    "UniversityNotice",
     "User",
 ]

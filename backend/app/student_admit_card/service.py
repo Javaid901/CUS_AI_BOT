@@ -35,7 +35,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Student, StudentAdmitCard
+from app.models import Student, StudentAdmitCard, StudentResult
 
 # The explicit semester allowlist (shared by the API, import validator &
 # chat flow). A value missing here is treated as "not available".
@@ -506,6 +506,65 @@ def student_card_payload(db: Session, student_id: str, semester: int) -> dict[st
     if row is None:
         return None
     return _student_dto(row)
+
+
+def student_card_document(
+    db: Session, student_id: str, semester: int
+) -> dict[str, Any] | None:
+    """All display values for the student's OWN admit-card document.
+
+    Identity (Student) + card (StudentAdmitCard) + the examination roll number
+    from the student's existing StudentResult row for the same semester. The
+    result is an explicit PII allowlist (never the ORM). DOB and credentials
+    are never included. Returns None when no card exists for the semester.
+    """
+    if semester not in _ALLOWLIST:
+        return None
+    row = (
+        db.query(StudentAdmitCard)
+        .filter(StudentAdmitCard.student_id == student_id, StudentAdmitCard.semester == semester)
+        .order_by(
+            StudentAdmitCard.academic_year.desc(),
+            StudentAdmitCard.issued_date.desc(),
+            StudentAdmitCard.created_at.desc(),
+        )
+        .first()
+    )
+    if row is None:
+        return None
+    student = row.student
+    exam_roll_no = ""
+    if student is not None:
+        res = (
+            db.query(StudentResult.exam_roll_no)
+            .filter(StudentResult.student_id == student.id, StudentResult.semester == semester)
+            .order_by(StudentResult.exam_roll_no.asc())
+            .first()
+        )
+        if res is not None:
+            exam_roll_no = res[0] or ""
+    return {
+        "semester": row.semester,
+        "exam_type": row.exam_type or "Regular",
+        "exam_session": row.exam_session or "",
+        "academic_year": row.academic_year or "",
+        "centre_name": row.centre_name or "",
+        "centre_code": row.centre_code or "",
+        "centre_address": row.centre_address or "",
+        "reporting_time": row.reporting_time or "",
+        "subjects": _json_list(row.subjects),
+        "instructions": _json_list(row.instructions),
+        "issued_date": row.issued_date or "",
+        "reg_no": student.reg_no if student else "",
+        "roll_no": student.roll_no if student else "",
+        "name": student.name if student else "",
+        "gender": student.gender if student else "",
+        "father_name": student.father_name if student else "",
+        "mobile": student.phone if student else "",
+        "batch": student.batch if student else "",
+        "programme": student.programme if student else "",
+        "exam_roll_no": exam_roll_no,
+    }
 
 
 # --------------------------------------------------------------------------- #

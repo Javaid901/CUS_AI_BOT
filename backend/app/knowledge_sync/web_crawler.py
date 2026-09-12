@@ -389,7 +389,7 @@ async def _guarded_get(
         if status in (301, 302, 303, 307, 308) and follow_redirects:
             location = headers.get("Location") if headers else None
             if not location:
-                return httpx.Response(status_code=status, headers=headers, content=body)
+                return _decoded_response(status, headers, body)
             next_url = normalize_url(urljoin(current, location))
             if not _scheme_allowed(next_url) or next_url in seen_hops:
                 log.warning("Blocked redirect chain at %s -> %s", current, next_url)
@@ -403,10 +403,29 @@ async def _guarded_get(
             hops += 1
             continue
 
-        return httpx.Response(status_code=status, headers=headers, content=body)
+        return _decoded_response(status, headers, body)
 
     log.warning("Redirect limit (%d hops) exceeded for %s", _MAX_REDIRECT_HOPS, url)
     return None
+
+
+def _decoded_response(
+    status: int,
+    headers: httpx.Headers | None,
+    body: bytes,
+) -> httpx.Response:
+    """Build a final response from an already-decoded body.
+
+    The streamed body (via aiter_bytes) is decompressed by httpx before it
+    reaches us, so the original Content-Encoding/Content-Length headers no
+    longer describe the payload. Keeping them would make httpx decompress the
+    raw text a second time and raise "Error -3 while decompressing data:
+    incorrect header check". This is scoped to the Website Sync crawler path.
+    """
+    final_headers = httpx.Headers(headers) if headers else httpx.Headers()
+    final_headers.pop("Content-Encoding", None)
+    final_headers.pop("Content-Length", None)
+    return httpx.Response(status_code=status, headers=final_headers, content=body)
 
 
 class WebsiteCrawler:

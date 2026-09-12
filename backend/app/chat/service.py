@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.config import settings
-from app.chat.fallback import build_fallback_response
+from app.chat.fallback import _is_outside_scope, build_fallback_response
 from app.ingest.generator import GenerationError, stream_answer_async
 from app.ingest.prompts import format_context, display_title
 from app.ingest.retrieve import retrieve
@@ -289,36 +289,44 @@ async def run_chat(
     # Build retrieval context from conversation state if available
     retrieval_context = context or {}
 
-    # Cache retrieval by query hash AND context so that programme/semester/
-    # scheme-filtered results never leak to an identical query from another
-    # context (the `where` filter depends on `retrieval_context`).
-    cache = get_cache()
-    ctx_key = _context_cache_key(retrieval_context)
-    query_key = hashlib.md5((message + "|" + ctx_key).encode()).hexdigest()
-    cached_chunks = await cache.get("rag", query_key)
-    if cached_chunks is not None:
-        chunks = cached_chunks
+    # Outside-of-university-domain questions (weather, general knowledge,
+    # translation, ...) are answered DETERMINISTICALLY and never sent to the
+    # LLM: retrieval is skipped entirely and the fallback branch below emits
+    # the professional outside-scope message (with guidance back to supported
+    # topics and no authority card).
+    if _is_outside_scope(message):
+        chunks = []
     else:
-        try:
-            # Retrieval chains Ollama embedding (HTTP, up to 120s), a Chroma
-            # query and a BM25 refresh that can load tens of thousands of
-            # chunks — never run that on the event loop or a single chat
-            # stalls every user.
-            chunks = _relevant(
-                await asyncio.to_thread(retrieve, message, context=retrieval_context)
-            )
-            await cache.set("rag", query_key, chunks, ttl=60.0)
-        except Exception as exc:
-            # Retrieval/embedding failures must never propagate: the user gets
-            # a friendly, traceable message instead of a broken SSE stream.
-            log.error("Retrieval failed chat=%s query=%s: %s", chat_id, message[:120], exc)
-            yield {
-                "type": "error",
-                "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
-                "ref": hashlib.sha1(str(chat_id or "").encode()).hexdigest()[:8],
-            }
-            yield {"type": "done", "chat_id": str(conv.id), "cited_chunks": []}
-            return
+        # Cache retrieval by query hash AND context so that programme/semester/
+        # scheme-filtered results never leak to an identical query from another
+        # context (the `where` filter depends on `retrieval_context`).
+        cache = get_cache()
+        ctx_key = _context_cache_key(retrieval_context)
+        query_key = hashlib.md5((message + "|" + ctx_key).encode()).hexdigest()
+        cached_chunks = await cache.get("rag", query_key)
+        if cached_chunks is not None:
+            chunks = cached_chunks
+        else:
+            try:
+                # Retrieval chains Ollama embedding (HTTP, up to 120s), a Chroma
+                # query and a BM25 refresh that can load tens of thousands of
+                # chunks — never run that on the event loop or a single chat
+                # stalls every user.
+                chunks = _relevant(
+                    await asyncio.to_thread(retrieve, message, context=retrieval_context)
+                )
+                await cache.set("rag", query_key, chunks, ttl=60.0)
+            except Exception as exc:
+                # Retrieval/embedding failures must never propagate: the user gets
+                # a friendly, traceable message instead of a broken SSE stream.
+                log.error("Retrieval failed chat=%s query=%s: %s", chat_id, message[:120], exc)
+                yield {
+                    "type": "error",
+                    "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
+                    "ref": hashlib.sha1(str(chat_id or "").encode()).hexdigest()[:8],
+                }
+                yield {"type": "done", "chat_id": str(conv.id), "cited_chunks": []}
+                return
 
     # Scope chunks to the conversation's programme so a "BCA" answer never
     # carries MCA facts. Comparisons (programmes list) keep all targets.
@@ -361,18 +369,34 @@ async def run_chat(
             events, assistant_text = _fallback_events(message)
             for event in events:
                 yield event
-        if _llm_parroted_prompt(assistant_text):
+        # Never emit an empty bubble: an empty / whitespace-only generation is
+        # replaced with the full professional fallback (text + options).
+        if not assistant_text.strip():
+            log.warning("Generation returned empty text; falling back cleanly")
+            events, assistant_text = _fallback_events(message)
+            for event in events:
+                yield event
+        elif _llm_parroted_prompt(assistant_text):
             log.warning("Generation parroted the prompt; falling back cleanly")
             events, assistant_text = _fallback_events(message)
             for event in events:
                 yield event
         elif _llm_confessed_unknown(assistant_text):
             cut = _confession_cut(assistant_text)
-            if cut > 0:
-                assistant_text = assistant_text[:cut].rstrip()
-            yield {"type": "token", "text": assistant_text}
-            for event in _llm_fallback_events(message):
-                yield event
+            prefix = assistant_text[:cut].rstrip() if cut > 0 else assistant_text
+            if prefix.strip():
+                assistant_text = prefix
+                yield {"type": "token", "text": assistant_text}
+                for event in _llm_fallback_events(message):
+                    yield event
+            else:
+                # The model answered with ONLY the "not in knowledge base"
+                # sentence — the prefix is empty. Keep it clean: emit the full
+                # fallback (text + authority card + options) instead of an
+                # empty token.
+                events, assistant_text = _fallback_events(message)
+                for event in events:
+                    yield event
         else:
             yield {"type": "token", "text": assistant_text}
 

@@ -101,6 +101,31 @@ def find_duplicate(db: Session, authority_name: str, email: str, exclude_id: str
     return None
 
 
+def grievance_eligible_ids(db: Session) -> set[str]:
+    """IDs of authorities that can receive NEW grievances.
+
+    An authority is a valid grievance destination only while it has at least
+    one ACTIVE `authority_admin` account assigned to it (`users.authority_id`).
+    The public picker, the AI recommendation step, the auto-match resolver and
+    submission validation all share this single definition — the database is
+    the sole source of truth, so deactivating the last administrator of an
+    authority removes it from every surface immediately.
+    """
+    from app.models import User
+
+    rows = (
+        db.query(User.authority_id)
+        .filter(
+            User.role == "authority_admin",
+            User.is_active.is_(True),
+            User.authority_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
 def list_all(db: Session, active_only: bool = False, include_deleted: bool = False) -> list[dict[str, Any]]:
     q = db.query(Authority)
     if not include_deleted:

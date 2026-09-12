@@ -13,8 +13,10 @@ every endpoint is per-IP rate limited):
 
 Security notes:
   * Submission requires a valid email and a real grievance text (>= 10 chars).
-  * The selected authority MUST be currently active; inactive/unknown ids are
-    rejected outright (never routed to a stale office).
+  * The selected authority MUST currently accept grievances — active AND backed
+    by at least one active Authority Admin account; inactive, unknown, or
+    administrator-less ids are rejected outright (never routed to a stale
+    office nobody can see).
   * Verify returns a PII-free status payload; wrong/missing token and unknown
     reference both fail identically via 403/404 without leaking anything.
   * tracking_token is returned ONCE, at submission time, never logged.

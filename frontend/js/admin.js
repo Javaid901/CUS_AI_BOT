@@ -782,6 +782,9 @@
       if (btn.dataset.tab === "studentServices") {
         if (window.CUS && window.CUS.studentAdminInit) window.CUS.studentAdminInit();
       }
+      if (btn.dataset.tab === "notices") {
+        if (window.CUS && window.CUS.noticesAdminInit) window.CUS.noticesAdminInit();
+      }
       if (btn.dataset.tab === "profile") { loadProfile(); }
     });
   });
@@ -1764,7 +1767,9 @@
   // ===== Website Sync dashboard =====
   var WS_CATEGORIES = ["admissions","examinations","departments","programmes","news","notices","faculty","scholarships","hostels","transport","administration","research","academic-calendar","events","policies","downloads","unknown"];
   var _wsStatus = null;
+  var _wsEnabled = false;
   var _wsPollTimer = 0;
+  var _wsStatusReq = 0;
   var WS_TERMINAL_STATES = ["Ready", "Warning", "Error"];
 
   function wsApi(path, method, body) {
@@ -1820,7 +1825,9 @@
   }
 
   function loadWSStatus() {
+    var req = ++_wsStatusReq;
     wsApi("/api/admin/website-sync/status").then(function (res) {
+      if (req !== _wsStatusReq) return; // stale response; newer load is in flight
       if (!res.ok) { toast("Status load failed", "error"); return; }
       var s = res.data || {};
       _wsStatus = s;
@@ -1831,9 +1838,11 @@
       var breakdown = s.status_breakdown || {};
       $("wsFailed").textContent = breakdown.failed || 0;
       $("wsDupe").textContent = s.duplicate_pages || 0;
-      $("wsToggle").checked = !!s.enabled;
+      _wsEnabled = !!s.master_enabled;
       var schEl = $("wsSchedule");
+      schEl.disabled = !_wsEnabled;
       if (s.schedule && schEl.querySelector('option[value="' + s.schedule + '"]')) schEl.value = s.schedule;
+      wsRenderControl();
       var lr = s.last_run;
       $("wsLastRun").textContent = lr ? "Last run: " + (lr.finished_at || lr.started_at || "running") + " — " + (lr.status || "") : "Never synced";
       var chips = $("wsStatusChips");
@@ -1949,27 +1958,74 @@ function wsRunNow() {
         toast("Website sync complete", "success");
         wsSetStatus(null);
       } else {
-        toast("Website sync failed: " + (res.data.detail || "unknown"), "error");
-        wsSetStatus("<b>Sync error:</b> " + esc((res.data && res.data.detail) || "unknown"));
+        var msg = extractApiError(res, "Sync failed");
+        toast("Website sync failed: " + msg, "error");
+        wsSetStatus("<b>Sync error:</b> " + esc(msg));
       }
     }).catch(function () { toast("Network error during sync", "error"); })
       .finally(function () {
         if (_wsPollTimer) { clearInterval(_wsPollTimer); _wsPollTimer = 0; }
-        btn.disabled = false; btn.textContent = "\u25b6 Sync Now";
+        btn.disabled = false;
+        wsRenderControl();
         setTimeout(function () { loadWebsiteSync(); }, 300);
       });
   }
 
-  function wsToggleSync() {
-    var schedule = $("wsSchedule").value;
-    wsApi("/api/admin/website-sync/toggle", "POST", { enabled: $("wsToggle").checked, schedule: schedule })
-      .then(function (res) { if (res.ok) toast("Sync settings saved", "success"); });
+  function wsRenderControl() {
+    var btn = $("wsRunBtn");
+    var badge = $("wsStateBadge");
+    var disBtn = $("wsDisableBtn");
+    if (!btn || !badge || !disBtn) return;
+    if (_wsEnabled) {
+      btn.textContent = "\u25b6 Sync Now";
+      btn.dataset.mode = "run";
+      badge.textContent = "Status: Enabled";
+      badge.className = "status-badge on";
+      disBtn.style.display = "";
+    } else {
+      btn.textContent = "Enable Website Sync";
+      btn.dataset.mode = "enable";
+      badge.textContent = "Status: Disabled";
+      badge.className = "status-badge off";
+      disBtn.style.display = "none";
+    }
+    badge.style.display = "inline-flex";
   }
 
-  $("wsRunBtn").addEventListener("click", wsRunNow);
+  function wsSetEnabled(value, done) {
+    wsApi("/api/admin/website-sync/toggle", "POST", { enabled: value, schedule: $("wsSchedule").value })
+      .then(function (res) {
+        if (res.ok) {
+          toast(value ? "Website Sync enabled" : "Website Sync disabled", "success");
+          if (done) done(true);
+        } else {
+          toast("Could not " + (value ? "enable" : "disable") + " Website Sync: " + extractApiError(res, "Request failed"), "error");
+          if (done) done(false);
+        }
+      });
+  }
+
+  function wsEnableSync() {
+    wsSetEnabled(true, function (ok) { if (ok) loadWebsiteSync(); });
+  }
+
+  function wsSaveSchedule() {
+    wsApi("/api/admin/website-sync/toggle", "POST", { enabled: _wsEnabled, schedule: $("wsSchedule").value })
+      .then(function (res) {
+        if (res.ok) { toast("Sync schedule saved", "success"); loadWebsiteSync(); }
+        else toast("Could not save schedule: " + extractApiError(res, "Request failed"), "error");
+      });
+  }
+
+  $("wsRunBtn").addEventListener("click", function () {
+    if ($("wsRunBtn").dataset.mode === "enable") wsEnableSync();
+    else wsRunNow();
+  });
+  $("wsDisableBtn").addEventListener("click", function () {
+    wsSetEnabled(false, function (ok) { if (ok) loadWebsiteSync(); });
+  });
   $("wsRefreshBtn").addEventListener("click", loadWebsiteSync);
-  $("wsToggle").addEventListener("change", wsToggleSync);
-  $("wsSchedule").addEventListener("change", wsToggleSync);
+  $("wsSchedule").addEventListener("change", wsSaveSchedule);
   $("wsApplyFilter").addEventListener("click", loadWebsiteSync);
   $("wsFilterQ").addEventListener("keydown", function (e) { if (e.key === "Enter") loadWebsiteSync(); });
   $("wsDupesBtn").addEventListener("click", function () {

@@ -248,15 +248,36 @@
 #cusw .input-wrap .send:disabled { opacity: .35; cursor: default; transform: none; box-shadow: none; }
 #cusw .input-wrap .send svg { width: 18px; height: 18px; }
 
-/* Microphone button — ensure icon is visible */
+/* Microphone button — press-and-hold voice input (ChatGPT-style) */
 #cusw .mic {
   flex-shrink: 0;
   width: 40px; height: 40px; border-radius: 50%; border: none;
-  background: transparent; display: grid; place-items: center;
-  cursor: pointer;
-  flex-shrink: 0;
+  background: transparent; display: flex; align-items: center; justify-content: center;
+  gap: 7px; padding: 0; cursor: pointer; overflow: hidden; white-space: nowrap;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  transition: all .2s ease;
 }
-#cusw .mic svg { width: 20px; height: 20px; stroke-width: 1.5; stroke: #145a32; }
+#cusw .mic svg { width: 20px; height: 20px; stroke-width: 2; stroke: #145a32; flex-shrink: 0; }
+#cusw .mic .mic-label { display: none; font-size: 13.5px; font-weight: 600; color: #fff; }
+#cusw .mic.on {
+  width: auto; padding: 0 16px; border-radius: 22px;
+  background: linear-gradient(135deg, #b3261e, #d32f2f);
+  animation: micPulse 1.4s ease-in-out infinite;
+}
+#cusw .mic.on svg { stroke: #fff; }
+#cusw .mic.on .mic-label { display: inline; }
+#cusw .mic.processing {
+  width: auto; padding: 0 16px; border-radius: 22px;
+  background: linear-gradient(135deg, #0f5132, #145a32);
+  pointer-events: none;
+}
+#cusw .mic.processing svg { stroke: #fff; }
+#cusw .mic.processing .mic-label { display: inline; }
+#cusw .mic.unsupported { opacity: .4; cursor: not-allowed; }
+@keyframes micPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(179,38,30,.35); }
+  50%      { box-shadow: 0 0 0 8px rgba(179,38,30,0); }
+}
 
 /* Loading spinner inside send button */
 #cusw .input-wrap .send .spinner {
@@ -424,6 +445,12 @@
 #cusw .dv { padding: 6px 0; color: var(--cus-ink); }
 #cusw .dacts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 
+/* ---------- Admit card document frame (in-chat View) ---------- */
+#cusw .acd-doc { margin-top: 6px; }
+#cusw .acd-doc h4 { color: var(--cus-green); font-size: 15px; margin: 0 0 8px; }
+#cusw .acd-frame { border: 1px solid #d5dbe3; border-radius: 6px; overflow: hidden; margin: 8px 0 2px; background: #fff; }
+#cusw .acd-frame iframe { width: 100%; height: 560px; border: 0; background: #fff; display: block; }
+
 /* ---------- Breadcrumbs (context trail) ---------- */
 #cusw .breadcrumbs {
   font-size: 11px; color: #6b7280; padding: 4px 0 8px; display: flex;
@@ -525,6 +552,31 @@
 }
 @media (max-width: 380px) {
   #cusw .row .msg { max-width: 92%; font-size: 13.5px; }
+}
+
+/* ---------- Public university notices / date sheets ---------- */
+#cusw .notice-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; min-width: 0; }
+/* Namespaced on purpose: the marketing site styles a global `.notice-card`
+   (see main.css) with `display:flex`; sharing that class made the chat card a
+   squeezed flex-row so titles/meta collapsed to one character per line. */
+#cusw .ds-notice-card {
+  display: block; box-shadow: none;
+  border: 1px solid var(--cus-line, #e2e8f0); border-radius: 12px;
+  padding: 10px 12px; background: var(--cus-surface, #fff);
+}
+#cusw .ds-notice-card + .ds-notice-card { margin-top: 0; }
+#cusw .notice-head { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+#cusw .notice-head .nicon { font-size: 16px; line-height: 1.45; flex: none; }
+#cusw .notice-title { color: var(--cus-ink, #16222b); font-weight: 700; font-size: 13.5px; line-height: 1.4; }
+#cusw .notice-head .notice-title { margin: 0; flex: 1 1 auto; min-width: 0; }
+#cusw .notice-meta { color: #6b7280; font-size: 11.5px; margin-top: 3px; }
+#cusw .notice-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; margin-top: 8px; }
+#cusw .notice-actions a.chip { text-decoration: none; }
+#cusw .ds-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+#cusw .ds-actions a.chip { text-decoration: none; }
+#cusw .dtbl th {
+  text-align: left; padding: 6px 10px 6px 0; font-size: 11.5px; text-transform: uppercase;
+  letter-spacing: .04em; color: #6b7280; white-space: nowrap;
 }
 
 @media (prefers-reduced-motion: reduce) {

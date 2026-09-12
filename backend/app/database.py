@@ -131,6 +131,13 @@ def _upgrade_schema() -> None:
         "student_results": {
             "exam_roll_no": "VARCHAR(50)",
         },
+        "student_exam_forms": {
+            "exam_session_id": "VARCHAR(32)",
+            "form_no": "VARCHAR(30)",
+            "photo_path": "VARCHAR(255)",
+            "eligibility_snapshot": "TEXT",
+            "printed_at": "DATETIME",
+        },
         "documents": {
             "academic_scheme": "VARCHAR(20)",
             "programme": "VARCHAR(50)",
@@ -166,6 +173,10 @@ def _upgrade_schema() -> None:
         },
         "grievance_notifications": {
             "provider_message_id": "VARCHAR(200)",
+        },
+        "knowledge_gaps": {
+            "resolution_text": "TEXT",
+            "resolved_by": "VARCHAR(200)",
         },
     }
     inspector = inspect(engine)

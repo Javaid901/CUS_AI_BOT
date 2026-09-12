@@ -25,6 +25,48 @@ from pydantic import BaseModel, Field
 EXAM_TYPES: tuple[str, ...] = ("Regular", "Backlog")
 
 
+class ExamSessionCreate(BaseModel):
+    """POST /api/admin/exam-sessions body (super-admin provisioning)."""
+
+    name: str = Field(..., max_length=200)
+    code: str = Field(..., max_length=40)
+    programme: str = Field(..., max_length=50)
+    batch: str = Field(default="", max_length=30)
+    semester: int = Field(..., ge=1)
+    exam_type: str = Field(default="Regular", max_length=50)
+    academic_year: str = Field(default="", max_length=20)
+    application_open_at: str | None = Field(default=None, max_length=40)
+    last_date_normal: str | None = Field(default=None, max_length=40)
+    last_date_late: str | None = Field(default=None, max_length=40)
+    base_fee: int = Field(default=0, ge=0)
+    late_fee: int = Field(default=0, ge=0)
+    status: str = Field(default="Draft", max_length=20)
+
+
+class ExamSessionUpdate(BaseModel):
+    """PATCH /api/admin/exam-sessions/{id} body. All fields optional."""
+
+    name: str | None = Field(default=None, max_length=200)
+    code: str | None = Field(default=None, max_length=40)
+    programme: str | None = Field(default=None, max_length=50)
+    batch: str | None = Field(default=None, max_length=30)
+    semester: int | None = Field(default=None, ge=1)
+    exam_type: str | None = Field(default=None, max_length=50)
+    academic_year: str | None = Field(default=None, max_length=20)
+    application_open_at: str | None = Field(default=None, max_length=40)
+    last_date_normal: str | None = Field(default=None, max_length=40)
+    last_date_late: str | None = Field(default=None, max_length=40)
+    base_fee: int | None = Field(default=None, ge=0)
+    late_fee: int | None = Field(default=None, ge=0)
+    status: str | None = Field(default=None, max_length=20)
+
+
+class ExamSessionStatusUpdate(BaseModel):
+    """POST /api/admin/exam-sessions/{id}/status — deterministic transition."""
+
+    status: str = Field(..., max_length=20)
+
+
 class ImportBundle(BaseModel):
     """Super-Admin confirm body: the raw spreadsheet rows echoed from preview."""
 
@@ -75,12 +117,37 @@ class StudentFillCreate(BaseModel):
     Student is always identified by the resolved session cookie; only the form
     identity + own data may be expressed here. Fee/payment/admin fields are
     deliberately absent — the server owns them.
+
+    Two mutually-exclusive flavours (the server dispatches on `exam_session_id`):
+
+      * Session-driven (primary, Phase D2): send ONLY `exam_session_id`. The
+        server derives programme/semester/exam_type/academic_year/fee/subjects
+        from the OPEN ExamSession and runs the deterministic eligibility gate.
+        `subjects` and the legacy identity fields are IGNORED when a session is
+        given (forged subject lists can never override catalogue subjects).
+
+      * Legacy (backward-compatible exception path): send semester + exam_type
+        (+ optional academic_year/subjects). Used by the existing chat picker /
+        admin-provisioned flow and kept so pre-session forms keep working.
     """
 
-    semester: int = Field(..., ge=1)
-    exam_type: str = Field(..., max_length=50)
+    exam_session_id: str | None = Field(default=None, max_length=36)
+    semester: int | None = Field(default=None, ge=1)
+    exam_type: str | None = Field(default=None, max_length=50)
     academic_year: str = Field(default="", max_length=20)
     subjects: list[str] = Field(default_factory=list)
+    confirm: bool = Field(default=True)
+
+
+class StudentPrintBody(BaseModel):
+    """POST /api/student/exam-forms/{id}/print — PDF download/open vehicle.
+
+    `as_attachment=True` sends a Content-Disposition: attachment (download);
+    False returns the same PDF for inline preview. No other client state is
+    accepted; the server re-scopes the form to the session student.
+    """
+
+    as_attachment: bool = False
 
 
 class StudentSubmitBody(BaseModel):

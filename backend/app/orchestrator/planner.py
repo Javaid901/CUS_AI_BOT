@@ -306,6 +306,25 @@ def _plan_inner(
     except Exception:
         pass  # detector failures never break the normal flow
 
+    # ---- Stage 0-pre-exam: Exam form natural-language intents ----
+    # "fill exam form" / "print exam form" must reach the student_service
+    # exam_form flow directly.  This runs BEFORE query-understanding
+    # preprocessing which rewrites "fill" -> "final" and "print" -> "price",
+    # destroying the action verb that the unsupported-service rule needs.
+    _exam_nl = re.match(
+        r"^\s*(fill|print)\s+(?:an?\s+)?(?:exam(?:ination)?\s+form)\s*[.?!]*\s*$",
+        text,
+    )
+    if _exam_nl:
+        _ev = _exam_nl.group(1).lower()
+        return Plan(
+            action="student_service",
+            target="exam_form",
+            confidence=0.97,
+            reason=f"Exam form intent: {_ev}",
+            extra={"service": "exam_form", "exam_intent": _ev},
+        )
+
     # ---- Stage 0: Query Understanding preprocessing ----
     # Lightweight normalization, spelling correction, alias expansion.
     # Only run on non-trivial messages (not single option selections).
@@ -502,6 +521,34 @@ def _plan_inner(
             reason=f"Programme comparison: {' vs '.join(e.programmes)}",
             extra={"programmes": list(e.programmes), "topic": _comparison_topic},
         )
+
+    # ---- Rule 3a: University notices / date sheet ----
+    # "date sheet", "time table", "exam schedule", "bca 4th sem date sheet"
+    # route to the structured public-notices pipeline (backend/app/notices).
+    # This runs BEFORE the catalogue block so "bca datesheet" can never be
+    # misread as a bare catalogue-overview request, and a bare "datesheet"
+    # (also a registered navigation label) can never fall through to the
+    # generic "which programme?" slot-fill — the browser-visible bug that the
+    # old picker surfaced. _detect_notice_intent is keyword-gated on exam-
+    # schedule vocabulary, so one-word navigation labels like "notices",
+    # "examination" and "dates" return None and keep their normal flows.
+    # Mode becomes `schedule` when an explicit semester is present (with a
+    # programme it is that programme's filtered schedule; without one the
+    # whole matching semester sheet is served); otherwise the engine lists
+    # published date-sheet notices.
+    notice_intent = _detect_notice_intent(text, e)
+    if notice_intent:
+            _pid = notice_intent.get("programme")
+            if _pid:
+                ctx.programme = _pid
+                ctx.programme_id = _pid
+            return Plan(
+                action="university_notices",
+                target=notice_intent.get("query") or text,
+                confidence=notice_intent.get("confidence", 0.85),
+                reason=notice_intent.get("reason", "University notices / date-sheet intent"),
+                extra=notice_intent,
+            )
 
     # ---- Rule 3b: Academic catalogue (NEP) ----
     # Structured catalogue data (programmes, subjects, VAC/SEC/AEC, credits,
@@ -1764,3 +1811,171 @@ def _detect_news_intent(text: str) -> str | None:
         if kw not in low:
             parts.append(kw)
     return " ".join(parts) if len(parts) > 1 else low
+
+
+# ---------------------------------------------------------------------------
+# University notices (public date sheets)
+# ---------------------------------------------------------------------------
+
+# Phrases that mark a university-notices / date-sheet request. Deliberately
+# narrower than _NEWS_NOUNS: only exam-schedule vocabulary routes to the
+# structured notices pipeline; bare "notices"/"circular" stays with the
+# website-knowledge / news flow (Rule 3b).
+_SCHEDULE_KEYWORDS = (
+    "date sheet", "date-sheet", "datesheet",
+    "time table", "time-table", "timetable",
+    "exam schedule", "examination schedule", "schedule of exam",
+    "exam date", "examination date",
+    "exam timetable", "examination timetable",
+)
+
+# Stream/sub-branch mentions that further narrow a date-sheet request
+# ("btech cse 4th sem date sheet"). Short ambiguous tokens ("it", "ce",
+# "ee", "me") are deliberately excluded so ordinary English is never
+# misread as a stream.
+_STREAM_TERMS = (
+    ("cse", "cse"),
+    ("computer science", "cse"),
+    ("ece", "ece"),
+    ("electronics and communication", "ece"),
+    ("eee", "eee"),
+    ("electrical and electronics", "eee"),
+    ("mechanical", "mechanical"),
+    ("civil", "civil"),
+    ("electronics", "electronics"),
+    ("electrical", "electrical"),
+)
+
+
+def _detect_stream(text: str) -> str | None:
+    """Extract a stream/branch mention (cse, ece, ...) from the message."""
+    low = text.lower()
+    for term, stream in _STREAM_TERMS:
+        if term in low:
+            return stream
+    return None
+
+
+def _detect_batch(text: str) -> str | None:
+    """Extract an explicit batch mention like "2024 batch" / "batch of 2024".
+
+    Batch is only ever inferred when the user explicitly says "batch" (or its
+    fuzzy-normalised twin "back", which query-understanding produces for
+    "…2024 batch…") — a bare year elsewhere is never guessed, so a query can
+    never silently over-filter on an unstated batch.
+    """
+    low = text.strip().lower()
+    if "batch" in low:
+        for pattern in (
+            r"batch[^0-9a-z]{0,24}?(20\d{2}(?:\s*[-/]\s*\d{2,4})?)",
+            r"(20\d{2}(?:\s*[-/]\s*\d{2,4})?)[^0-9a-z]{0,24}?batch",
+        ):
+            m = re.search(pattern, low)
+            if m:
+                return m.group(1).replace(" ", "")
+        m = re.search(r"\b(20\d{2})\b", low)
+        if m:
+            return m.group(1)
+        return None
+    # Fuzzy normalisation rewrites "2024 batch" -> "2024 back": a year directly
+    # adjacent to that mangled token is still an explicit batch mention.
+    m = re.search(r"(20\d{2}(?:\s*[-/]\s*\d{2,4})?)[^0-9a-z]{0,24}?back\b", low)
+    if m:
+        return m.group(1).replace(" ", "")
+    m = re.search(r"back\b[^0-9a-z]{0,24}?(20\d{2}(?:\s*[-/]\s*\d{2,4})?)", low)
+    if m:
+        return m.group(1).replace(" ", "")
+    return None
+
+
+# Discipline/programme mentions that pin a date-sheet request to a specific
+# subject column (pattern, canonical programme id). Long/specific patterns are
+# tested first; the slugs must exactly match DateSheetEntry.programme_id as
+# produced by the notices parser (see parser._COLUMN_PROGRAMME_MAP), so
+# "AI and ML …" filters programme_id == "ai-ml" rather than the degree family
+# (pg/msc/…) the extractor would otherwise return.
+_NOTICE_PROGRAMME_ALIASES = (
+    (r"\bbusiness\s+administration\b|\bbba\b", "business-administration"),
+    (r"\bcomputer\s+applications?\b", "computer-applications"),
+    (r"\bcomputer\s+science\b", "computer-science"),
+    (r"\bartificial\s+intelligence\b|\bmachine\s+learning\b|\bai\s*(?:and|&)\s*ml\b",
+     "ai-ml"),
+    (r"\bdata\s+science\b", "data-science"),
+    (r"\benvironmental\s+science\b", "environmental-science"),
+    (r"\bpolitical\s+science\b", "political-science"),
+    (r"\bjournalism[^\s]*", "journalism-mass-communication"),
+    (r"\bbio[- ]?chemistry\b|\bbiochemistry\b", "bio-chemistry"),
+    (r"\bhome\s+science\b", "home-science"),
+    (r"\bphysics\b", "physics"),
+    (r"\bchemistry\b", "chemistry"),
+    (r"\bbotany\b", "botany"),
+    (r"\bzoology\b", "zoology"),
+    (r"\bhistory\b", "history"),
+    (r"\beconomics\b", "economics"),
+    (r"\bgeography\b", "geography"),
+    (r"\benglish\b", "english"),
+    (r"\bmusic\b", "music"),
+    (r"\beducation\b", "education"),
+)
+
+
+def _detect_programme_discipline(text: str) -> str | None:
+    """Extract a discipline/programme-column mention (ai-ml, physics, ...)."""
+    low = text.lower()
+    for pattern, pid in _NOTICE_PROGRAMME_ALIASES:
+        if re.search(pattern, low):
+            return pid
+    return None
+
+
+def _detect_notice_intent(text: str, e: Any) -> dict | None:
+    """Detect a university-notices / date-sheet request (Rule 3a).
+
+    Returns a dict (mode `notice_list` | `schedule`, programme, semester,
+    stream, batch, query, confidence, reason) or None when the message is not
+    a date-sheet/schedule request. Mode becomes `schedule` whenever an
+    explicit semester is present — with a programme the engine serves that
+    programme's VERIFIED DateSheetEntry rows; without one it serves the whole
+    matching semester sheet. Programme/semesterless requests list the
+    published notices instead. The LLM never generates any schedule values.
+    """
+    low = text.strip().lower()
+    if not any(k in low for k in _SCHEDULE_KEYWORDS):
+        return None
+    programmes = list(getattr(e, "programmes", None) or [])
+    programme = programmes[0] if programmes else (getattr(e, "programme", None) or None)
+    semester = getattr(e, "semester", None) or None
+    stream = _detect_stream(low)
+    batch = _detect_batch(low)
+    discipline = _detect_programme_discipline(low)
+    # A discipline mention (subject column) overrides any degree family the
+    # extractor returned (pg/msc/…): verified schedule rows are keyed by the
+    # column programme id (ai-ml, physics, …), never the degree family.
+    if discipline:
+        programme = discipline
+    if semester is not None:
+        mode = "schedule"
+        conf = 0.92
+        reason = (
+            f"Date-sheet schedule for {programme.upper()} semester {semester}"
+            if programme else
+            f"Date-sheet schedule for semester {semester}"
+        )
+    elif programme:
+        mode = "notice_list"
+        conf = 0.85
+        reason = f"Published date-sheet notices for {programme.upper()}"
+    else:
+        mode = "notice_list"
+        conf = 0.8
+        reason = "Published date-sheet notices"
+    return {
+        "mode": mode,
+        "programme": programme,
+        "semester": semester,
+        "stream": stream,
+        "batch": batch,
+        "query": low,
+        "confidence": conf,
+        "reason": reason,
+    }

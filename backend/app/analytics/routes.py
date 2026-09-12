@@ -128,9 +128,19 @@ def analytics_bulk_delete_logs(
 ):
     """Bulk delete log entries. Payload: {"ids": ["id1", "id2", ...]}"""
     from app.analytics.reports import bulk_delete_activity_logs
-    ids = payload.get("ids", [])
+    ids = payload.get("ids")
     if not ids:
         raise HTTPException(status_code=400, detail="No IDs provided")
+    if not isinstance(ids, list) or len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Too many IDs (max 500)")
+    import uuid as _uuid_mod
+    for lid in ids:
+        if not isinstance(lid, str):
+            raise HTTPException(status_code=400, detail="Invalid ID format")
+        try:
+            _uuid_mod.UUID(lid)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid ID format")
     result = bulk_delete_activity_logs(ids)
     return result
 
@@ -232,17 +242,39 @@ def analytics_knowledge_gaps(
 @router.post("/knowledge-gaps/{gap_id}/resolve")
 def resolve_knowledge_gap(
     gap_id: str,
+    payload: dict[str, str],
     current: User = _protected,
     db: Session = Depends(get_db),
 ):
+    """Record an administrator-verified resolution for a knowledge gap.
+
+    The admin MUST supply the verified resolution text; nothing is generated
+    automatically. A second resolve that would overwrite a different existing
+    resolution is rejected so an existing resolution is never lost.
+    """
     from app.analytics.models import KnowledgeGap
     try:
         uid = uuid.UUID(gap_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid gap ID")
+    resolution = payload.get("resolution_text")
+    if not resolution or not resolution.strip():
+        raise HTTPException(status_code=400, detail="Resolution text is required")
+    resolution = resolution.strip()
+    if len(resolution) < 20:
+        raise HTTPException(status_code=400, detail="Resolution text must be at least 20 characters")
+
     gap = db.get(KnowledgeGap, uid)
     if not gap:
         raise HTTPException(status_code=404, detail="Knowledge gap not found")
+
+    if gap.resolved:
+        if gap.resolution_text == resolution:
+            return {"status": "resolved", "already_resolved": True}
+        raise HTTPException(status_code=409, detail="Knowledge gap is already resolved")
+
+    gap.resolution_text = resolution
+    gap.resolved_by = (current.full_name or "").strip() or current.username
     gap.resolved = True
     gap.resolved_at = datetime.now(timezone.utc)
     db.commit()

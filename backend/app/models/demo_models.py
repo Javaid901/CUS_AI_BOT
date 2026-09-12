@@ -85,9 +85,116 @@ class StudentExamForm(Base):
     transaction_id = Column(String(100), nullable=True)
     submission_date = Column(String(20), nullable=True)
     academic_year = Column(String(20), nullable=True)
+    # Exam Session model additions (additive, nullable — legacy rows stay valid).
+    exam_session_id = Column(_UUID(as_uuid=True), nullable=True, index=True)
+    form_no = Column(String(30), nullable=True, index=True)
+    photo_path = Column(String(255), nullable=True)
+    eligibility_snapshot = Column(Text, nullable=True)
+    printed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
     student = relationship("Student")
+
+
+class ExamSession(Base):
+    """A provisioned examination window students fill their exam forms against.
+
+    Lifecycle: Draft → Open (applications accepted) → Closed → Archived. The
+    `code` (e.g. "EXMPG26") prefixes every server-generated form number so a
+    form_no like "EXMPG26-3-00539" is globally readable and unique. `form_seq`
+    is the per-session counter that backs form_no allocation.
+    """
+
+    __tablename__ = "exam_sessions"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    code = Column(String(40), nullable=False, unique=True, index=True)
+    programme = Column(String(50), nullable=False)
+    batch = Column(String(30), nullable=True)
+    semester = Column(Integer, nullable=False)
+    exam_type = Column(String(50), default="Regular")
+    academic_year = Column(String(20), nullable=True)
+    application_open_at = Column(DateTime, nullable=True)
+    last_date_normal = Column(DateTime, nullable=True)
+    last_date_late = Column(DateTime, nullable=True)
+    base_fee = Column(Integer, default=0)
+    late_fee = Column(Integer, default=0)
+    status = Column(String(20), default="Draft")
+    form_seq = Column(Integer, default=0)
+    created_by = Column(_UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ExamApplicationSubject(Base):
+    """Server-derived subjects on a submitted/printed exam form.
+
+    `source` records where the subject list came from (system = derived from the
+    academic catalogue; manual = carved on a legacy/admin bookkeeping row). A
+    student can never write rows here — the server writes them at fill time.
+    """
+
+    __tablename__ = "exam_application_subjects"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    form_id = Column(_UUID(as_uuid=True), ForeignKey("student_exam_forms.id", ondelete="CASCADE"), nullable=False, index=True)
+    subject_code = Column(String(30), nullable=True)
+    subject_name = Column(String(200), nullable=False)
+    source = Column(String(20), default="system")
+    verified = Column(Boolean, default=False)
+    verified_by = Column(String(50), nullable=True)
+    verified_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    form = relationship("StudentExamForm")
+
+
+class ExamEligibility(Base):
+    """Snapshot of a student's eligibility check for one exam session.
+
+    `rules` is a JSON list of {"rule", "passed", "message"} entries — the
+    deterministic evidence behind `eligible`. A student can never express these;
+    only the server writes them at fill time.
+    """
+
+    __tablename__ = "exam_eligibility"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    form_id = Column(_UUID(as_uuid=True), ForeignKey("student_exam_forms.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(_UUID(as_uuid=True), nullable=True, index=True)
+    eligible = Column(Boolean, default=False)
+    rules = Column(Text, nullable=True)
+    evaluated_at = Column(DateTime, default=utcnow)
+
+    form = relationship("StudentExamForm")
+
+
+class ExamPayment(Base):
+    """A payment record on an exam form (mock/manual payment backend).
+
+    Rows start as `initiated`; the payment backend adapter performs the actual
+    transition to `success` (server-side, never trusted browser state). The
+    exam form only becomes submittable once a `success` payment exists.
+    """
+
+    __tablename__ = "exam_payments"
+
+    id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    form_id = Column(_UUID(as_uuid=True), ForeignKey("student_exam_forms.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(_UUID(as_uuid=True), nullable=True, index=True)
+    amount = Column(Integer, nullable=False)
+    head = Column(String(100), default="Exam Form Fee")
+    status = Column(String(20), default="initiated")
+    gateway = Column(String(50), default="mock")
+    gateway_ref = Column(String(100), nullable=True)
+    failure_reason = Column(String(200), nullable=True)
+    recorded_by = Column(String(50), nullable=True)
+    recorded_at = Column(DateTime, nullable=True)
+    reconciled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    form = relationship("StudentExamForm")
 
 
 class FeeReceipt(Base):
@@ -249,6 +356,10 @@ class HelpdeskTicket(Base):
 __all__ = [
     "BacklogStatus",
     "CourseRegistration",
+    "ExamApplicationSubject",
+    "ExamEligibility",
+    "ExamPayment",
+    "ExamSession",
     "FeeReceipt",
     "HelpdeskTicket",
     "MigrationCertificate",

@@ -7,15 +7,19 @@
 
   var COLORS = ["#0F5132","#145A32","#1E7E34","#28A745","#34CE7C","#6FCF97","#A3E4C4","#C8E6D3","#E8F5E9","#FFF3CD","#FED7AA","#FB923C","#FDBA74","#F97316","#DC2626","#991B1B"];
 
+  var MIN_RESOLUTION_LEN = 20;
+
   function authHeaders() { var h = {}; var t = localStorage.getItem("cus_admin_token"); if (t) h.Authorization = "Bearer " + t; return h; }
   function log(m) { console.log("[CUS-Insights] " + m); }
+  function toast(msg, type) { if (window.CUS_TOAST) window.CUS_TOAST(msg, type || "info"); }
 
   var _charts = {};
   function destroyChart(id) { if (_charts[id]) { try { _charts[id].destroy(); } catch(e) {} delete _charts[id]; } }
 
-  function fetchJSON(url) {
-    log("GET " + url);
-    return fetch(url, { headers: authHeaders() }).then(function (r) {
+  function fetchJSON(url, opts) {
+    var request = Object.assign({}, opts, { headers: Object.assign(authHeaders(), (opts && opts.headers) || {}) });
+    log((request.method || "GET") + " " + url);
+    return fetch(url, request).then(function (r) {
       if (r.status === 401) { log("Unauthorized, reloading"); window.location.reload(); throw new Error("Unauthorized"); }
       if (!r.ok) { log("HTTP " + r.status + " for " + url); throw new Error("HTTP " + r.status); }
       return r.json();
@@ -324,12 +328,18 @@
     if (logs.length === 0) {
       html += '<div class="insight-empty"><p>No activity logs found for the current period.</p></div>';
     } else {
+      html += '<div class="trending-bulk-bar">';
+      html += '<button id="deleteSelectedLogsBtn" class="btn sm red" type="button" disabled title="Delete selected query logs">Delete Selected</button>';
+      html += '<span class="trending-bulk-hint" id="trendingBulkHint"></span>';
+      html += '</div>';
       html += '<table class="insight-table trending-logs-table">';
       html += '<thead><tr>';
+      html += '<th class="trending-select-col"><input type="checkbox" id="trendingSelectAll" class="trending-select-all" title="Select all visible rows"></th>';
       html += '<th>Time</th><th>Type</th><th>Query / Action</th><th>Category</th><th>Programme</th><th>Result</th><th>Time (ms)</th><th style="width:40px;">Actions</th>';
       html += '</tr></thead><tbody>';
       logs.forEach(function (log) {
-        html += '<tr>';
+        html += '<tr data-log-id="' + esc(log.id) + '">';
+        html += '<td class="trending-select-col"><input type="checkbox" class="trending-row-checkbox" value="' + esc(log.id) + '" title="Select this query log"></td>';
         html += '<td>' + esc(log.time_display) + '</td>';
         html += '<td><span class="badge badge-' + getBadgeClass(log.activity_type) + '">' + esc(log.activity_label) + '</span></td>';
         html += '<td class="query-cell">' + esc(log.query_text || log.activity_label) + '</td>';
@@ -345,6 +355,18 @@
     html += '</div>';
 
     document.getElementById("trendingLogsContent").innerHTML = html;
+    if (logs.length > 0) wireTrendingSelection();
+  }
+
+  function wireTrendingSelection() {
+    var header = document.getElementById("trendingSelectAll");
+    var delBtn = document.getElementById("deleteSelectedLogsBtn");
+    if (header) header.addEventListener("change", function () { toggleTrendingSelectAll(header); });
+    if (delBtn) delBtn.addEventListener("click", deleteSelectedTrendingLogs);
+    document.querySelectorAll(".trending-row-checkbox").forEach(function (cb) {
+      cb.addEventListener("change", function () { toggleTrendingRowSelect(cb); });
+    });
+    updateSelectedCountDisplay();
   }
 
   function renderTrendingPagination() {
@@ -468,19 +490,94 @@
       }
       document.getElementById("gapsContent").innerHTML = html;
       document.querySelectorAll(".resolve-gap").forEach(function (btn) {
-        btn.addEventListener("click", function () { window.resolveGap(btn.getAttribute("data-gap-id")); });
+        btn.addEventListener("click", function () {
+          var gid = btn.getAttribute("data-gap-id");
+          var gap = gaps.filter(function (g) { return g.id === gid; })[0] || {};
+          openResolveGap(gap);
+        });
       });
     }).catch(function (err) {
       emptyState("gapsContent", "Could not load knowledge gaps: " + err.message);
     });
   }
 
-  window.resolveGap = function (gapId) {
-    fetch(BASE + "/knowledge-gaps/" + gapId + "/resolve", {
-      method: "POST",
-      headers: authHeaders()
-    }).then(function (r) { if (r.ok) loadGaps(); }).catch(function () {});
-  };
+  function openResolveGap(g) {
+    var body =
+      '<div class="resolve-gap-details">' +
+      '<div class="row"><span class="k">Gap Type</span><span class="v">' + esc(g.gap_type || "–") + '</span></div>' +
+      '<div class="row"><span class="k">Original Query</span><span class="v">' + esc(g.query_text || "–") + '</span></div>' +
+      '<div class="row"><span class="k">Frequency</span><span class="v">' + (g.frequency != null ? g.frequency : "–") + '</span></div>' +
+      '<div class="row"><span class="k">Confidence</span><span class="v">' + (g.confidence_score != null ? Math.round(g.confidence_score * 100) + "%" : "–") + '</span></div>' +
+      '<div class="row"><span class="k">Suggestion</span><span class="v">' + esc(g.suggestion || "–") + '</span></div>' +
+      '</div>' +
+      '<label style="display:block;font-weight:600;font-size:13.5px;color:var(--navy);margin-bottom:8px;">Official Resolution / Answer <span class="req">*</span></label>' +
+      '<textarea id="rgResolution" class="rg-textarea" rows="5" placeholder="Enter the verified information or action taken to address this knowledge gap. Do not enter guessed information."></textarea>' +
+      '<p class="rg-helper">Enter the verified information or action taken to address this knowledge gap. Do not enter guessed information.</p>' +
+      '<div id="rgError" style="display:none;color:#dc2626;margin-top:12px;font-size:13px;"></div>';
+
+    var ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.style.display = "flex";
+    ov.innerHTML =
+      '<div class="modal-box" style="max-width:560px;">' +
+      '<div class="modal-header"><h3>Resolve Knowledge Gap</h3><button type="button" class="modal-close" data-mclose="1">&times;</button></div>' +
+      '<div class="modal-body" style="padding:20px 24px;overflow-y:auto;">' + body + '</div>' +
+      '<div class="modal-footer"><button type="button" class="btn ghost" data-mclose="1">Cancel</button>' +
+      '<button type="button" class="btn green" id="rgConfirm">Confirm Resolve</button></div>' +
+      '</div>';
+    document.body.appendChild(ov);
+    ov.querySelectorAll("[data-mclose]").forEach(function (b) {
+      b.addEventListener("click", function () { ov.remove(); });
+    });
+    ov.addEventListener("click", function (e) { if (e.target === ov) ov.remove(); });
+
+    var ta = ov.querySelector("#rgResolution");
+    var errEl = ov.querySelector("#rgError");
+    var confirmBtn = ov.querySelector("#rgConfirm");
+
+    function showErr(msg) { errEl.textContent = msg; errEl.style.display = "block"; }
+
+    ta.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); confirmBtn.click(); }
+    });
+
+    confirmBtn.addEventListener("click", function () {
+      errEl.style.display = "none";
+      var text = ta.value.trim();
+      if (text.length < MIN_RESOLUTION_LEN) {
+        showErr("Please provide the official resolution before marking this gap as resolved. Minimum " + MIN_RESOLUTION_LEN + " characters.");
+        return;
+      }
+      confirmBtn.disabled = true;
+      fetch(BASE + "/knowledge-gaps/" + encodeURIComponent(g.id) + "/resolve", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+        body: JSON.stringify({ resolution_text: text })
+      }).then(function (r) {
+        if (r.status === 401) { log("Unauthorized, reloading"); window.location.reload(); throw new Error("Unauthorized"); }
+        if (!r.ok) { log("HTTP " + r.status + " for resolve gap " + g.id); throw { status: r.status }; }
+        return r.json();
+      }).then(function () {
+        ov.remove();
+        toast("Knowledge gap resolved.", "success");
+        loadGaps();
+      }).catch(function (err) {
+        if (err && err.message === "Unauthorized") return;
+        confirmBtn.disabled = false;
+        var status = err && err.status;
+        var msg;
+        if (status === 400) msg = "The resolution was rejected. Please include more verified detail (at least " + MIN_RESOLUTION_LEN + " characters).";
+        else if (status === 403) msg = "You do not have permission to resolve knowledge gaps.";
+        else if (status === 404) msg = "This knowledge gap no longer exists. It may have been removed.";
+        else if (status === 409) msg = "This knowledge gap has already been resolved.";
+        else msg = "Could not resolve the knowledge gap due to a server error. It has not been changed.";
+        showErr(msg);
+        log("Resolve failed for gap " + g.id + ": " + (err.message || "HTTP " + status));
+      });
+    });
+
+    ta.focus();
+  }
 
   // ===================================================================
   // 8. CONVERSATIONS
@@ -728,16 +825,30 @@ function getResultBadgeClass(status) {
     return map[status] || "gray";
   }
 
+  var _deleteInFlight = false;
+  var _trendingState = {
+    selectedLogs: new Set(),
+    page: 1,
+    totalPages: 1,
+    filters: { search: "", activity_type: "", result_status: "", category: "", programme: "", college: "", service: "", date_from: "", date_to: "" },
+  };
+
   function deleteTrendingLogDetail(logId) {
+    if (_deleteInFlight) return;
     if (!confirm("Delete this activity log?")) return;
+    _deleteInFlight = true;
     fetchJSON(BASE + "/logs/" + logId, {
       method: "DELETE",
       headers: authHeaders()
     }).then(function () {
       log("Deleted log: " + logId);
+      toast("Query log deleted.", "success");
       loadTrendingLogs(getPeriod());
     }).catch(function (err) {
-      alert("Delete failed: " + err.message);
+      log("Delete failed: " + logId + " -> " + err.message);
+      toast("Could not delete query log.", "error");
+    }).finally(function () {
+      _deleteInFlight = false;
     });
   }
 
@@ -745,6 +856,7 @@ function getResultBadgeClass(status) {
 // 2c. TRENDING LOADS (master activity/query log reload)
 // ===================================================================
   function loadTrendingLogs(period) {
+    _trendingState.selectedLogs.clear();
     showLoading("trendingLogsContent");
     var params = new URLSearchParams();
     params.append("period", period);
@@ -764,18 +876,29 @@ function getResultBadgeClass(status) {
 
   function deleteSelectedTrendingLogs() {
     if (_trendingState.selectedLogs.size === 0) return;
-    if (!confirm("Delete " + _trendingState.selectedLogs.size + " selected activity logs?")) return;
+    var n = _trendingState.selectedLogs.size;
+    if (!confirm("Delete " + n + " selected query logs?\n\nThis action cannot be undone.")) return;
     var ids = Array.from(_trendingState.selectedLogs);
+    var delBtn = document.getElementById("deleteSelectedLogsBtn");
+    if (delBtn) delBtn.disabled = true;
     fetchJSON(BASE + "/logs/bulk-delete", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ ids: ids })
     }).then(function (result) {
-      log("Deleted: " + result.deleted + ", Failed: " + result.failed);
+      var deleted = result && typeof result.deleted === "number" ? result.deleted : 0;
+      if (deleted > 0) {
+        toast(deleted === 1 ? "1 query log deleted." : deleted + " query logs deleted.", "success");
+      } else {
+        toast("Could not delete the selected query logs.", "error");
+      }
+      log("Bulk delete: deleted=" + deleted + ", failed=" + (result && result.failed));
       _trendingState.selectedLogs.clear();
       loadTrendingLogs(getPeriod());
     }).catch(function (err) {
-      alert("Delete failed: " + err.message);
+      log("Bulk delete failed: " + err.message);
+      toast("Could not delete the selected query logs.", "error");
+      updateSelectedCountDisplay();
     });
   }
 
@@ -783,8 +906,17 @@ function getResultBadgeClass(status) {
     var checked = headerCheckbox.checked;
     document.querySelectorAll(".trending-row-checkbox").forEach(function (cb) {
       cb.checked = checked;
-      toggleTrendingRowSelect(cb);
+      var id = cb.value;
+      var row = cb.closest("tr");
+      if (checked) {
+        _trendingState.selectedLogs.add(id);
+        if (row) row.classList.add("selected");
+      } else {
+        _trendingState.selectedLogs.delete(id);
+        if (row) row.classList.remove("selected");
+      }
     });
+    updateSelectedCountDisplay();
   }
 
   function toggleTrendingRowSelect(checkbox) {
@@ -797,27 +929,26 @@ function getResultBadgeClass(status) {
       _trendingState.selectedLogs.delete(id);
       if (row) row.classList.remove("selected");
     }
-    var headerCheckbox = document.getElementById("trendingSelectAll");
-    if (headerCheckbox) {
-      var allChecked = document.querySelectorAll(".trending-row-checkbox:checked").length === document.querySelectorAll(".trending-row-checkbox").length;
-      headerCheckbox.checked = allChecked;
-    }
     updateSelectedCountDisplay();
   }
 
   function updateSelectedCountDisplay() {
-    var countEl = document.querySelector(".filter-label[style*='color:var(--green)']");
-    var deleteBtn = document.querySelector(".trending-filters .btn.red");
-    if (_trendingState.selectedLogs.size > 0) {
-      if (!countEl) {
-        // Will be added on next render
-      }
-      if (!deleteBtn) {
-        // Will be added on next render
-      }
-    } else {
-      if (countEl) countEl.remove();
-      if (deleteBtn) deleteBtn.remove();
+    var n = _trendingState.selectedLogs.size;
+    var delBtn = document.getElementById("deleteSelectedLogsBtn");
+    var hint = document.getElementById("trendingBulkHint");
+    if (delBtn) {
+      delBtn.disabled = n === 0;
+      delBtn.textContent = n > 0 ? "Delete Selected (" + n + ")" : "Delete Selected";
+    }
+    if (hint) {
+      hint.textContent = n > 0 ? (n === 1 ? "1 query log selected." : n + " query logs selected.") : "";
+    }
+    var header = document.getElementById("trendingSelectAll");
+    if (header) {
+      var cbs = document.querySelectorAll(".trending-row-checkbox");
+      var checked = Array.prototype.filter.call(cbs, function (cb) { return cb.checked; }).length;
+      header.checked = cbs.length > 0 && checked === cbs.length;
+      header.indeterminate = checked > 0 && checked < cbs.length;
     }
   }
 

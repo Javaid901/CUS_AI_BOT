@@ -16,6 +16,8 @@ Endpoint contract note:
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -25,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.admin.profile import router as admin_profile_router
 from app.admin.routes import router as admin_router
+from app.admin.notices import router as admin_notices_router
 from app.analytics.routes import router as analytics_router
 from app.auth.routes import router as auth_router
 from app.authority.routes import public_router as authority_lookup_router
@@ -37,6 +40,7 @@ from app.college.routes import router as college_router
 from app.config import settings
 from app.database import create_all
 from app.grievance.routes import router as grievance_router
+from app.notices.routes import router as notices_router
 from app.public.routes import router as public_router
 from app.student.routes import router as student_router
 from app.student_admin.routes import router as student_admin_router
@@ -46,6 +50,7 @@ from app.student_admit_card.routes import admin_router as student_admit_card_adm
 from app.student_admit_card.routes import router as student_admit_card_router
 from app.student_exam_form.routes import admin_router as student_exam_form_admin_router
 from app.student_exam_form.routes import router as student_exam_form_router
+from app.student_exam_form.session_routes import router as exam_session_admin_router
 from app.utils.errors import register_exception_handlers
 from app.utils.logging import log
 
@@ -72,10 +77,12 @@ app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(admin_router)
 app.include_router(admin_profile_router)
+app.include_router(admin_notices_router)
 app.include_router(college_router)
 app.include_router(analytics_router)
 app.include_router(catalogue_router)
 app.include_router(public_router)
+app.include_router(notices_router)
 app.include_router(authority_admin_router)
 app.include_router(authority_lookup_router)
 app.include_router(authority_admins_router)
@@ -89,6 +96,7 @@ app.include_router(student_admit_card_router)
 app.include_router(student_admit_card_admin_router)
 app.include_router(student_exam_form_router)
 app.include_router(student_exam_form_admin_router)
+app.include_router(exam_session_admin_router)
 
 
 # ----- Spec-style aliases (for compatibility with the task spec) -----
@@ -141,6 +149,7 @@ def on_startup() -> None:
         _seed_students()
     _warmup_models()
     _warmup_intent_classifier()
+    _warmup_retrieval()
     _start_analytics_scheduler()
     _backfill_analytics()
     _start_website_sync_scheduler()
@@ -265,19 +274,51 @@ def _warmup_models() -> None:
     t2.join(timeout=120)
 
 
+def _is_testing() -> bool:
+    """True when running under pytest (or explicitly asked to skip warmups).
+
+    Heavy startup warmups are skipped here so `TestClient(app)` test suites
+    don't pay a ~20s model load on every entered client. Production/dev startup
+    (uvicorn) performs the warmups and first user queries stay fast.
+    """
+    return "pytest" in sys.modules or os.getenv("CUS_SKIP_STARTUP_WARMUP") == "1"
+
+
 def _warmup_intent_classifier() -> None:
-    """Pre-load the semantic intent model + centroids so first query is fast."""
-    import threading
+    """Pre-load the semantic intent model + centroids so first query is fast.
 
-    def _warm():
-        try:
-            from app.orchestrator.intent_classifier import warmup
-            warmup()
-            log.info("Intent classifier warmed up")
-        except Exception as exc:
-            log.warning("Intent classifier warmup failed (non-fatal): %s", exc)
+    Runs synchronously (blocking): the sentence-transformers import + model
+    load takes ~15-20s on this machine, and deferring it to a daemon thread
+    leaves the first user query paying the cold start on the request path.
+    """
+    if _is_testing():
+        log.debug("Intent classifier warmup skipped (test runner)")
+        return
+    try:
+        from app.orchestrator.intent_classifier import warmup
+        warmup()
+        log.info("Intent classifier warmed up (model + centroids ready)")
+    except Exception as exc:
+        log.warning("Intent classifier warmup failed (non-fatal): %s", exc)
 
-    threading.Thread(target=_warm, daemon=True).start()
+
+def _warmup_retrieval() -> None:
+    """Pre-build the BM25 index and open the Chroma client so first RAG is fast.
+
+    The first `hybrid_search` on a fresh process spends ~7-9s refreshing the
+    BM25 index (reads every chunk from on-disk Chroma). Warming it at startup
+    moves that one-time cost off the first user query.
+    """
+    if _is_testing():
+        log.debug("Retrieval warmup skipped (test runner)")
+        return
+    try:
+        from app.ingest.retriever import get_bm25
+
+        get_bm25().search("warmup", top_k=1)
+        log.info("Retrieval warmup complete (BM25 index + Chroma client ready)")
+    except Exception as exc:
+        log.warning("Retrieval warmup failed (non-fatal): %s", exc)
 
 
 def _seed_admin() -> None:

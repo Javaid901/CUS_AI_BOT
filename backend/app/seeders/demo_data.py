@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,10 @@ from app.student.dob import hash_dob
 from app.models.demo_models import (
     BacklogStatus,
     CourseRegistration,
+    ExamApplicationSubject,
+    ExamEligibility,
+    ExamPayment,
+    ExamSession,
     FeeReceipt,
     HelpdeskTicket,
     MigrationCertificate,
@@ -138,9 +143,12 @@ _GRADE_MARKS = [(90, "A+"), (80, "A"), (72, "B+"), (64, "B"), (56, "C+"), (48, "
 
 
 def _random_marks() -> tuple[int, int, int, str]:
-    internal = random.randint(15, 25)
-    external = random.randint(30, 60)
-    total = internal + external
+    # Internal assessment marks drive the existing 40% minimum-internals
+    # eligibility rule, so demo cohorts are generated realistically ABOVE the
+    # threshold (independent of the university's own rolling distribution).
+    internal = random.randint(72, 85)
+    external = random.randint(15, 35)
+    total = min(internal + external, 100)
     for min_mark, grade in _GRADE_MARKS:
         if total >= min_mark:
             return internal, external, total, grade
@@ -197,6 +205,8 @@ def _seed_demo_students(db: Session, count: int = 25) -> None:
 
     db.commit()
 
+    _seed_exam_sessions(db, student_objects)
+
     # Seed service data for each student
     for student, s in student_objects:
         _seed_results(db, student, s)
@@ -218,6 +228,54 @@ def _seed_demo_students(db: Session, count: int = 25) -> None:
     logging.getLogger("cus").info(
         "Seeded %d demo students with full service data", len(student_objects)
     )
+
+
+def _seed_exam_sessions(db: Session, student_objects: list[tuple[Student, dict]]) -> None:
+    """Provision OPEN Exam Sessions for each unique (programme, semester, batch).
+
+    The student-facing Fill flow only lists OPEN sessions that match a
+    student's own programme/current-semester/batch, so seeding one Open
+    session per demo cohort makes the Exam Session path exercisable end-to-end.
+    Idempotent: an existing session for the same programme+semester+batch
+    (and exam type) is never duplicated.
+    """
+    now = datetime.now(timezone.utc)
+    for student, s in student_objects:
+        programme = (s.get("programme") or "").strip().lower()
+        semester = int(s.get("semester") or student.current_semester or 1)
+        batch = (s.get("batch") or student.batch or "").strip()
+        exam_type = "Regular"
+        academic_year = f"{s.get('admission_year', 2025)}-{s.get('admission_year', 2025) + 1}"
+        existing = (
+            db.query(ExamSession)
+            .filter(
+                ExamSession.programme == programme,
+                ExamSession.semester == semester,
+                ExamSession.exam_type == exam_type,
+                ExamSession.academic_year == academic_year,
+            )
+            .all()
+        )
+        if any((x.batch or "") == batch for x in existing):
+            continue
+        db.add(ExamSession(
+            id=uuid.uuid4(),
+            name=f"Semester {semester} {exam_type} Examination ({programme.upper()})",
+            code=f"DEMO{programme.upper()}{semester}",
+            programme=programme,
+            batch=batch,
+            semester=semester,
+            exam_type=exam_type,
+            academic_year=academic_year,
+            application_open_at=now - timedelta(days=10),
+            last_date_normal=now + timedelta(days=30),
+            last_date_late=now + timedelta(days=45),
+            base_fee=1500 + semester * 500,
+            late_fee=300,
+            status="Open",
+            form_seq=0,
+        ))
+    db.commit()
 
 
 def _seed_results(db: Session, student: Student, s: dict) -> None:
@@ -576,7 +634,12 @@ def seed_demo_data(db: Session, count: int = 25) -> int:
 def _seed_service_data_for_existing(db: Session) -> None:
     """Seed demo service data for existing students (no new student creation)."""
     students = db.query(Student).all()
+    student_objects = []
     for student in students:
+        s = _make_student_dict(student)
+        student_objects.append((student, s))
+    _seed_exam_sessions(db, student_objects)
+    for student, s in student_objects:
         s = _make_student_dict(student)
         _seed_results(db, student, s)
         _seed_admit_card(db, student, s)
@@ -620,7 +683,8 @@ def _make_student_dict(student: Student) -> dict:
 def reset_demo_data(db: Session) -> None:
     """Delete all demo data from all service tables + student sessions + students."""
     tables = [
-        StudentResult, StudentAdmitCard, StudentExamForm, FeeReceipt,
+        StudentResult, StudentAdmitCard, StudentExamForm, ExamSession,
+        ExamApplicationSubject, ExamEligibility, ExamPayment, FeeReceipt,
         StudentAttendance, StudentTranscript, MigrationCertificate,
         Revaluation, XeroxRequest, BacklogStatus, CourseRegistration,
         HelpdeskTicket, StudentSession, Student,

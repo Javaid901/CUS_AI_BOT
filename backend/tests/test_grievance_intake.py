@@ -50,7 +50,7 @@ from app.grievance.intake import (
     new_tracking_token,
 )
 from app.main import app
-from app.models import Authority
+from app.models import Authority, User
 
 # Mirror app startup so the new grievance columns exist on the real DB
 # (create_all + _upgrade_schema run idempotently).
@@ -61,6 +61,7 @@ FAIL: list[str] = []
 
 _created_refs: list[str] = []
 _created_authority_ids: list[str] = []
+_created_user_ids: list[str] = []
 client = TestClient(app)
 
 REF_RE = re.compile(r"^CUS-GRV-\d{4}-[0-9A-F]{8}$")
@@ -86,6 +87,8 @@ def _record_submission(reference: str) -> None:
 def _cleanup() -> None:
     db = SessionLocal()
     try:
+        for uid in _created_user_ids:
+            db.query(User).filter(User.id == uid).delete()
         for ref in _created_refs:
             db.query(Grievance).filter(Grievance.reference == ref).delete()
         for aid in _created_authority_ids:
@@ -104,6 +107,9 @@ def _purge_leftovers() -> None:
     """
     db = SessionLocal()
     try:
+        db.query(User).filter(
+            User.email.like("grv-adm-%@test.local")
+        ).delete(synchronize_session=False)
         db.query(Grievance).filter(
             (Grievance.reference.like("CUS-GRV-2099-%"))
             | (Grievance.student_email == "student@example.com")
@@ -146,6 +152,40 @@ def _make_authority(name: str = "Controller of Examinations", active: bool = Tru
         _created_authority_ids.append(a.id)
         authority_service.load_cache(db)
         return a.id
+    finally:
+        db.close()
+
+
+def _make_admin(
+    authority_id: str,
+    *,
+    active: bool = True,
+    username: str | None = None,
+) -> str:
+    """Create an Authority Admin account bound to the given authority.
+
+    No grievance surface (picker, recommendation, auto-match, submission) may
+    serve an authority without at least one ACTIVE such account.
+    """
+    from app.auth.security import hash_password
+
+    db = SessionLocal()
+    try:
+        u = User(
+            id=uuid.uuid4(),
+            username=username or f"__grv_adm_{uuid.uuid4().hex[:10]}",
+            email=f"grv-adm-{uuid.uuid4().hex[:8]}@test.local",
+            hashed_password=hash_password("pass1234"),
+            role="authority_admin",
+            is_active=active,
+            authority_id=authority_id,
+            full_name=f"Admin {authority_id[:4]}",
+            designation="Office Head",
+        )
+        db.add(u)
+        db.commit()
+        _created_user_ids.append(str(u.id))
+        return str(u.id)
     finally:
         db.close()
 
@@ -239,28 +279,43 @@ def test_reference_and_token_material():
 
 
 def test_recommendation_active_only():
-    print("-- recommend: active authorities only --")
-    active_id = _make_authority("Controller of Examinations", active=True)
+    print("-- recommend: eligible (active + admin-backed) authorities only --")
+    staffed_id = _make_authority("Controller of Examinations", active=True)
+    _make_admin(staffed_id)
+    unstaffed_id = _make_authority("Controller of Examinations (no admin)", active=True)
     inactive_id = _make_authority("Controller of Examinations (inactive)", active=False)
     active = None
     for m in authority_service.list_active():
-        if m["id"] == active_id:
+        if m["id"] == staffed_id:
             active = m
     check("active authority cached", active is not None)
     check("inactive authority excluded from cache", all(m["id"] != inactive_id for m in authority_service.list_active()))
+
+    from app.authority.repository import grievance_eligible_ids
+
+    db = SessionLocal()
+    try:
+        eligible = grievance_eligible_ids(db)
+    finally:
+        db.close()
+    check("staffed authority is grievance-eligible", staffed_id in eligible, str(eligible)[:120])
+    check("unstaffed active authority is NOT eligible", unstaffed_id not in eligible)
 
     r = client.post("/api/grievances/recommend", json={"input": "my results are wrong, please help"}, headers=_fake_ip(31))
     check("recommend endpoint 200", r.status_code == 200, str(r.text[:200]))
     body = r.json()
     top = body.get("authority") or {}
-    # Any real seeded authority may outrank the test one — what matters is
-    # that the recommendation is a LIVE authority and never the inactive one.
-    active_ids = {m["id"] for m in authority_service.list_active()}
-    check("recommendation is an active authority", top.get("authority_id") in active_ids, str(top))
+    alternates = body.get("alternatives", [])
+    recommended_ids = [x["authority_id"] for x in [top] + alternates if x.get("authority_id")]
+    check("recommendation is an eligible authority", top.get("authority_id", "") in eligible, str(top))
+    check("staffed authority recommended", staffed_id in recommended_ids, str(recommended_ids))
+    check("unstaffed active authority never recommended", unstaffed_id not in recommended_ids, str(recommended_ids))
     check("inactive authority never recommended",
-          top.get("authority_id") != inactive_id and
-          all(a.get("authority_id") != inactive_id for a in body.get("alternatives", [])),
-          str(body.get("alternatives", [])))
+          inactive_id not in recommended_ids,
+          str(recommended_ids))
+    check("every recommendation is eligible",
+          all(aid in eligible for aid in recommended_ids),
+          str(recommended_ids))
     check("recommend payload has stable keys",
           {"authority_id", "authority_name", "department_name", "email", "match_score"} <= set(top.keys()))
 
@@ -368,10 +423,18 @@ def test_submission_validation_and_security():
     r3 = client.post("/api/grievances", json=short, headers=_fake_ip(44))
     check("too-short final text rejected", r3.status_code == 422)
 
+    # Active but with NO Authority Admin assigned — also not routable.
+    unstaffed_id = _make_authority("Unstaffed Office")
+    unstaffed = _submit_payload(authority_id=unstaffed_id)
+    r3b = client.post("/api/grievances", json=unstaffed, headers=_fake_ip(44))
+    check("active-but-unstaffed office rejected (422)", r3b.status_code == 422, r3b.text[:200])
+    check("unstaffed rejection is explicit", "administrator" in (r3b.text or "").lower(), r3b.text[:200])
+
     active_id = _make_authority("Controller of Examinations")
+    _make_admin(active_id)
     routed = _submit_payload(authority_id=active_id)
     r4 = client.post("/api/grievances", json=routed, headers=_fake_ip(45))
-    check("active office accepted", r4.status_code == 201, r4.text[:200])
+    check("admin-backed active office accepted", r4.status_code == 201, r4.text[:200])
     db = SessionLocal()
     try:
         g = db.query(Grievance).filter(Grievance.reference == r4.json()["reference"]).first()
@@ -434,6 +497,7 @@ def test_idempotent_retry():
     from app.database import SessionLocal
 
     active_id = _make_authority("Controller of Examinations")
+    _make_admin(active_id)
     payload = _submit_payload(authority_id=active_id, final_text="Admit card has not been generated after form submission and fee payment.")
     key = "test-retry-" + uuid.uuid4().hex[:10]
 

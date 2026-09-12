@@ -16,8 +16,10 @@ Security contract:
     returned exactly once (at submission) and never persisted or emailed.
   * verify_submission returns a status-only payload — student PII is never
     exposed, and a wrong/missing token fails closed (caller maps to 403).
-  * Only ACTIVE authorities are eligible for routing; an inactive or unknown
-    authority id in a submission is rejected before anything is written.
+  * Only ACTIVE authorities that are ALSO backed by at least one active
+    Authority Admin account are eligible for routing; an inactive, unknown,
+    or administrator-less authority id in a submission is rejected before
+    anything is written.
 """
 
 from __future__ import annotations
@@ -35,7 +37,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.authority.matcher import find_authority
-from app.authority.repository import get_by_id as repo_get_by_id
+from app.authority.repository import (
+    get_by_id as repo_get_by_id,
+)
+from app.authority.repository import (
+    grievance_eligible_ids,
+)
 from app.authority.service import authority_service
 from app.config import settings
 from app.grievance.models import Grievance
@@ -101,17 +108,25 @@ _RECOMMEND_MIN_SCORE = 0.55
 
 
 def recommend_authorities(db: Session, text: str, top_k: int = 3) -> list[dict[str, Any]]:
-    """Best-fit active authorities for a grievance text.
+    """Best-fit eligible active authorities for a grievance text.
+
+    Only authorities that are BOTH active AND backed by at least one active
+    Authority Admin account can be recommended — an office with nobody to
+    receive the grievance is never suggested (and would not even appear in
+    the student picker).
 
     Returns up to top_k entries with stable keys
     (authority_id, authority_name, department_name, email, match_score).
     Empty list when nothing clears the threshold.
     """
+    eligible = grievance_eligible_ids(db)
     matches = find_authority(text, top_k=top_k)
     out: list[dict[str, Any]] = []
     for m in matches:
         score = float(m.get("_match_score", 0.0) or 0.0)
         if score < _RECOMMEND_MIN_SCORE:
+            continue
+        if m.get("id") not in eligible:
             continue
         out.append({
             "authority_id": m.get("id", ""),
@@ -126,6 +141,15 @@ def recommend_authorities(db: Session, text: str, top_k: int = 3) -> list[dict[s
 def is_active_authority(authority_id: str) -> bool:
     row = authority_service.get(authority_id)
     return bool(row)
+
+
+def is_routable_authority(db: Session, authority_id: str) -> bool:
+    """True only when the authority is active AND has an active Authority Admin.
+
+    This is the single gate for grievance submission: an active authority with
+    nobody assigned to receive grievances is not a valid destination.
+    """
+    return bool(authority_service.get(authority_id)) and authority_id in grievance_eligible_ids(db)
 
 
 def authority_summary(authority_id: str, db: Session | None = None) -> dict[str, Any]:
@@ -219,8 +243,11 @@ def submit_grievance(
         raise ValueError("final_text must be at least 10 characters")
 
     if authority_id:
-        if not is_active_authority(authority_id):
-            raise ValueError("selected authority is not available for routing")
+        if not is_routable_authority(db, authority_id):
+            raise ValueError(
+                "The selected authority is not currently accepting grievances "
+                "(no active administrator is assigned to it)."
+            )
 
     request_id = (idempotency_key or "").strip() or None
     if request_id:
@@ -406,6 +433,7 @@ __all__ = [
     "generate_public_reference",
     "hash_tracking_token",
     "is_active_authority",
+    "is_routable_authority",
     "new_tracking_token",
     "recommend_authorities",
     "submit_grievance",

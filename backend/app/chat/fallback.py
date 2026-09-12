@@ -18,6 +18,7 @@ Rules (never hallucinate):
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.ingest.prompts import FALLBACK_MESSAGE
@@ -39,8 +40,14 @@ _ALIAS_MAPS = {**DEPARTMENT_ALIASES, **SERVICE_ROUTES}
 
 # Keywords and patterns that indicate a question is clearly outside the
 # university chatbot's supported scope. Matched case‑insensitively.
+#
+# A match only counts as outside-scope when the message carries NO strong
+# university-domain signal (see _STRONG_UNI_RE). That guard keeps supported
+# questions that merely share a word from being misrouted — "Who is the
+# Vice-Chancellor of CUS?" matches "who is the" but must stay on-topic.
 _OUTSIDE_SCOPE_PATTERNS: tuple[str, ...] = (
     "weather",
+    "rain",
     "stock",
     "market",
     "currency",
@@ -52,17 +59,62 @@ _OUTSIDE_SCOPE_PATTERNS: tuple[str, ...] = (
     "president",
     "sports score",
     "result table",  # generic sports/competition table
+    "translate",
+    "joke",
+    "poem",
+    "song lyrics",
+    "recipe",
+    "population",
+)
+
+# Strong university-domain signals, assembled from the vocabulary ALREADY used
+# by the topic detector (app.ingest.retriever TOPIC_PATTERNS / programme
+# keywords) and the authority matcher (DEPARTMENT_ALIASES / SERVICE_ROUTES) —
+# nothing new is invented here. Stems are prefix-matched; short programme/
+# acronym tokens are word-boundary matched so "BA" never matches "basketball".
+_STRONG_UNI_RE = re.compile(
+    r"\b(?:"
+    # topic vocabulary (retriever TOPIC_PATTERNS)
+    r"admission\w*|apply\w*|enrol\w*|enroll\w*|admit\w*|"
+    r"fee\w*|result\w*|marksheet\b|grade[sd]?\b|"
+    r"eligib\w*|qualif\w*|prerequisite\w*|"
+    r"college\w*|campus\w*|"
+    r"exam\w*|date\s*sheet|admit\s*card|hall\s*ticket|"
+    r"scholarship\w*|financial\s*aid\b|"
+    r"doc\w*|course\w*|program(?:me)?s?\b|subject\w*|"
+    r"syllab\w*|curricul\w*|placement\w*|career\w*|"
+    r"semester\w*|hostel\w*|boarding\b|"
+    r"contact\w*|notice\w*|notification\w*|circular\w*|"
+    r"prospectus\b|brochure\b|facilit\w*|infrastructure\b|"
+    r"seats?\b|intake\b|faculty\b|teacher\w*|professor\w*|lecturer\w*|staff\b|"
+    r"librar\w*|labs?\b|laborator\w*|train\w*|"
+    r"download\w*|forms?\b|transfer\w*|migration\w*|backlog\w*|supplement\w*|"
+    r"transcript\w*|degree\w*|certificate\w*|attendance\b|"
+    # authority / department vocabulary (matcher DEPARTMENT_ALIASES and SERVICE_ROUTES)
+    r"registr\w*|chancellor\w*|vice\s*chancellor\b|dean[sd]?\b|coe\b|"
+    r"academic\w*|finance\b|account\w*|grievance\w*|help\s*desk\b|registration\w*|"
+    # programme keywords (retriever PROGRAMME_KEYWORDS)
+    r"ba\b|bsc\b|bcom\b|bba\b|bca\b|btech\b|bed\b|b\.?\s?ed\b|"
+    r"ma\b|msc\b|mcom\b|mba\b|mca\b|med\b|m\.?\s?ed\b|phd\b|dyd\b|"
+    r"integrated\b|ug\b|pg\b"
+    r")\b",
+    re.IGNORECASE,
 )
 
 
 def _is_outside_scope(message: str) -> bool:
     """Return True when the user query is clearly outside the university
-    chatbot's supported domain. No LLM calls — pure keyword/match checks."""
+    chatbot's supported domain (weather, general knowledge, translation, ...).
+
+    Deterministic — no LLM calls. A pattern match is accepted only when the
+    message carries NO strong university-domain signal (programme name,
+    department alias, or a topic keyword such as admission/fee/result), so
+    on-topic questions like "Who is the Vice-Chancellor of CUS?" are never
+    misrouted to the outside-scope response."""
     lower = message.lower()
-    for pattern in _OUTSIDE_SCOPE_PATTERNS:
-        if pattern in lower:
-            return True
-    return False
+    if not any(pattern in lower for pattern in _OUTSIDE_SCOPE_PATTERNS):
+        return False
+    return _STRONG_UNI_RE.search(lower) is None
 
 
 def _next_steps_text(outside_scope: bool) -> str:

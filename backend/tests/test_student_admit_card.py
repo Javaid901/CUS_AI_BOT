@@ -724,16 +724,17 @@ def test_chat_admit_card_picker_and_detail_flow():
     assert "admit_card_sem-2" in all_options_ids
 
     text2, events2 = _chat_events("admit_card_sem-2")
-    details = [e for e in events2 if e.get("type") == "detail"]
-    assert details, "chip click should yield an admit card detail"
-    joined = " ".join(f["label"] + " " + f["value"] for f in details[0].get("fields", []))
-    assert "Amar Singh College, Srinagar" in joined
-    assert "Computer Science" in joined
+    docs = [e for e in events2 if e.get("type") == "admit_card_doc"]
+    assert docs, "chip click should yield the university-document admit card"
+    doc_html = docs[0].get("document_html", "")
+    assert "Amar Singh College, Srinagar" in doc_html
+    assert "Computer Science" in doc_html
+    assert "CLUSTER UNIVERSITY SRINAGAR" in doc_html
     for banned in ("password", "hashed_password", "dob", "cus_student_sid"):
         assert banned not in text2
 
 
-def test_engine_typed_semester_renders_detail_deterministically():
+def test_engine_typed_semester_renders_document_deterministically():
     # Typed phrasing routes via the planner (which may legitimately pick the
     # catalogue semester-subjects path first — pre-existing behaviour); the
     # engine's semester-resolution contract must hold regardless.
@@ -745,10 +746,9 @@ def test_engine_typed_semester_renders_detail_deterministically():
         entities = extract_entities("show my 2nd semester admit card")
         assert entities.semester == 2
         evs = list(_admit_card_events(db, {"student_id": A["id"]}, "ignored", entities))
-        details = [e for e in evs if e.get("type") == "detail"]
-        assert details
-        joined = " ".join(f["label"] + " " + f["value"] for f in details[0].get("fields", []))
-        assert "Computer Science" in joined
+        docs = [e for e in evs if e.get("type") == "admit_card_doc"]
+        assert docs
+        assert "Computer Science" in docs[0].get("document_html", "")
     finally:
         db.close()
 
@@ -788,3 +788,97 @@ def test_chat_unauthenticated_admit_card_asks_to_sign_in():
     )  # note: no student cookie on `client`
     assert r.status_code == 200
     assert "auth_form" in r.text or "sign in" in r.text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Print / download — real one-page A4 PDF document
+# --------------------------------------------------------------------------- #
+def _pdf_text(content: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(content))
+    return " ".join((page.extract_text() or "") for page in reader.pages)
+
+
+def test_print_returns_real_one_page_pdf():
+    r = client_a.post("/api/student/admit-cards/1/print", json={})
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("application/pdf")
+    assert r.content.startswith(b"%PDF")
+    assert r.headers.get("x-robots-tag") == "noindex, nofollow"
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(r.content))
+    assert len(reader.pages) == 1  # exactly one page, nothing clipped away
+
+    text = (reader.pages[0].extract_text() or "")
+    assert "CLUSTER UNIVERSITY SRINAGAR" in text
+    assert "CHANDIGARH" not in text
+    assert "ADMIT CARD" in text
+    assert "SEMESTER 1 EXAMINATION" in text
+    assert "Exam Roll No." in text
+    assert "CUS Registration No." in text
+    assert "SUBJECTS" in text
+    assert "EXAMINATION CENTER" in text
+    assert "IMPORTANT" in text
+    assert "Signature of the Applicant" in text
+    assert "Developed by I.T Cell" in text
+    assert "Mathematics" in text
+    assert "Physics" in text
+    for banned in ("2005-06-15", "hashed_password", "password", "cus_student_sid", "token"):
+        assert banned not in text
+
+
+def test_print_attachment_filename():
+    r = client_a.post("/api/student/admit-cards/1/print", json={"as_attachment": True})
+    assert r.status_code == 200
+    cd = r.headers.get("content-disposition") or ""
+    assert cd.startswith("attachment")
+    assert "Admit_Card_Semester_1.pdf" in cd
+
+
+def test_print_requires_valid_session():
+    r = client.post("/api/student/admit-cards/1/print", json={})
+    assert r.status_code == 401
+    assert "session" in _msg(r).lower()
+
+
+def test_print_idor_no_cross_student_leak():
+    # Give B a semester-5 card via the admin flow; A printing the same
+    # semester must never expose B's data (identity comes only from the
+    # authenticated session, so A gets A's card or a safe 404).
+    body = {
+        "reg_no": B["reg_no"], "semester": 5, "exam_type": "Regular",
+        "academic_year": "2025-2026", "exam_session": "May/Jun 2026",
+        "centre_name": "IDOR Probe College", "centre_code": "IDOR1",
+        "subjects": ["B-Only Subject"],
+    }
+    r = client.post("/api/admin/admit-cards", json=body, headers=SUPER)
+    assert r.status_code == 201, r.text
+    _created_card_ids.append(r.json()["id"])
+
+    resp = client_a.post("/api/student/admit-cards/5/print", json={"as_attachment": True})
+    assert resp.status_code in (200, 404)
+    if resp.status_code == 200:
+        text = _pdf_text(resp.content)
+        assert "IDOR Probe College" not in text
+        assert "B-Only Subject" not in text
+        assert B["reg_no"] not in text
+
+
+def test_print_semester_not_issued_or_allowlisted():
+    # B has no issued cards at all (safe 404 with an allowlisted semester);
+    # 9 is outside the allowlist (422).
+    r = client_b.post("/api/student/admit-cards/1/print", json={})
+    assert r.status_code == 404
+    r = client_a.post("/api/student/admit-cards/9/print", json={})
+    assert r.status_code == 422
+
+
+def test_print_server_log_never_exposes_credentials():
+    # The PDF payload itself must not embed PRIVATE data even in binary form.
+    r = client_a.post("/api/student/admit-cards/1/print", json={})
+    assert r.status_code == 200
+    for banned in (b"cus_student_sid", b"hashed_password", b"2005-06-15"):
+        assert banned not in r.content

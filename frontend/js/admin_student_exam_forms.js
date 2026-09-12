@@ -13,14 +13,21 @@
   }
   function log(m) { console.log("[CUS-ExamForms] " + m); }
 
-  function req(method, url, body) {
+  function req(method, url, body, noReloadOn401) {
     var opts = { method: method, headers: authHeaders() };
     if (body !== undefined) opts.body = JSON.stringify(body);
     if (opts.body) opts.headers["Content-Type"] = "application/json";
     return fetch(url, opts).then(function (r) {
-      if (r.status === 401) { log("Unauthorized, reloading"); window.location.reload(); throw new Error("Unauthorized"); }
+      if (r.status === 401) {
+        if (noReloadOn401) throw new Error("Authentication expired. Please log in again.");
+        log("Unauthorized, reloading"); window.location.reload(); throw new Error("Unauthorized");
+      }
       return r.json().then(function (d) {
-        if (!r.ok) throw new Error((d && d.error && d.error.message) || (d && d.detail) || ("HTTP " + r.status));
+        if (!r.ok) {
+          var err = new Error((d && d.error && d.error.message) || (d && typeof d.detail === "string" && d.detail) || ("HTTP " + r.status));
+          err.status = r.status;
+          throw err;
+        }
         return d;
       });
     });
@@ -51,8 +58,43 @@
   var _q = "";
   var _sem = "";
   var _status = "";
+  var _view = "forms";
   var _importFilename = "";
   var _importRawRows = [];
+
+  var SESSIONS_BASE = API + "/api/admin/exam-sessions";
+
+  function _tabBar() {
+    return '<div style="display:flex;gap:8px;margin-bottom:14px;">' +
+      '<button class="btn sm' + (_view === "sessions" ? " green" : "") + '" id="efTabSessions">Exam Sessions</button>' +
+      '<button class="btn sm' + (_view === "forms" ? " green" : "") + '" id="efTabForms">Exam Forms</button>' +
+      "</div>";
+  }
+
+  function _fmtDT(v) {
+    if (!v) return "—";
+    var d = new Date(v);
+    if (isNaN(d.getTime())) return esc(v);
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+
+  function _dtLocal(v) {
+    if (!v) return "";
+    var d = new Date(v);
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+
+  function _dateVal(v) {
+    var t = _dtLocal(v);
+    return t ? t.slice(0, 10) : "";
+  }
+
+  function _nowLocal() {
+    var d = new Date();
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
 
   var _SEM_OPTIONS = "";
   for (var i = 1; i <= 8; i++) {
@@ -70,7 +112,9 @@
   // ========== Render ==========
   function render() {
     if (!root()) return;
+    if (_view === "sessions") { renderSessions(); return; }
     root().innerHTML =
+      _tabBar() +
       '<div class="admin-card">' +
       "<h2>Student Exam Forms</h2>" +
       '<p class="sub">Exam forms are structured records (semester, exam type, subjects, status, fee). Students fill and submit ' +
@@ -103,6 +147,8 @@
 
     document.getElementById("efAdd").addEventListener("click", function () { openForm(null); });
     document.getElementById("efImport").addEventListener("click", openImport);
+    var tabS = document.getElementById("efTabSessions");
+    if (tabS) tabS.addEventListener("click", function () { _view = "sessions"; render(); });
     document.getElementById("efSem").addEventListener("change", function () {
       _sem = this.value;
       _page = 1;
@@ -286,7 +332,10 @@
 
   // ========== Status transition ==========
   function openStatus(id) {
-    get(BASE + "?" + (new URLSearchParams({ q: _q, semester: _sem, form_status: _status, page: _page, page_size: 100 })).toString()).then(function (d) {
+    var params = new URLSearchParams({ q: _q, page: _page, page_size: 100 });
+    if (_sem) params.set("semester", _sem);
+    if (_status) params.set("form_status", _status);
+    get(BASE + "?" + params.toString()).then(function (d) {
       var found = (d.exam_forms || []).filter(function (c) { return String(c.id) === String(id); })[0];
       if (!found) { toast("That exam form no longer exists.", "error"); return; }
       var opts = "";
@@ -319,7 +368,7 @@
         var status = ov.querySelector("#ef_status_sel").value;
         post(BASE + "/" + encodeURIComponent(id) + "/status", { form_status: status }).then(function () {
           ov.remove();
-          toast("Status updated to " + status, "success");
+          toast("Exam form status updated successfully.", "success");
           load();
         }).catch(function (e) {
           errEl.textContent = e.message;
@@ -460,4 +509,262 @@
   }
 
   window.CUS.examFormsInit = render;
+
+  // ========== Exam Sessions (super-admin provisioning) ==========
+  function renderSessions() {
+    var rootEL = root();
+    rootEL.innerHTML =
+      _tabBar() +
+      '<div class="admin-card">' +
+      "<h2>Exam Sessions</h2>" +
+      '<p class="sub">Super-admins provision Exam Sessions that drive the student-side Fill / Print flow. Each session targets a programme + batch + semester; fees (base + late) are server-owned and the form-sequence counter is automatic. Status lifecycle: Draft → Open → Closed → Archived.</p>' +
+      "</div>" +
+      '<div class="admin-card">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px;">' +
+      '<div class="kpi kpi-sm" style="flex:1;min-width:160px;"><div class="box"><div class="n" id="esTotal">-</div>' +
+      '<div class="l">Exam sessions</div></div></div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+      '<input id="esSearch" type="search" class="st-input" placeholder="Search name / code" style="min-width:200px;">' +
+      '<select id="esStatus" class="st-input">' +
+      '<option value="">All statuses</option>' +
+      ["Draft", "Open", "Closed", "Archived"].map(function (s) {
+        return '<option value="' + s + '">' + s + "</option>";
+      }).join("") +
+      "</select>" +
+      '<button class="btn" id="esAdd">+ New Session</button>' +
+      "</div></div>" +
+      '<div style="overflow-x:auto;"><table class="admin-table" style="width:100%;border-collapse:collapse;">' +
+      "<thead><tr><th>Code</th><th>Name</th><th>Programme</th><th>Batch</th><th>Sem</th><th>Type</th><th>Year</th>" +
+      "<th>Opens</th><th>Normal</th><th>Late</th><th>Base / Late Fee</th><th>Status</th><th>Form#</th><th></th></tr></thead>" +
+      '<tbody id="esRows"><tr><td colspan="14" style="text-align:center;color:var(--muted);">Loading&hellip;</td></tr></tbody>' +
+      "</table></div>" +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;">' +
+      '<span id="esPageInfo" style="color:var(--muted);font-size:13px;"></span>' +
+      '<span style="display:flex;gap:8px;"><button class="btn sm ghost" id="esPrev">&#8592; Prev</button>' +
+      '<button class="btn sm ghost" id="esNext">Next &#8594;</button></span>' +
+      "</div></div>";
+
+    var tabs = document.getElementById("efTabForms");
+    if (tabs) tabs.addEventListener("click", function () { _view = "forms"; render(); });
+    document.getElementById("esAdd").addEventListener("click", function () { openSessionForm(null); });
+    document.getElementById("esSearch").addEventListener("input", function () {
+      var v = this.value.trim();
+      if (v === _q) return;
+      _q = v;
+      _page = 1;
+      loadSessions();
+    });
+    document.getElementById("esStatus").addEventListener("change", function () {
+      _status = this.value;
+      _page = 1;
+      loadSessions();
+    });
+    document.getElementById("esPrev").addEventListener("click", function () {
+      if (_page > 1) { _page -= 1; loadSessions(); }
+    });
+    document.getElementById("esNext").addEventListener("click", function () {
+      _page += 1; loadSessions();
+    });
+    loadSessions();
+  }
+
+  function loadSessions() {
+    var params = new URLSearchParams({ page: _page, page_size: 20 });
+    if (_q) params.set("q", _q);
+    if (_status) params.set("status", _status);
+    get(SESSIONS_BASE + "?" + params.toString()).then(function (d) {
+      var t = document.getElementById("esTotal");
+      if (t) t.textContent = d.total;
+      var rows = document.getElementById("esRows");
+      if (!rows) return;
+      if (!(d.sessions || []).length) {
+        rows.innerHTML = '<tr><td colspan="14" style="text-align:center;color:var(--muted);">No exam sessions found' + (_q || _status ? " for the current filters" : "") + ".</td></tr>";
+      } else {
+        rows.innerHTML = d.sessions.map(function (s) {
+          var statusColor = { "Open": "#15803d", "Draft": "#7c3aed", "Closed": "#b45309", "Archived": "#6b7280" }[s.status] || "#6b7280";
+          return "<tr>" +
+            "<td><strong>" + esc(s.code) + "</strong></td>" +
+            "<td>" + esc(s.name) + "</td>" +
+            "<td>" + esc(s.programme) + "</td>" +
+            "<td>" + esc(s.batch || "—") + "</td>" +
+            "<td>" + esc(s.semester) + "</td>" +
+            "<td>" + esc(s.exam_type) + "</td>" +
+            "<td>" + esc(s.academic_year || "—") + "</td>" +
+            "<td>" + _fmtDT(s.application_open_at) + "</td>" +
+            "<td>" + _fmtDT(s.last_date_normal) + "</td>" +
+            "<td>" + _fmtDT(s.last_date_late) + "</td>" +
+            "<td>" + eduFee(s.base_fee) + " / " + eduFee(s.late_fee) + "</td>" +
+            '<td><span style="color:' + statusColor + ";font-weight:600;\">" + esc(s.status) + "</span></td>" +
+            "<td>" + esc(s.application_count || s.form_seq || 0) + "</td>" +
+            "<td>" +
+            '<button class="btn sm ghost" data-es="edit" data-id="' + esc(s.id) + '">Edit</button> ' +
+            '<button class="btn sm ghost" data-es="open" data-id="' + esc(s.id) + '">Open</button> ' +
+            '<button class="btn sm ghost" data-es="closed" data-id="' + esc(s.id) + '">Close</button> ' +
+            '<button class="btn sm ghost" data-es="archived" data-id="' + esc(s.id) + '">Archive</button> ' +
+            '<button class="btn sm ghost" data-es="delete" data-id="' + esc(s.id) + '" title="Delete only when no forms exist">Delete</button>' +
+            "</td></tr>";
+        }).join("");
+      }
+      var pi = document.getElementById("esPageInfo");
+      if (pi) pi.textContent = "Page " + d.page + " of " + (d.pages || 1);
+      document.getElementById("esNext").disabled = d.page >= (d.pages || 1);
+      document.getElementById("esPrev").disabled = (d.page || 1) <= 1;
+
+      rows.querySelectorAll("[data-es]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var act = b.getAttribute("data-es");
+          var id = b.getAttribute("data-id");
+          if (act === "edit") openSessionForm(id);
+          else if (act === "open") setSessionStatus(id, "Open");
+          else if (act === "closed") setSessionStatus(id, "Closed");
+          else if (act === "archived") setSessionStatus(id, "Archived");
+          else if (act === "delete") deleteSession(id);
+        });
+      });
+    }).catch(function (e) { toast(e.message, "error"); });
+  }
+
+  function eduFee(n) {
+    n = Number(n) || 0;
+    return "₹ " + n.toLocaleString("en-IN");
+  }
+
+  function _statusBody(status) {
+    return '<div style="max-width:360px;margin:0 auto;text-align:center;padding:10px 0;">' +
+      '<p style="margin:0 0 4px;">Change this exam session to <strong>' + esc(status) + "</strong>?</p>" +
+      '<p style="font-size:12px;color:var(--muted);margin:0 0 14px;">Lifecycle is deterministic: Draft → Open → Closed → Archived.</p>' +
+      '<div style="display:flex;gap:8px;justify-content:center;">' +
+      '<button class="btn green" id="esConfirmStatus">Yes, ' + esc(status) + "</button>" +
+      '<button type="button" class="btn ghost" data-mclose="1">Cancel</button></div></div>';
+  }
+
+  function setSessionStatus(id, status) {
+    var ov = modal(_statusBody(status));
+    ov.querySelector("#esConfirmStatus").addEventListener("click", function () {
+      post(SESSIONS_BASE + "/" + encodeURIComponent(id) + "/status", { status: status })
+        .then(function () { ov.remove(); toast("Session status → " + status, "success"); loadSessions(); })
+        .catch(function (e) { toast(e.message, "error"); });
+    });
+  }
+
+  function deleteSession(id) {
+    var ov = modal('<div style="max-width:360px;margin:0 auto;text-align:center;padding:10px 0;">' +
+      "<p>Delete this exam session?</p>" +
+      '<p style="font-size:12px;color:var(--muted);margin:0 0 14px;">Only possible when no exam forms reference it.</p>' +
+      '<div style="display:flex;gap:8px;justify-content:center;">' +
+      '<button class="btn" id="esConfirmDelete">Delete</button>' +
+      '<button type="button" class="btn ghost" data-mclose="1">Cancel</button></div></div>');
+    ov.querySelector("#esConfirmDelete").addEventListener("click", function () {
+      del(SESSIONS_BASE + "/" + encodeURIComponent(id))
+        .then(function () { ov.remove(); toast("Exam session deleted", "success"); loadSessions(); })
+        .catch(function (e) { toast(e.message, "error"); });
+    });
+  }
+
+  function openSessionForm(id) {
+    var editing = !!id;
+    var fields = [];
+    var values = {};
+    if (editing) {
+      get(SESSIONS_BASE + "/" + encodeURIComponent(id)).then(function (s) {
+        values = s;
+        _openSessionForm(values);
+      }).catch(function (e) { toast(e.message, "error"); });
+    } else {
+      _openSessionForm(values);
+    }
+  }
+
+  function _openSessionForm(values) {
+    function field(label, html) {
+      return '<div class="ef-field" style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px;">' +
+        '<label style="font-weight:600;font-size:13px;">' + label + "</label>" + html + "</div>";
+    }
+    function text(id, val, ph) {
+      return '<input id="es_' + id + '" class="st-input" value="' + esc(val || "") + '" placeholder="' + esc(ph || "") + '">';
+    }
+    function date(id, val, ph) {
+      return '<input type="date" id="es_' + id + '" class="st-input" value="' + esc(val || "") + '" placeholder="' + esc(ph || "") + '">';
+    }
+    function number(id, val, ph) {
+      return '<input id="es_' + id + '" class="st-input" type="number" min="0" value="' + esc(val ?? "") + '" placeholder="' + esc(ph || "") + '">';
+    }
+    var body = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 14px;">' +
+      field("Session name", text("name", values.name, "e.g. MCA 3rd Semester Regular Examination 2026")) +
+      field("Code", text("code", values.code, "e.g. MCA3-REG-2026")) +
+      field("Programme", text("programme", values.programme, "e.g. MCA")) +
+      field("Batch", text("batch", values.batch, "e.g. 2024")) +
+      field("Semester", '<input id="es_semester" class="st-input" type="number" min="1" value="' + esc(values.semester || 1) + '" placeholder="e.g. 3">') +
+      field("Exam type", text("exam_type", values.exam_type || "Regular", "e.g. Regular")) +
+      field("Academic year", text("academic_year", values.academic_year, "e.g. 2025-26")) +
+      field("Status", '<select id="es_status" class="st-input">' +
+        ["Draft", "Open", "Closed", "Archived"].map(function (s) {
+          return '<option value="' + s + '"' + (values.status === s ? " selected" : "") + ">" + s + "</option>";
+        }).join("") + "</select>") +
+      field("Applications open at", date("application_open_at", _dateVal(values.application_open_at), "Select opening date")) +
+      field("Normal deadline (fee+free)", date("last_date_normal", _dateVal(values.last_date_normal), "Select normal deadline")) +
+      field("Late deadline", date("last_date_late", _dateVal(values.last_date_late), "Select late deadline")) +
+      field("Base fee (₹)", number("base_fee", values.base_fee ?? "", "e.g. 900")) +
+      field("Late fee (₹)", number("late_fee", values.late_fee ?? "", "e.g. 100")) +
+      "</div>" +
+      '<p style="font-size:12px;color:var(--muted);margin:4px 0 0;">Empty date/time fields leave the corresponding window unset. Fees are server-owned and read-only for students.</p>';
+
+    var ov = modal('<div style="max-width:620px;">' +
+      "<h3 style=\"margin:0 0 12px;\">" + (values.id ? "Edit exam session" : "New exam session") + "</h3>" + body +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">' +
+      '<button class="btn green" id="esSave">Save session</button>' +
+      '<button type="button" class="btn ghost" data-mclose="1">Cancel</button></div></div>');
+
+    ov.querySelector("#esSave").addEventListener("click", function () {
+      var payload = {
+        name: ov.querySelector("#es_name").value.trim(),
+        code: ov.querySelector("#es_code").value.trim(),
+        programme: ov.querySelector("#es_programme").value.trim(),
+        batch: ov.querySelector("#es_batch").value.trim(),
+        semester: Number(ov.querySelector("#es_semester").value) || 1,
+        exam_type: ov.querySelector("#es_exam_type").value.trim() || "Regular",
+        academic_year: ov.querySelector("#es_academic_year").value.trim(),
+        application_open_at: ov.querySelector("#es_application_open_at").value.trim() || null,
+        last_date_normal: ov.querySelector("#es_last_date_normal").value.trim() || null,
+        last_date_late: ov.querySelector("#es_last_date_late").value.trim() || null,
+        base_fee: Number(ov.querySelector("#es_base_fee").value) || 0,
+        late_fee: Number(ov.querySelector("#es_late_fee").value) || 0,
+        status: ov.querySelector("#es_status").value,
+      };
+      var p = values.id
+        ? req("PATCH", SESSIONS_BASE + "/" + encodeURIComponent(values.id), payload, true)
+        : req("POST", SESSIONS_BASE, payload, true);
+      p.then(function () {
+        ov.remove();
+        if (values.id) toast("Session updated successfully.", "success");
+        else toast("Session saved successfully.", "success");
+        loadSessions();
+      }).catch(function (e) {
+        var msg = (e && e.message) || "Unable to save the session. Please try again.";
+        if (e && e.status) {
+          if (e.status === 401) msg = "Authentication expired. Please log in again.";
+          else if (e.status === 403) msg = "You are not authorized to create an exam session.";
+          else if (e.status === 422) msg = "Please check the entered session details.";
+          else if (e.status === 409) msg = "An exam session with this code already exists.";
+          else if (e.status >= 500) msg = "Unable to save the session. Please try again.";
+        }
+        toast(msg, "error");
+      });
+    });
+  }
+
+  function modal(bodyHtml) {
+    var ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(15,23,42,.55);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;z-index:9999;overflow:auto;";
+    var box = document.createElement("div");
+    box.style.cssText = "background:#fff;border-radius:14px;padding:22px;width:100%;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,.25);color:#0f172a;";
+    box.innerHTML = bodyHtml;
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    ov.querySelectorAll("[data-mclose]").forEach(function (b) {
+      b.addEventListener("click", function () { ov.remove(); });
+    });
+    ov.addEventListener("click", function (e) { if (e.target === ov) ov.remove(); });
+    return ov;
+  }
 })();

@@ -640,7 +640,7 @@ def render_result_print_html(result: dict[str, Any]) -> str:
 </style></head><body>
 <div class="page">
   <div class="head">
-    <p class="org">CHANDIGARH UNIVERSITY</p>
+    <p class="org">CLUSTER UNIVERSITY SRINAGAR</p>
     <h1>Statement of Marks</h1>
     <div class="doc">Generated from the student self-service portal - not an official transcript.</div>
   </div>

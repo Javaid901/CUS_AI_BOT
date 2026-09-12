@@ -451,8 +451,20 @@ async def website_sync_run(
     db: Session = Depends(get_db),
     current: User = _protected,
 ):
-    """Run a full (or URL-scoped) website sync pass."""
-    from app.knowledge_sync.web_engine import WebsiteSyncEngine
+    """Run a full (or URL-scoped) website sync pass.
+
+    Enforced server-side: when the Website Sync master toggle is OFF the run
+    is rejected (409) before any crawl starts, regardless of how the request
+    arrives (dashboard, direct API call, dev tools, another client).
+    """
+    from app.knowledge_sync.web_engine import WebsiteSyncEngine, load_state
+
+    state = load_state()
+    if not state.get("enabled", False):
+        raise HTTPException(
+            status_code=409,
+            detail="Website Sync is disabled. Enable it before starting a sync.",
+        )
 
     engine = WebsiteSyncEngine(db)
     result = await engine.run_async(

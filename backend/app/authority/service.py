@@ -36,6 +36,9 @@ from app.authority.repository import (
     get_category_by_slug as repo_get_category_by_slug,
 )
 from app.authority.repository import (
+    grievance_eligible_ids as repo_grievance_eligible_ids,
+)
+from app.authority.repository import (
     list_all as repo_list_all,
 )
 from app.authority.repository import (
@@ -171,14 +174,17 @@ class AuthorityService:
         Matching is normalized (lowercase, punctuation collapsed, "&" → "and")
         and evaluated against real authority records — never hardcoded names.
         A bare generic mention such as "the dean" surfaces as ambiguous when
-        several Dean authorities exist, so the student chooses; an inactive or
-        deleted authority is reported as unavailable and never auto-selected.
+        several Dean authorities exist, so the student chooses; an inactive,
+        deleted, or administrator-less authority is reported as unavailable and
+        never auto-selected (a grievance needs someone to receive it).
         """
         import re
 
         text = (text or "").strip()
         if len(text) < 3:
             return {"status": "none"}
+
+        eligible = repo_grievance_eligible_ids(db)
 
         def _norm(value: str) -> str:
             v = value.lower().replace("&", " and ")
@@ -213,11 +219,20 @@ class AuthorityService:
         unavailable_names: list[str] = []
         for row, variants in phrases:
             if any(v and v in message for v in variants):
-                if row.get("active") and row.get("deleted_at") is None:
-                    active_matches.append(row)
-                else:
+                if not (row.get("active") and row.get("deleted_at") is None):
                     unavailable_names.append(
                         (row.get("authority_name") or "").strip() or row.get("department_name") or "that office"
+                    )
+                    continue
+                if row.get("id") in eligible:
+                    active_matches.append(row)
+                else:
+                    # Active on paper but nobody is assigned to receive new
+                    # grievances — never auto-selected, surfaced as unavailable.
+                    unavailable_names.append(
+                        (row.get("authority_name") or "").strip()
+                        or row.get("department_name")
+                        or "that office"
                     )
 
         if len(active_matches) == 1:
@@ -228,13 +243,14 @@ class AuthorityService:
 
         # Fallback: alias / service-route resolution ("examination branch" →
         # Controller of Examinations, "fee issue" → Finance). Only accepts a
-        # UNIQUE active authority for the resolved department — never invents
-        # a match and never returns inactive/deleted records.
+        # UNIQUE eligible active authority for the resolved department — never
+        # invents a match and never returns inactive/deleted/unstaffed records.
         dept_hint = self._department_from_aliases(text)
         if dept_hint:
             dept_matches = [
                 r for r in repo_list_all(db, include_deleted=True)
                 if r.get("active") and r.get("deleted_at") is None
+                and r.get("id") in eligible
                 and _norm((r.get("department_name") or "")).lower() == dept_hint.lower()
             ]
             if len(dept_matches) == 1:

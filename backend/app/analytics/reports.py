@@ -400,6 +400,9 @@ def get_knowledge_gaps(limit: int = 50, include_resolved: bool = False) -> list[
                 "frequency": g.frequency,
                 "suggestion": g.suggestion,
                 "resolved": g.resolved,
+                "resolved_at": g.resolved_at.isoformat() if g.resolved_at else None,
+                "resolution_text": g.resolution_text,
+                "resolved_by": g.resolved_by,
                 "detected_at": g.detected_at.isoformat() if g.detected_at else None,
             }
             for g in gaps

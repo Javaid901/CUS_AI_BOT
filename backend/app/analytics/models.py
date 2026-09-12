@@ -172,6 +172,8 @@ class KnowledgeGap(Base):
     suggestion = Column(Text, nullable=True)
     resolved = Column(Boolean, default=False)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolution_text = Column(Text, nullable=True)
+    resolved_by = Column(String(200), nullable=True)
 
     __table_args__ = (
         Index("ix_kg_type_freq", "gap_type", "frequency"),

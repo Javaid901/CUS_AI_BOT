@@ -25,6 +25,17 @@ class ImportBundle(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class AdmitCardPrintRequest(BaseModel):
+    """Optional body for the student admit-card print/download endpoint.
+
+    Semester travels in the URL path; `as_attachment` switches between an
+    inline (print/preview) and attachment (download) PDF disposition. The
+    student identity is always resolved from the authenticated session.
+    """
+
+    as_attachment: bool = False
+
+
 class _CardFields(BaseModel):
     """Shared card fields (explicit allowlists, server-validated)."""
 

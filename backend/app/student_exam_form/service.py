@@ -48,7 +48,20 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Student, StudentExamForm
+from app.models import (
+    ExamApplicationSubject,
+    ExamEligibility,
+    ExamPayment,
+    ExamSession,
+    Student,
+    StudentExamForm,
+)
+from app.student_exam_form import exam_session as es
+from app.student_exam_form.eligibility import (
+    evaluate_eligibility,
+    snapshot_rules,
+    system_subjects_for,
+)
 
 # The explicit semester allowlist (shared by the API, import validator & chat
 # flow). A value missing here is treated as "not available".
@@ -209,17 +222,31 @@ def parse_import_file(filename: str, content: bytes) -> dict[str, Any]:
 
 
 def _json_list(value: str | None) -> list[str]:
-    """Parse the Text column into a list of strings (JSON array, tolerant)."""
+    """Parse the Text column into a list of strings (JSON array, tolerant).
+
+    Session-derived subject rows are stored as [{"subject_code", "subject_name"}]
+    dicts so the server keeps codes; this renderer flattens them to names so
+    the legacy string-list contract (student DTO / admin list) is unchanged.
+    """
     if not value:
         return []
     s = value.strip()
     if not s:
         return []
+
+    def _name(item: Any) -> str:
+        if isinstance(item, dict):
+            for key in ("subject_name", "name", "title"):
+                if str(item.get(key) or "").strip():
+                    return str(item[key]).strip()
+            return str(item)
+        return str(item).strip()
+
     try:
         data = json.loads(s)
         if isinstance(data, list):
-            return [str(x).strip() for x in data if str(x).strip()]
-        return [str(data)]
+            return [_name(x) for x in data if str(x).strip()]
+        return [_name(data)]
     except Exception:
         items = [x.strip() for x in s.replace(";", "\n").replace(",", "\n").splitlines() if x.strip()]
         return items or [s]
@@ -491,6 +518,41 @@ def student_form_by_identity(
     )
 
 
+def student_form_records(db: Session, student_id: str) -> list[dict[str, Any]]:
+    """Numbered forms for the student's Print picker (own record, safe allowlist).
+
+    Includes session-bound forms carrying a server-generated form_no — the
+    student's own printed record, so form_no/session info is expected here.
+    No fee references, no identity fields beyond the printed form number.
+    """
+    rows = (
+        db.query(StudentExamForm)
+        .filter(StudentExamForm.student_id == student_id)
+        .order_by(StudentExamForm.semester, StudentExamForm.created_at.desc())
+        .all()
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if r.semester not in _ALLOWLIST:
+            continue
+        session = None
+        if r.exam_session_id:
+            session = db.get(ExamSession, r.exam_session_id)
+        out.append({
+            "id": str(r.id),
+            "form_no": r.form_no or "",
+            "semester": r.semester,
+            "exam_type": r.exam_type or "Regular",
+            "academic_year": r.academic_year or "",
+            "form_status": r.form_status or "Pending",
+            "fee_status": r.fee_status or "Unpaid",
+            "submission_date": r.submission_date or "",
+            "session_code": session.code if session else "",
+            "session_name": session.name if session else "",
+        })
+    return out
+
+
 def _duplicate_exists(db: Session, key: tuple, exclude_id: uuid.UUID | None = None) -> bool:
     student_id, semester, exam_type, academic_year = key
     query = db.query(StudentExamForm).filter(
@@ -507,7 +569,17 @@ def _duplicate_exists(db: Session, key: tuple, exclude_id: uuid.UUID | None = No
 def student_fill(
     db: Session, student_id: str, data: dict[str, Any]
 ) -> dict[str, Any]:
-    """Student Fill: create a new Pending exam form for their own identity."""
+    """Student Fill: create a new Pending exam form for their own identity.
+
+    Dispatches on `exam_session_id`. Session-driven fill is the primary path:
+    the server derives programme/semester/exam_type/fee/subjects from the OPEN
+    ExamSession and gates on the deterministic eligibility snapshot. Without a
+    session id the legacy allow-list path is used, kept backward-compatible.
+    """
+    session_id = data.get("exam_session_id")
+    if session_id:
+        return _fill_by_session(db, student_id, session_id, bool(data.get("confirm", True)))
+
     semester = data.get("semester")
     exam_type = (data.get("exam_type") or "Regular").strip()
     if semester not in _ALLOWLIST:
@@ -539,10 +611,181 @@ def student_fill(
     return _student_dto(form)
 
 
+def _fill_by_session(db: Session, student_id: str, session_id: str, confirm: bool) -> dict[str, Any]:
+    """Session-driven fill (Phase D2). Everything academic is derived server-side.
+
+    Order of operations inside ONE transaction:
+      1. session lock via allocate_form_no (atomically bumps form_seq)
+      2. deterministic eligibility gate (snapshot persisted to exam_eligibility
+         + the form's eligibility_snapshot column)
+      3. subjects from the academic catalogue (exam_application_subjects rows +
+         the form.subjects JSON for backward-compatible DTO rendering)
+      4. fee from the session (base + late when past last_date_normal);
+         amount 0 → auto-paid zero-amount system payment (still gated).
+    """
+    if not confirm:
+        raise ValueError("Form submission requires confirmation.")
+
+    student = db.get(Student, uuid.UUID(str(student_id)))
+    if student is None:
+        raise ValueError("Student profile not found")
+
+    session = es.get_session(db, session_id)
+    if (session.status or "Draft") != "Open":
+        raise ValueError("This exam session is not open for applications.")
+
+    # Duplicate: canonical (student, session) identity — plus a guard that a
+    # student with an existing LEGACY (session-less) form for the same identity
+    # cannot double-declare the same exam via the session path.
+    if _duplicate_session_form(db, student.id, session.id):
+        raise ValueError("An exam form already exists for this student and exam session")
+    legacy_key = (str(student.id), session.semester, session.exam_type or "Regular", session.academic_year or "")
+    if _legacy_duplicate_exists(db, legacy_key):
+        raise ValueError("An exam form already exists for this student, semester and exam")
+
+    eligibility = evaluate_eligibility(db, student, session)
+    if not eligibility.get("eligible"):
+        failed = [r["message"] for r in eligibility["rules"] if not r["passed"]]
+        detail = " ".join(failed)
+        raise ValueError(f"Your profile does not meet the eligibility criteria for this exam session. {detail}".strip())
+
+    subjects = system_subjects_for(db, session, student)
+    if not subjects:
+        raise ValueError("No subjects are available for this exam session yet — please check again later.")
+
+    subject_names = [s.get("subject_name", "") for s in subjects if s.get("subject_name")]
+    amount, late_applied = _session_fee(db, session)
+
+    form_no = es.allocate_form_no(db, session.id)
+    fee_status = "Paid" if amount == 0 else "Unpaid"
+
+    form = StudentExamForm(
+        id=uuid.uuid4(),
+        student_id=student.id,
+        semester=session.semester,
+        exam_type=session.exam_type or "Regular",
+        form_status="Pending",
+        subjects=json.dumps(subjects),
+        fee_status=fee_status,
+        fee_amount=amount,
+        transaction_id=None,
+        submission_date=None,
+        academic_year=session.academic_year or None,
+        exam_session_id=session.id,
+        form_no=form_no,
+        photo_path=None,
+        eligibility_snapshot=snapshot_rules(eligibility),
+    )
+    db.add(form)
+    db.flush()
+
+    for subj in subjects:
+        db.add(ExamApplicationSubject(
+            id=uuid.uuid4(),
+            form_id=form.id,
+            subject_code=(subj.get("subject_code") or "")[:30] or None,
+            subject_name=(subj.get("subject_name") or "")[:200],
+            source="system",
+        ))
+    db.add(ExamEligibility(
+        id=uuid.uuid4(),
+        form_id=form.id,
+        session_id=session.id,
+        eligible=True,
+        rules=snapshot_rules(eligibility),
+    ))
+    if amount == 0:
+        # Zero-fee session: an immediately-successful system payment keeps the
+        # "submittable only after a success payment" invariant uniform.
+        from datetime import datetime as _dt
+
+        now = _dt.utcnow()
+        db.add(ExamPayment(
+            id=uuid.uuid4(),
+            form_id=form.id,
+            session_id=session.id,
+            amount=0,
+            head="Exam Form Fee",
+            status="success",
+            gateway="mock",
+            gateway_ref=f"ZERO-{form_no}",
+            recorded_by="system",
+            recorded_at=now,
+            reconciled_at=now,
+        ))
+
+    db.commit()
+    db.refresh(form)
+    return _student_dto(form)
+
+
+def _duplicate_session_form(db: Session, student_id: uuid.UUID, session_id: uuid.UUID) -> bool:
+    return (
+        db.query(StudentExamForm)
+        .filter(StudentExamForm.student_id == student_id, StudentExamForm.exam_session_id == session_id)
+        .first()
+        is not None
+    )
+
+
+def _legacy_duplicate_exists(db: Session, key: tuple) -> bool:
+    """Identity collision against legacy (session-less) forms only.
+
+    A session-bound form is scoped by (student, session); a legacy form is
+    scoped by (student, semester, exam_type, academic_year). The two never
+    double-count: a student may hold several session forms for the same exam
+    cycle but never a session form AND a legacy form for the same identity.
+    """
+    student_id, semester, exam_type, academic_year = key
+    return (
+        db.query(StudentExamForm)
+        .filter(
+            StudentExamForm.student_id == student_id,
+            StudentExamForm.semester == semester,
+            func.coalesce(StudentExamForm.exam_type, "Regular") == exam_type,
+            func.coalesce(StudentExamForm.academic_year, "") == academic_year,
+            StudentExamForm.exam_session_id.is_(None),
+        )
+        .first()
+        is not None
+    )
+
+
+def _session_fee(db: Session, session: ExamSession) -> tuple[int, bool]:
+    """Server-derived payable amount for the session.
+
+    Late fee applies when the normal deadline has passed (and was set). Returns
+    (amount, late_applied). Timezone differences between naive stored dates and
+    aware "now" are normalized defensively.
+    """
+    from datetime import datetime, timezone
+
+    def _ensure_utc(dt):
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    base = int(session.base_fee or 0)
+    late = int(session.late_fee or 0)
+    normal = _ensure_utc(session.last_date_normal)
+    now = _ensure_utc(datetime.now())
+    if normal is not None and late > 0 and now > normal:
+        return base + late, True
+    return base, False
+
+
 def student_submit(db: Session, student_id: str, form_id: str, confirm: bool) -> tuple[dict[str, Any], bool]:
     """Affirm the filled form. Server performs the allowed Pending → Submitted
     transition and stamps submission_date. `was_submitted` tells the route
-    whether this call actually transitioned the state (audit only on change)."""
+    whether this call actually transitioned the state (audit only on change).
+
+    Session-driven forms are gated (Phase D2): the session must still be Open,
+    the persisted eligibility snapshot must be eligible, and a payable fee must
+    be Paid (a success payment existed server-side). Legacy forms keep the old
+    un-gated behaviour.
+    """
     form = _form_or_404(db, form_id)
     if str(form.student_id) != student_id:
         raise ValueError("You are not authorized to access this form.")
@@ -550,6 +793,22 @@ def student_submit(db: Session, student_id: str, form_id: str, confirm: bool) ->
         raise ValueError("Form submission requires confirmation.")
     if form.form_status not in _SUBMITABLE_STATUSES:
         raise ValueError("Your Exam Form has already been submitted.")
+
+    if form.exam_session_id:
+        session = db.get(ExamSession, form.exam_session_id)
+        if session is None:
+            raise ValueError("Exam session not found")
+        if (session.status or "Draft") != "Open":
+            raise ValueError("The application window for this exam session has closed.")
+        try:
+            snapshot = json.loads(form.eligibility_snapshot or "{}")
+        except Exception:
+            snapshot = {}
+        if snapshot.get("eligible") is not True:
+            raise ValueError("Your Exam Form is not marked eligible by the university.")
+        if (form.fee_amount or 0) > 0 and (form.fee_status or "Unpaid") != "Paid":
+            raise ValueError("Your Exam Form is unpaid. Please pay the exam fee before submitting.")
+
     form.form_status = "Submitted"
     from datetime import datetime
     form.submission_date = datetime.now().strftime("%d-%b-%Y")
@@ -567,10 +826,106 @@ def student_print_payload(db: Session, student_id: str, semester: int, exam_type
     return _student_dto(form)
 
 
+def _json_subject_names(value: str | None) -> list[str]:
+    """Names-only list for the printable document (dict-safe)."""
+    return _json_list(value)
+
+
+def student_form_document(db: Session, student_id: str, form_id: str) -> dict[str, Any] | None:
+    """Printable DOCUMENT payload for the student's OWN exam form.
+
+    This is the ONLY student-facing surface that renders form_no, identity
+    fields and the payment reference — it is the student's own printed record
+    (mirrors the physical admit-card document pattern). Returns None for
+    anyone else's form. Never includes DOB, credentials or session tokens.
+    """
+    form = _form_or_404(db, form_id)
+    if str(form.student_id) != student_id:
+        return None
+    student = form.student
+
+    session = None
+    if form.exam_session_id:
+        session = db.get(ExamSession, form.exam_session_id)
+
+    from app.student_exam_form.payment import payment_snapshot
+
+    pay = payment_snapshot(db, form.id)
+    base_fee = int(session.base_fee or 0) if session else None
+    late_fee = int(session.late_fee or 0) if session else None
+    from datetime import datetime
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    return {
+        "form_id": str(form.id),
+        "form_no": form.form_no or "",
+        "semester": form.semester,
+        "exam_type": form.exam_type or "Regular",
+        "academic_year": form.academic_year or "",
+        "form_status": form.form_status or "Pending",
+        "submission_date": form.submission_date or "",
+        "subjects": _json_subject_names(form.subjects),
+        "name": student.name if student else "",
+        "reg_no": student.reg_no if student else "",
+        "roll_no": student.roll_no or "" if student else "",
+        "programme": (student.programme or "").upper() if student else "",
+        "college": student.college or "" if student else "",
+        "batch": student.batch or "" if student else "",
+        "session_code": session.code if session else "",
+        "session_name": session.name if session else "",
+        "fee_normal": base_fee,
+        "fee_late": late_fee,
+        "fee_total": form.fee_amount,
+        "fee_status": form.fee_status or "Unpaid",
+        "transaction_id": pay.get("gateway_ref") if pay else (form.transaction_id or ""),
+        "payment_date": pay.get("recorded_at") if pay else "",
+        "photo_path": form.photo_path or "",
+        "generated_at": now_iso,
+    }
+
+
+def student_payment_receipt(db: Session, student_id: str, form_id: str) -> dict[str, Any] | None:
+    """Receipt payload for the student's OWN successful payment.
+
+    Reuses the allow-listed exam-form document dict (name, reg no, form_no,
+    exam info, fee, transaction ref, payment date) and enriches it with the
+    server-owned payment identity (payment_id, gateway, payment_status). Only
+    display values — never DOB, credentials or session tokens. Returns None for
+    anyone else's form; the caller gates the "not yet paid" case via
+    `fee_status` (server-owned).
+    """
+    data = student_form_document(db, student_id, form_id)
+    if data is None:
+        return None
+    if (data.get("fee_status") or "Unpaid") != "Paid":
+        return data
+    from app.student_exam_form.payment import payment_snapshot
+
+    pay = payment_snapshot(db, form_id)
+    if pay:
+        data["payment_id"] = pay.get("id") or ""
+        data["payment_status"] = pay.get("status") or "success"
+        data["gateway"] = pay.get("gateway") or "mock"
+        data["payment_date_iso"] = pay.get("recorded_at") or data.get("payment_date")
+    return data
+
+
+def mark_form_printed(db: Session, student_id: str, form_id: str) -> None:
+    """Stamp printed_at on the student's OWN form (print/download only)."""
+    form = _form_or_404(db, form_id)
+    if str(form.student_id) != student_id:
+        return
+    from datetime import datetime
+
+    form.printed_at = datetime.utcnow()
+    db.commit()
+
+
 # --------------------------------------------------------------------------- #
 # Super-Admin management
 # --------------------------------------------------------------------------- #
-def _admin_dto(r: StudentExamForm) -> dict[str, Any]:
+def _admin_dto(r: StudentExamForm, db: Session | None = None) -> dict[str, Any]:
     dto = {
         "id": str(r.id),
         "semester": r.semester,
@@ -582,7 +937,15 @@ def _admin_dto(r: StudentExamForm) -> dict[str, Any]:
         "fee_amount": r.fee_amount,
         "transaction_id": r.transaction_id or "",
         "submission_date": r.submission_date or "",
+        "form_no": r.form_no or "",
+        "exam_session_id": str(r.exam_session_id) if r.exam_session_id else "",
+        "session_code": "",
+        "printed_at": r.printed_at.isoformat() if r.printed_at else "",
     }
+    if r.exam_session_id and db is not None:
+        session = db.get(ExamSession, r.exam_session_id)
+        if session is not None:
+            dto["session_code"] = session.code or ""
     dto.update(
         {
             "reg_no": r.student.reg_no if r.student else "",
@@ -628,7 +991,7 @@ def list_exam_forms(
         .all()
     )
     return {
-        "exam_forms": [_admin_dto(r) for r in rows],
+        "exam_forms": [_admin_dto(r, db) for r in rows],
         "total": total,
         "page": page,
         "page_size": page_size,

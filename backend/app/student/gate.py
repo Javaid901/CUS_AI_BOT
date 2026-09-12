@@ -179,6 +179,22 @@ def admit_card_detail_event(semester: int, data: dict) -> dict:
     }
 
 
+def admit_card_document_event(semester: int, data: dict) -> dict:
+    """The university-document admit card for the student's OWN semester.
+
+    Renders the full formal document (same source as the Printable PDF) so the
+    in-chat "View" reproduces the reference layout instead of a chat card.
+    """
+    from app.student_admit_card.render import render_admit_card_document_html
+
+    return {
+        "type": "admit_card_doc",
+        "title": f"Admit Card · Semester {semester}",
+        "semester": semester,
+        "document_html": render_admit_card_document_html(data),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Student Exam Form (Phase D) — authenticated renders only
 # --------------------------------------------------------------------------- #
@@ -236,4 +252,122 @@ def exam_form_detail_event(form: dict) -> dict:
         "title": f"Exam Form · {form.get('exam_type') or 'Regular'} Semester {form.get('semester')}",
         "message": "Here is your exam form:",
         "fields": fields,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Student Exam Form — Exam Session model (Phase D2): Fill / Print / Pay / Doc
+# --------------------------------------------------------------------------- #
+def exam_form_sessions_event(sessions: list[dict]) -> dict:
+    """Open Exam Session picker for Fill (authenticated student's own profile).
+
+    Chip ids are `exam_form_pick{code}` — the "exam_form" substring keeps the
+    planner routing deterministically to student_service/exam_form; the engine
+    re-validates the code against the student's OWN available sessions (never
+    trusts a raw id from the client).
+    """
+    return {
+        "type": "options",
+        "title": "Fill Exam Form",
+        "message": "Which OPEN exam session would you like to fill?",
+        "options": [
+            {
+                "id": f"exam_form_pick{(s['code'] or '').lower()}",
+                "label": f"{s['name']} · Semester {s['semester']} · Fee ₹{s['base_fee']}",
+            }
+            for s in sessions
+        ],
+    }
+
+
+def exam_form_print_picker_event(forms: list[dict]) -> dict:
+    """Picker of the student's OWN numbered forms for Print / Download."""
+    return {
+        "type": "options",
+        "title": "Print Exam Form",
+        "message": "Which exam form would you like to print?",
+        "options": [
+            {
+                "id": f"exam_form_view{(f['id'] or '').lower()}",
+                "label": f"{f.get('form_no') or f.get('id')} · Semester {f.get('semester')} · {f.get('form_status') or 'Pending'}",
+            }
+            for f in forms
+        ],
+    }
+
+
+def exam_form_actions_event(form: dict, session: dict | None = None) -> dict:
+    """Post-fill action chips for the student's OWN exam form.
+
+    Pay Now is shown only while the fee is unpaid and payable. View/Download
+    always appear; Submit appears once the fee is settled (fee 0 or Paid).
+    """
+    fee = int(form.get("fee_amount") or 0)
+    status = (form.get("form_status") or "Pending").lower()
+    paid = fee <= 0 or (form.get("fee_status") or "Unpaid") == "Paid"
+    actions: list[dict[str, str]] = []
+    if not paid and status == "pending":
+        actions.append({
+            "id": f"exam_form_pay{(form.get('id') or '').lower()}",
+            "label": f"Pay Now (₹{fee})",
+        })
+    actions.append({
+        "id": f"exam_form_view{(form.get('id') or '').lower()}",
+        "label": "View Document",
+    })
+    actions.append({
+        "id": f"exam_form_dl{(form.get('id') or '').lower()}",
+        "label": "Print / Download PDF",
+    })
+    if paid and status == "pending":
+        actions.append({
+            "id": f"exam_form_submit{(form.get('id') or '').lower()}",
+            "label": "Submit Exam Form",
+        })
+    return {
+        "type": "options",
+        "title": "Exam Form Actions",
+        "message": "What would you like to do next?",
+        "options": actions,
+    }
+
+
+def exam_form_document_event(data: dict) -> dict:
+    """The university-document exam form for the student's OWN form.
+
+    Same source as the Printable PDF (single source of truth for the printed
+    record), shown in-chat inside an isolated iframe with Print/Download
+    actions that POST to the authenticated print endpoint.
+    """
+    from app.student_exam_form.render import render_exam_form_document_html
+
+    form_id = str(data.get("form_id") or "")
+    semester = data.get("semester") or ""
+    form_no = data.get("form_no") or ""
+    return {
+        "type": "exam_form_doc",
+        "title": f"Exam Form · Semester {semester}",
+        "form_id": form_id,
+        "form_no": form_no,
+        "semester": semester,
+        "document_html": render_exam_form_document_html(data),
+    }
+
+
+def exam_form_pay_event(data: dict) -> dict:
+    """Mock checkout payload for the student's OWN unpaid exam form.
+
+    The amount is server-derived (form.fee_amount — never client-supplied).
+    The panel NEVER tells the server a payment happened: the frontend calls the
+    initiate/confirm endpoints, which run the (mock) gateway server-side.
+    """
+    return {
+        "type": "exam_form_pay",
+        "title": "Pay Exam Form Fee",
+        "form_id": str(data.get("form_id") or ""),
+        "form_no": data.get("form_no") or "",
+        "amount": int(data.get("fee_total") or 0),
+        "session_code": data.get("session_code") or "",
+        "session_name": data.get("session_name") or "",
+        "university": "Cluster University Srinagar",
     }

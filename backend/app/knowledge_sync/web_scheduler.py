@@ -40,17 +40,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_master_enabled() -> bool:
+def _is_master_enabled(state: dict | None = None) -> bool:
     """Check the master sync toggle. Returns True when the admin has turned
     the Website Sync master switch ON (via the dashboard or API)."""
-    state = load_state()
+    if state is None:
+        state = load_state()
     return bool(state.get("enabled", False))
-
-
-def _get_schedule_hours() -> int:
-    """Return the scheduled interval hours based on the state preset."""
-    schedule = load_state().get("schedule", "disabled")
-    return SCHEDULE_PRESETS.get(schedule, 0)
 
 
 def _run_sync() -> None:
@@ -77,54 +72,49 @@ def _run_sync() -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _poll_once(state: dict | None = None) -> None:
+    """Perform one scheduler decision cycle.
+
+    Only a positive automatic cadence (hourly/daily/weekly/...) combined with
+    the master enable flag can start a crawl. "manual" and "disabled" presets
+    (hours = 0) NEVER auto-crawl: only an explicit administrator "Sync Now"
+    starts a sync in those modes.
+    """
+    if state is None:
+        state = load_state()
+    # Master toggle check — if OFF, never auto-crawl regardless of schedule.
+    if not _is_master_enabled(state):
+        log.info("Scheduler: master toggle OFF — skipping auto-crawl")
+        return
+    hours = SCHEDULE_PRESETS.get(state.get("schedule", "disabled"), 0)
+    if hours <= 0:
+        # manual / disabled cadence: manual means manual. The dashboard
+        # "Sync Now" button is the only trigger; no run-once-then-wait.
+        log.info("Scheduler: schedule '%s' — manual only; no automatic crawl",
+                 state.get("schedule", "disabled"))
+        return
+    last_raw = state.get("last_run_at")
+    due = True
+    if last_raw:
+        try:
+            last = datetime.fromisoformat(last_raw)
+            due = (_utcnow() - last).total_seconds() >= hours * 3600
+        except ValueError:
+            due = True
+    if due:
+        state["last_run_at"] = _utcnow().isoformat()
+        save_state(state)
+        _run_sync()
+
+
 def _run_loop() -> None:
-    """Poll the persisted state every POLL_SECONDS and trigger sync when due."""
+    """Poll the persisted state every POLL_SECONDS and sync when due."""
     log.info("Website Sync scheduler started (poll %ss)", _POLL_SECONDS)
     while not _STOP_EVENT.wait(_POLL_SECONDS):
         try:
-            state = load_state()
-            # Master toggle check — if OFF, never auto-crawl regardless of schedule
-            if not _is_master_enabled():
-                # Still track last poll time for UI, but skip crawl
-                log.info("Scheduler: master toggle OFF — skipping auto-crawl")
-                continue
-            hours = _get_schedule_hours()
-            if hours <= 0:
-                # "manual" schedule: only run when explicitly triggered,
-                # never auto-repeat. The engine run with trigger="manual"
-                # performs one shot; the scheduler then waits longer.
-                log.info("Scheduler: manual schedule — performing immediate sync")
-                _run_sync_manual()
-                # After manual sync, wait longer before checking again
-                # (the engine run will have set next_run_at or the state
-                # will reflect that manual mode doesn't auto-repeat).
-                # Sleep a bit longer to avoid tight loop.
-                threading.Event().wait(3600)  # 1 hour cooldown
-                continue
-            if hours <= 0:
-                continue
-            last_raw = state.get("last_run_at")
-            due = True
-            if last_raw:
-                try:
-                    last = datetime.fromisoformat(last_raw)
-                    due = (_utcnow() - last).total_seconds() >= hours * 3600
-                except ValueError:
-                    due = True
-            if due:
-                state["last_run_at"] = _utcnow().isoformat()
-                save_state(state)
-                _run_sync()
+            _poll_once()
         except Exception as exc:  # noqa: BLE001
             log.error("Website sync scheduler iteration failed: %s", exc)
-
-
-def _run_sync_manual() -> None:
-    """Run a single manual sync respecting the master toggle."""
-    if not _is_master_enabled():
-        log.info("Manual sync skipped: master toggle is OFF")
-        return
-    _run_sync()
 
 
 def start() -> None:

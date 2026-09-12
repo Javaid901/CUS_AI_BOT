@@ -31,6 +31,9 @@ from sqlalchemy.orm import Session
 
 from app.auth.security import require_superadmin
 from app.authority.matcher import find_authority, format_contact_card
+from app.authority.repository import (
+    grievance_eligible_ids as repo_grievance_eligible_ids,
+)
 from app.authority.repository import list_all as repo_list_all
 from app.authority.schemas import (
     AuthorityCreate,
@@ -277,13 +280,16 @@ def public_departments(
 def public_active_authorities(
     db: Session = Depends(get_db),
 ):
-    """Public list of ACTIVE authorities (student-facing).
+    """Public list of ACTIVE authorities a student can submit a grievance to.
 
     Only the fields a student needs for the grievance workflow are exposed;
     internal/operational fields (keywords, services, emergency contacts, etc.)
-    are never included. The database is the source of truth.
+    are never included. An authority is eligible ONLY when it is active AND at
+    least one ACTIVE `authority_admin` account is assigned to it — an office
+    with nobody to receive the grievance is never offered in the picker.
     """
     rows = repo_list_all(db, active_only=True)
+    eligible = repo_grievance_eligible_ids(db)
     return {
         "authorities": [
             {
@@ -294,6 +300,7 @@ def public_active_authorities(
                 "email": r["email"] or "",
             }
             for r in rows
+            if r["id"] in eligible
         ]
     }
 

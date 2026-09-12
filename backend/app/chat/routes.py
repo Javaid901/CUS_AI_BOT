@@ -202,7 +202,7 @@ async def ask(
                 if etype == "token":
                     yield _sse(None, event["text"])
 
-                elif etype in ("options", "detail", "auth_form", "results_form", "grievance"):
+                elif etype in ("options", "detail", "auth_form", "results_form", "grievance", "admit_card_doc", "exam_form_doc", "exam_form_pay", "notice_list", "date_sheet_schedule"):
                     yield _structured_event(etype, event)
                     audit(
                         db, "chat",

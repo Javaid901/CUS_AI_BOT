@@ -30,6 +30,7 @@ Security contract:
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.auth.security import require_superadmin
@@ -38,7 +39,8 @@ from app.database import get_db
 from app.models import User
 from app.student.session import resolve_session
 from app.student_admit_card import service as admit_card_svc
-from app.student_admit_card.schemas import AdmitCardCreate, AdmitCardUpdate, ImportBundle
+from app.student_admit_card.render import render_admit_card_pdf
+from app.student_admit_card.schemas import AdmitCardCreate, AdmitCardPrintRequest, AdmitCardUpdate, ImportBundle
 from app.utils.logging import audit
 
 router = APIRouter(prefix=f"{settings.API_PREFIX}/student/admit-cards", tags=["student-admit-card"])
@@ -103,6 +105,45 @@ def my_admit_cards(
         "available_semesters": [s["semester"] for s in available],
         "card": data,
     }
+
+
+@router.post("/{semester}/print")
+def print_admit_card(
+    semester: int,
+    request: Request,
+    body: AdmitCardPrintRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """Real one-page A4 PDF of the authenticated student's OWN admit card.
+
+    Identity always comes from the authenticated StudentSession cookie —
+    the semester is the only selector and never carries a student identity.
+    `as_attachment=true` → Content-Disposition attachment (Download),
+    otherwise inline (Print / preview).
+    """
+    identity = _require_student_snapshot(request, db)
+    student_id = identity["student_id"]
+
+    if semester not in settings.valid_student_semesters:
+        raise HTTPException(status_code=422, detail="Invalid semester selection.")
+
+    data = admit_card_svc.student_card_document(db, student_id, semester)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No admit card is issued for the selected semester.",
+        )
+
+    pdf_bytes = render_admit_card_pdf(data)
+    headers = {
+        "X-Robots-Tag": "noindex, nofollow",
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'",
+    }
+    filename = f"Admit_Card_Semester_{semester}.pdf"
+    disposition = "attachment" if (body and body.as_attachment) else "inline"
+    headers["Content-Disposition"] = f'{disposition}; filename="{filename}"'
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 
 # --------------------------------------------------------------------------- #

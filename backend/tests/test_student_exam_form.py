@@ -919,3 +919,775 @@ def test_chat_unauthenticated_exam_form_asks_to_sign_in():
     )  # note: no student cookie on `client`
     assert r.status_code == 200
     assert "auth_form" in r.text or "sign in" in r.text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Phase D2 — Exam Session model: fill / eligibility gate / payment / document
+# --------------------------------------------------------------------------- #
+import re
+
+from datetime import timedelta
+
+from app.models import (
+    ExamApplicationSubject,
+    ExamEligibility,
+    ExamPayment,
+    ExamSession,
+    StudentAttendance,
+    StudentResult,
+)
+
+client_c = TestClient(app)
+
+C: dict[str, str] = {}
+_SESSION_ID = ""
+_DRAFT_SESSION_ID = ""
+_ZERO_SESSION_ID = ""
+
+_created_session_ids: list[str] = []
+_created_result_ids: list[str] = []
+_created_attendance_ids: list[str] = []
+
+
+def _open_session(code: str, semester: int = 3, base_fee: int = 1500, **over) -> str:
+    """Create an OPEN session directly (server-independent test fixture)."""
+    now = datetime.now(timezone.utc)
+    _created_session_ids.append("__x")  # placeholder removed below
+    data = {
+        "id": uuid.uuid4(),
+        "name": f"Session {code}",
+        "code": code,
+        "programme": "bca",
+        "batch": "2023",
+        "semester": semester,
+        "exam_type": "Regular",
+        "academic_year": "2025-2026",
+        "application_open_at": now - timedelta(days=5),
+        "last_date_normal": now + timedelta(days=20),
+        "last_date_late": now + timedelta(days=35),
+        "base_fee": base_fee,
+        "late_fee": 300,
+        "status": "Open",
+        "form_seq": 0,
+    }
+    data.update(over)
+    db = SessionLocal()
+    try:
+        s = ExamSession(**data)
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+        sid = str(s.id)
+    finally:
+        db.close()
+    _created_session_ids[-1] = sid
+    return sid
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _seed_session_people():
+    """Student C + three sessions. Also seeds C's semester-3 evidence so the
+    eligibility gate passes (internals 60% ≥ 40%, attendance 85% ≥ 75%)."""
+    global C, _SESSION_ID, _DRAFT_SESSION_ID, _ZERO_SESSION_ID
+
+    db = SessionLocal()
+    try:
+        from app.catalogue.models import Programme, ProgrammeSubject
+        from sqlalchemy import func
+
+        # Hermetic subject derivation: the session-fill tests expect the results-
+        # fallback subject path for the exam fixture programme ("bca" -> catalogue
+        # code BCA). Catalogue test modules seed BCA semester-3 ProgrammeSubjects
+        # into the shared test database ahead of this module, so drop them here to
+        # keep subject derivation deterministic regardless of collection order.
+        prog_ids = [p.id for p in db.query(Programme).filter(func.lower(Programme.code) == "bca").all()]
+        for pid in prog_ids:
+            db.query(ProgrammeSubject).filter(ProgrammeSubject.programme_id == pid).delete()
+        db.commit()
+    finally:
+        db.close()
+
+    C.update(_create_student(reg="CUS-EF-C0001", current_semester=3, batch="2023"))
+    _login(client_c, C["reg_no"])
+
+    db = SessionLocal()
+    try:
+        for name, code, internal in (("Data Structures", "BCAD301", 62), ("English-II", "BCAD302", 58)):
+            r = StudentResult(
+                id=uuid.uuid4(), student_id=uuid.UUID(C["id"]), semester=3,
+                exam_type="Regular", subject_name=name, subject_code=code,
+                internal_marks=internal, max_marks=100, status="pass",
+            )
+            db.add(r)
+            _created_result_ids.append(str(r.id))
+        a = StudentAttendance(
+            id=uuid.uuid4(), student_id=uuid.UUID(C["id"]), semester=3,
+            subject_name="Data Structures", subject_code="BCAD301", percentage="85",
+        )
+        db.add(a)
+        _created_attendance_ids.append(str(a.id))
+        db.commit()
+    finally:
+        db.close()
+
+    _SESSION_ID = _open_session("TESTBCA3")            # fee 1500
+    _ZERO_SESSION_ID = _open_session("TESTBCA0", base_fee=0)  # zero fee
+    _open_session_placeholder_draft()                   # Draft session
+
+    yield
+
+    db = SessionLocal()
+    try:
+        for fid in _created_form_ids:
+            db.query(ExamPayment).filter(ExamPayment.form_id == str(fid)).delete()
+            db.query(ExamEligibility).filter(ExamEligibility.form_id == str(fid)).delete()
+            db.query(ExamApplicationSubject).filter(ExamApplicationSubject.form_id == str(fid)).delete()
+            db.query(StudentExamForm).filter(StudentExamForm.id == str(fid)).delete()
+        for sid in _created_session_ids:
+            db.query(ExamPayment).filter(ExamPayment.session_id == str(sid)).delete()
+            db.query(ExamEligibility).filter(ExamEligibility.session_id == str(sid)).delete()
+            db.query(ExamSession).filter(ExamSession.id == str(sid)).delete()
+        for rid in _created_result_ids:
+            db.query(StudentResult).filter(StudentResult.id == str(rid)).delete()
+        for aid in _created_attendance_ids:
+            db.query(StudentAttendance).filter(StudentAttendance.id == str(aid)).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _open_session_placeholder_draft():
+    global _DRAFT_SESSION_ID
+    now = datetime.now(timezone.utc)
+
+    def _mk(code):
+        return ExamSession(
+            id=uuid.uuid4(), name=f"Session {code}", code=code, programme="bca",
+            batch="2023", semester=3, exam_type="Regular", academic_year="2025-2026",
+            application_open_at=now - timedelta(days=5),
+            last_date_normal=now + timedelta(days=20),
+            last_date_late=now + timedelta(days=35),
+            base_fee=1500, late_fee=300, status="Draft", form_seq=0,
+        )
+
+    db = SessionLocal()
+    try:
+        s = _mk("TESTDRAFT3")
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+        _DRAFT_SESSION_ID = str(s.id)
+        _created_session_ids.append(_DRAFT_SESSION_ID)
+    finally:
+        db.close()
+
+
+def _fill_session(session_id: str, student_client: TestClient = None) -> dict:
+    sc = student_client or client_c
+    r = sc.post("/api/student/exam-forms", json={"exam_session_id": session_id})
+    assert r.status_code == 201, r.text
+    form = r.json()
+    _created_form_ids.append(form["id"])
+    return form
+
+
+def _new_eligible_bca_client(reg: str) -> TestClient:
+    """A fresh BCA semester-3 student with internals+attendance seeded so the
+    eligibility gate passes, and NO existing exam form (so the Fill flow can
+    reach the session picker legitimately)."""
+    st = _create_student(reg=reg, current_semester=3, batch="2023")
+    cl = TestClient(app)
+    _login(cl, st["reg_no"])
+    db = SessionLocal()
+    try:
+        for name, code, internal in (("Data Structures", "BCAD301", 62), ("English-II", "BCAD302", 58)):
+            r = StudentResult(
+                id=uuid.uuid4(), student_id=uuid.UUID(st["id"]), semester=3,
+                exam_type="Regular", subject_name=name, subject_code=code,
+                internal_marks=internal, max_marks=100, status="pass",
+            )
+            db.add(r)
+            _created_result_ids.append(str(r.id))
+        a = StudentAttendance(
+            id=uuid.uuid4(), student_id=uuid.UUID(st["id"]), semester=3,
+            subject_name="Data Structures", subject_code="BCAD301", percentage="85",
+        )
+        db.add(a)
+        _created_attendance_ids.append(str(a.id))
+        db.commit()
+    finally:
+        db.close()
+    return cl
+
+
+def test_session_picker_shows_only_matching_open_sessions():
+    r = client_c.get("/api/student/exam-forms/sessions")
+    assert r.status_code == 200
+    codes = {s["code"] for s in r.json()["sessions"]}
+    assert "TESTBCA3" in codes
+    assert "TESTDRAFT3" not in codes  # Draft sessions are never visible
+    ra = client_a.get("/api/student/exam-forms/sessions")
+    assert ra.status_code == 200
+    # A is current-semester 2 → the semester-3 sessions are profile-blocked.
+    assert all(s["semester"] != 3 or s["programme"] != "bca" for s in ra.json()["sessions"])
+
+
+def test_session_fill_derives_subjects_fee_and_snapshot():
+    form = _fill_session(_SESSION_ID)
+    assert form["form_status"] == "Pending"
+    assert form["semester"] == 3
+    assert form["exam_type"] == "Regular"
+    assert form["fee_amount"] == 1500
+    assert form["fee_status"] == "Unpaid"
+    assert "Data Structures" in form["subjects"] and "English-II" in form["subjects"]
+
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        assert re.fullmatch(r"TESTBCA3-3-\d{5}", row.form_no), row.form_no
+        assert row.exam_session_id == uuid.UUID(_SESSION_ID)
+        assert row.academic_year == "2025-2026"
+        snap = json.loads(row.eligibility_snapshot or "{}")
+        assert snap["eligible"] is True
+        assert any(r_["rule"] == "internals_ok" and r_["passed"] for r_ in snap["rules"])
+        elig = db.query(ExamEligibility).filter(ExamEligibility.form_id == row.id).first()
+        assert elig is not None and elig.eligible is True
+        subs = db.query(ExamApplicationSubject).filter(ExamApplicationSubject.form_id == row.id).all()
+        assert {s.subject_name for s in subs} == {"Data Structures", "English-II"}
+        assert all(s.source == "system" for s in subs)
+    finally:
+        db.close()
+
+
+def test_session_fill_draft_session_blocked():
+    r = client_c.post("/api/student/exam-forms", json={"exam_session_id": _DRAFT_SESSION_ID})
+    assert r.status_code == 422
+    assert "not open" in _msg(r).lower()
+
+
+def test_session_fill_duplicate_rejected():
+    sid = _open_session("TESTBCDUP")
+    form = _fill_session(sid)
+    r = client_c.post("/api/student/exam-forms", json={"exam_session_id": sid})
+    assert r.status_code == 409
+    assert "already" in _msg(r).lower()
+
+
+def test_session_fill_missing_session_422():
+    r = client_c.post("/api/student/exam-forms", json={"exam_session_id": "not-a-uuid"})
+    assert r.status_code == 404  # malformed → treated as unknown session
+
+
+def test_session_fill_eligibility_blocked_on_semester_mismatch():
+    d = _create_student(reg="CUS-EF-D0001", current_semester=2)
+    client_d = TestClient(app)
+    r_login = client_d.post("/api/student/verify", json={"reg_no": d["reg_no"], "dob": "2005-06-15"})
+    assert r_login.status_code == 200, r_login.text
+    r = client_d.post("/api/student/exam-forms", json={"exam_session_id": _SESSION_ID})
+    assert r.status_code == 422, r.text
+    assert "eligibility" in _msg(r).lower()
+
+
+def test_session_submit_blocked_while_unpaid():
+    sid = _open_session("TESTBCUP1")
+    form = _fill_session(sid)
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/submit", json={"confirm": True})
+    assert r.status_code == 422
+    assert "unpaid" in _msg(r).lower()
+
+
+def test_session_payment_initiate_confirm_auto_approves():
+    sid = _open_session("TESTBCPAY")
+    form = _fill_session(sid)
+
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/payments/initiate")
+    assert r.status_code == 200, r.text
+    pay = r.json()
+    assert pay["status"] == "initiated"
+    assert pay["amount"] == 1500
+    assert pay["form_id"] == form["id"]
+
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/payments/{pay['id']}/confirm")
+    assert r.status_code == 200, r.text
+    pay2 = r.json()
+    assert pay2["status"] == "success"
+    assert pay2["gateway_ref"]
+
+    # A successful payment auto-approves the form (no manual admin approval)
+    # and stamps the submission date in the project's canonical format.
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        assert row.form_status == "Approved"
+        assert row.fee_status == "Paid"
+        assert row.fee_amount == 1500
+        assert row.transaction_id == pay2["gateway_ref"]
+        assert row.submission_date == datetime.now().strftime("%d-%b-%Y")
+        assert row.printed_at is None  # untouched by payment
+    finally:
+        db.close()
+
+    # The old "confirm → submit" step is superseded: the affirmed form is already
+    # in its final Approved state, so a further submit is rejected idempotently.
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/submit", json={"confirm": True})
+    assert r.status_code == 409
+    assert "already" in _msg(r).lower()
+
+    # Repeated confirm stays idempotent (same success payment, state untouched).
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/payments/{pay['id']}/confirm")
+    assert r.status_code == 200
+    assert r.json()["status"] == "success"
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        assert row.form_status == "Approved" and row.fee_status == "Paid"
+        count = db.query(ExamPayment).filter(
+            ExamPayment.form_id == row.id, ExamPayment.status == "success"
+        ).count()
+        assert count == 1
+    finally:
+        db.close()
+
+
+def test_session_payment_history_and_idor():
+    sid = _open_session("TESTBCHIST")
+    form = _fill_session(sid)
+    client_c.post(f"/api/student/exam-forms/{form['id']}/payments/initiate")
+    r = client_c.get(f"/api/student/exam-forms/{form['id']}/payments")
+    assert r.status_code == 200
+    assert len(r.json()["payments"]) == 1
+
+    # Student B (own jar) must be blocked from C's payment endpoints (IDOR).
+    r = client_b.post(f"/api/student/exam-forms/{form['id']}/payments/initiate")
+    assert r.status_code == 403
+    r = client_b.get(f"/api/student/exam-forms/{form['id']}/document")
+    assert r.status_code == 403
+
+
+def test_session_payment_receipt_access_and_idor():
+    sid = _open_session("TESTBCRCP")
+    form = _fill_session(sid)
+
+    # 1. No payment yet -> receipt is unavailable (409 on both surfaces).
+    assert client_c.get(f"/api/student/exam-forms/{form['id']}/receipt").status_code == 409
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/receipt", json={"as_attachment": True})
+    assert r.status_code == 409
+
+    # 2. Cross-student access blocked (IDOR).
+    assert client_b.get(f"/api/student/exam-forms/{form['id']}/receipt").status_code == 403
+    r = client_b.post(f"/api/student/exam-forms/{form['id']}/receipt", json={"as_attachment": True})
+    assert r.status_code == 403
+
+    # 3. Pay -> success.
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/payments/initiate")
+    assert r.status_code == 200, r.text
+    pay = r.json()
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/payments/{pay['id']}/confirm")
+    assert r.status_code == 200, r.text
+    pay2 = r.json()
+
+    # 4. HTML receipt renders the successful payment (own view only).
+    r = client_c.get(f"/api/student/exam-forms/{form['id']}/receipt")
+    assert r.status_code == 200, r.text
+    html = r.text
+    assert "OFFICIAL PAYMENT RECEIPT" in html
+    assert "cluster university srinagar" in html.lower()
+    assert "PAID" in html
+    assert pay2["gateway_ref"] in html
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        assert row.form_no in html  # receipt number = form number
+    finally:
+        db.close()
+
+    # 5. PDF receipt downloads as an attachment.
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/receipt", json={"as_attachment": True})
+    assert r.status_code == 200, r.text
+    assert r.headers.get("content-type", "").startswith("application/pdf")
+    assert r.content[:5] == b"%PDF-"
+    assert "attachment" in r.headers.get("content-disposition", "")
+    assert "Fee_Receipt_" in r.headers.get("content-disposition", "")
+
+    # 6. The exam-form document reflects the auto-approved state.
+    r = client_c.get(f"/api/student/exam-forms/{form['id']}/document")
+    assert r.status_code == 200
+    assert "Approved" in r.text
+
+
+def test_session_zero_fee_auto_paid_and_submittable():
+    form = _fill_session(_ZERO_SESSION_ID)
+    assert form["fee_status"] == "Paid"
+    assert form["fee_amount"] == 0
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        pay = db.query(ExamPayment).filter(ExamPayment.form_id == row.id).first()
+        assert pay is not None and pay.status == "success" and pay.amount == 0
+        assert pay.gateway_ref.startswith("ZERO-")
+    finally:
+        db.close()
+    r = client_c.post(f"/api/student/exam-forms/{form['id']}/submit", json={"confirm": True})
+    assert r.status_code == 200
+    assert r.json()["form_status"] == "Submitted"
+
+
+def test_session_document_html_and_pdf_print():
+    sid = _open_session("TESTBCDOC")
+    form = _fill_session(sid)
+
+    r = client_c.get(f"/api/student/exam-forms/{form['id']}/document")
+    assert r.status_code == 200
+    html = r.text
+    assert "EXAMINATION FORM" in html
+    assert "Data Structures" in html
+    assert "cluster university srinagar" in html.lower()
+
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        form_no = row.form_no
+    finally:
+        db.close()
+    assert form_no and form_no in html
+
+    r2 = client_c.post(f"/api/student/exam-forms/{form['id']}/print", json={"as_attachment": False})
+    assert r2.status_code == 200, r2.text
+    assert r2.headers.get("content-type", "").startswith("application/pdf")
+    assert r2.content[:5] == b"%PDF-"
+    assert "inline" in r2.headers.get("content-disposition", "")
+
+    db = SessionLocal()
+    try:
+        row = db.get(StudentExamForm, uuid.UUID(form["id"]))
+        assert row.printed_at is not None  # stamped on download
+    finally:
+        db.close()
+
+
+def test_session_admin_crud_status_and_authz():
+    assert client.get("/api/admin/exam-sessions").status_code == 401
+    assert client.get("/api/admin/exam-sessions", headers=ADMIN).status_code == 403
+
+    r = client.get("/api/admin/exam-sessions?status=Open&page_size=100", headers=SUPER)
+    assert r.status_code == 200
+    assert any(s["code"] == "TESTBCA3" for s in r.json()["sessions"])
+
+    body = {
+        "name": "End Semester Exam Regular",
+        "code": "PG26X", "programme": "mca", "semester": 1,
+        "base_fee": 2000, "status": "Draft",
+        "application_open_at": "2026-09-01T00:00:00+00:00",
+        "last_date_normal": "2026-10-01T00:00:00+00:00",
+    }
+    r = client.post("/api/admin/exam-sessions", json=body, headers=SUPER)
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    _created_session_ids.append(sid)
+
+    r = client.post("/api/admin/exam-sessions", json=body, headers=SUPER)
+    assert r.status_code == 409  # duplicate code
+
+    r = client.patch(f"/api/admin/exam-sessions/{sid}", json={"name": "Renamed"}, headers=SUPER)
+    assert r.status_code == 200 and r.json()["name"] == "Renamed"
+
+    r = client.post(f"/api/admin/exam-sessions/{sid}/status", json={"status": "Open"}, headers=SUPER)
+    assert r.status_code == 200 and r.json()["status"] == "Open"
+
+    r = client.delete(f"/api/admin/exam-sessions/{sid}", headers=SUPER)
+    assert r.status_code == 200
+
+    r = client.delete(f"/api/admin/exam-sessions/{sid}", headers=SUPER)
+    assert r.status_code == 404
+
+    # A session with exam forms cannot be deleted (archive instead).
+    r = client.delete(f"/api/admin/exam-sessions/{_SESSION_ID}", headers=SUPER)
+    assert r.status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# Phase D2 — chat integration (session-driven Fill / Pay / Document events)
+# --------------------------------------------------------------------------- #
+def _chat_events_with(client_: TestClient, message: str):
+    r = client_.post(
+        "/api/chat/ask",
+        json={"message": message, "chat_id": f"efc_{uuid.uuid4().hex[:8]}", "stream": True},
+        headers=STU,
+    )
+    assert r.status_code == 200
+    events = []
+    for line in r.text.splitlines():
+        if line.startswith("data: "):
+            try:
+                events.append(json.loads(line[len("data: "):]))
+            except Exception:
+                events.append({"type": "token", "text": line[len("data: "):]})
+    assert events, "chat stream should yield events"
+    return events
+
+
+def _chat_events_c(message: str):
+    return _chat_events_with(client_c, message)
+
+
+def _chat_option_ids(events) -> list[str]:
+    return [
+        o["id"]
+        for e in events if e.get("type") == "options"
+        for o in (e.get("options") or [])
+    ]
+
+
+def test_chat_exam_form_hub_landing_always_shows_both_options():
+    # The exam form hub ALWAYS shows BOTH Fill and Print, regardless of whether
+    # the student already has an application. (fresh profile, no forms)
+    e = _create_student(reg="CUS-EF-E0001", current_semester=3, admission_year=2023)
+    client_e = TestClient(app)
+    r_login = client_e.post("/api/student/verify", json={"reg_no": e["reg_no"], "dob": "2005-06-15"})
+    assert r_login.status_code == 200, r_login.text
+    _open_session("TESTCHAT1")
+    events = _chat_events_with(client_e, "student_exam_form")
+    ids = _chat_option_ids(events)
+    assert "exam_form_fill" in ids
+    assert "exam_form_print" in ids
+
+
+def test_chat_exam_form_hub_landing_both_options_with_submitted_form():
+    # Even with a submitted/approved form the hub STILL shows BOTH options.
+    f = _create_student(reg="CUS-EF-A1001", programme="bba", current_semester=3, admission_year=2023)
+    client_f = TestClient(app)
+    _login(client_f, f["reg_no"])
+    sid_f = _open_session("TESTCHATQA", programme="bba")
+    dbx = SessionLocal()
+    try:
+        _seed_form(
+            dbx, f["id"], semester=3,
+            exam_session_id=uuid.UUID(sid_f),
+            form_no="TESTCHATQA-3-10001",
+            form_status="Approved",
+            submission_date="10-Sep-2026",
+            fee_status="Paid",
+            fee_amount=1500,
+        )
+    finally:
+        dbx.close()
+    events = _chat_events_with(client_f, "student_exam_form")
+    ids = _chat_option_ids(events)
+    assert "exam_form_print" in ids
+    assert "exam_form_fill" in ids
+
+
+def test_chat_exam_form_fill_shows_existing_application_not_duplicate():
+    # When an already-applied student clicks Fill the EXISTING application is
+    # displayed (message + detail + View/Download chips) — a new application
+    # is never started.
+    f = _create_student(reg="CUS-EF-A1002", programme="bba", current_semester=3, admission_year=2023)
+    client_f = TestClient(app)
+    _login(client_f, f["reg_no"])
+    sid_f = _open_session("TESTCHATQB", programme="bba")
+    dbx = SessionLocal()
+    try:
+        _seed_form(
+            dbx, f["id"], semester=3,
+            exam_session_id=uuid.UUID(sid_f),
+            form_no="TESTCHATQB-3-10001",
+            form_status="Approved",
+            submission_date="10-Sep-2026",
+            fee_status="Paid",
+            fee_amount=1500,
+        )
+    finally:
+        dbx.close()
+    events = _chat_events_with(client_f, "exam_form_fill")
+    texts = [e.get("text", "") for e in events if e.get("type") == "token"]
+    joined = " ".join(texts).lower()
+    assert "already filled" in joined
+    ids = _chat_option_ids(events)
+    assert not any(i.startswith("exam_form_pick") for i in ids), "no session picker for an already-applied student"
+    assert any(i.startswith("exam_form_view") for i in ids), "existing form must offer View"
+    assert any(i.startswith("exam_form_dl") for i in ids), "existing form must offer Print / Download"
+    assert any(e.get("type") == "detail" for e in events), "existing form detail must be shown"
+
+
+def test_chat_exam_form_pick_existing_session_shows_existing_application():
+    # Picking an already-applied session from the picker must display the
+    # existing application instead of creating a duplicate.
+    f = _create_student(reg="CUS-EF-A1003", programme="bba", current_semester=3, admission_year=2023)
+    client_f = TestClient(app)
+    _login(client_f, f["reg_no"])
+    sid_f = _open_session("TESTCHATQC", programme="bba")
+    dbx = SessionLocal()
+    try:
+        _seed_form(
+            dbx, f["id"], semester=3,
+            exam_session_id=uuid.UUID(sid_f),
+            form_no="TESTCHATQC-3-10001",
+            form_status="Approved",
+            submission_date="10-Sep-2026",
+            fee_status="Paid",
+            fee_amount=1500,
+        )
+    finally:
+        dbx.close()
+    events = _chat_events_with(client_f, "exam_form_picktestchatqc")
+    texts = " ".join(e.get("text", "") for e in events if e.get("type") == "token").lower()
+    assert "already filled" in texts
+    ids = _chat_option_ids(events)
+    assert any(i.startswith("exam_form_view") for i in ids)
+    assert any(i.startswith("exam_form_dl") for i in ids)
+
+
+def test_chat_exam_form_print_shows_empty_state():
+    # A student with no submitted form gets a clear empty state — no dead print.
+    h = _create_student(reg="CUS-EF-H0001", programme="bba", current_semester=3, admission_year=2023)
+    client_h = TestClient(app)
+    _login(client_h, h["reg_no"])
+    _open_session("TESTCHATH", programme="bba")
+    events = _chat_events_with(client_h, "exam_form_print")
+    texts = [e.get("text", "") for e in events if e.get("type") == "token"]
+    assert any("No submitted exam form is available" in t for t in texts)
+    assert not any(i.startswith("exam_form_view") for i in _chat_option_ids(events))
+    assert not any(i.startswith("exam_form_dl") for i in _chat_option_ids(events))
+
+
+def test_chat_exam_form_fill_pick_and_pay_event():
+    # Regression: a student with NO existing application gets the OPEN-session
+    # picker, and picking a session leads to the mock payment flow (unchanged).
+    client_d = _new_eligible_bca_client("CUS-EF-D0005")
+    _open_session("TESTCHAT2")
+    events = _chat_events_with(client_d, "exam_form_fill")
+    ids = _chat_option_ids(events)
+    pick = next(i for i in ids if i.startswith("exam_form_pick") and "testchat2" in i)
+
+    events2 = _chat_events_with(client_d, pick)
+    assert any(e.get("type") == "detail" for e in events2)
+    pay_chip = next(a for a in _chat_option_ids(events2) if a.startswith("exam_form_pay"))
+
+    events3 = _chat_events_with(client_d, pay_chip)
+    pays = [e for e in events3 if e.get("type") == "exam_form_pay"]
+    assert pays and pays[0]["amount"] == 1500
+    form_id = pay_chip[len("exam_form_pay"):]
+    assert form_id == pays[0]["form_id"]
+    _created_form_ids.append(form_id)
+
+
+def test_chat_exam_form_document_event_renders_form_doc():
+    client_e = _new_eligible_bca_client("CUS-EF-E0002")
+    _open_session("TESTCHAT3")
+    events = _chat_events_with(client_e, "exam_form_fill")
+    pick = next(i for i in _chat_option_ids(events) if i.startswith("exam_form_pick") and "testchat3" in i)
+    events2 = _chat_events_with(client_e, pick)
+    view_chip = next(a for a in _chat_option_ids(events2) if a.startswith("exam_form_view"))
+
+    events3 = _chat_events_with(client_e, view_chip)
+    docs = [e for e in events3 if e.get("type") == "exam_form_doc"]
+    assert docs, f"should emit exam_form_doc event: {[e.get('type') for e in events3]}"
+    assert "EXAMINATION FORM" in docs[0].get("document_html", "")
+    assert docs[0]["form_no"]
+    _created_form_ids.append(view_chip[len("exam_form_view"):])
+
+
+# --------------------------------------------------------------------------- #
+# MASTER: unified entry points — typed/voice NL → SAME canonical hub
+# --------------------------------------------------------------------------- #
+def _chat_events_cid(client_: TestClient, message: str, chat_id: str):
+    """Like `_chat_events_with` but uses the caller-provided chat_id so the
+    conversation state (e.g. the Student Services auth gate) persists across
+    turns."""
+    r = client_.post(
+        "/api/chat/ask",
+        json={"message": message, "chat_id": chat_id, "stream": True},
+        headers=STU,
+    )
+    assert r.status_code == 200
+    events = []
+    for line in r.text.splitlines():
+        if line.startswith("data: "):
+            try:
+                events.append(json.loads(line[len("data: "):]))
+            except Exception:
+                events.append({"type": "token", "text": line[len("data: "):]})
+    assert events, "chat stream should yield events"
+    return events
+
+
+def _chat_token_texts(events) -> list[str]:
+    return [e.get("text", "") for e in events if e.get("type") == "token"]
+
+
+def test_chat_nl_exam_form_generic_lands_canonical_hub():
+    # Typed "exam form" (generic) must land on the SAME canonical hub the
+    # Student Services chip renders — both options, never the legacy
+    # provisioning message and never an auto-picked single flow.
+    cl = _new_eligible_bca_client("CUS-EF-NL01")
+    events = _chat_events_with(cl, "exam form")
+    ids = _chat_option_ids(events)
+    assert "exam_form_fill" in ids
+    assert "exam_form_print" in ids
+    texts = " ".join(_chat_token_texts(events)).lower()
+    assert "no exam form is available for your profile yet" not in texts
+
+
+def test_chat_nl_examination_form_generic_lands_canonical_hub():
+    cl = _new_eligible_bca_client("CUS-EF-NL02")
+    events = _chat_events_with(cl, "examination form")
+    ids = _chat_option_ids(events)
+    assert "exam_form_fill" in ids
+    assert "exam_form_print" in ids
+
+
+def test_chat_nl_fill_exam_form_goes_directly_to_fill():
+    # "fill exam form" (typed / voice) goes DIRECTLY to the Fill flow (open
+    # session picker) without showing the hub first.
+    cl = _new_eligible_bca_client("CUS-EF-NL03")
+    _open_session("TESTCHATNL3")
+    events = _chat_events_with(cl, "fill exam form")
+    ids = _chat_option_ids(events)
+    picks = [i for i in ids if i.startswith("exam_form_pick") and "testchatnl3" in i]
+    assert picks, f"expected a session picker chip, got {ids}"
+
+
+def test_chat_nl_print_exam_form_goes_directly_to_print_empty_state():
+    # "print exam form" goes DIRECTLY to the Print flow; a student with no
+    # submitted form sees the print empty state — never the hub, never the
+    # legacy provisioning message.
+    cl = _new_eligible_bca_client("CUS-EF-NL04")
+    events = _chat_events_with(cl, "print exam form")
+    texts = " ".join(_chat_token_texts(events))
+    assert "No submitted exam form is available" in texts
+    assert "No Exam Form is available for your profile yet" not in texts
+    assert not any(i.startswith("exam_form_view") for i in _chat_option_ids(events))
+
+
+def test_chat_nl_exam_form_auth_resume_lands_canonical_hub():
+    # Unauthenticated "exam form" opens the auth gate; after sign-in the
+    # frontend sends "Student Services" and the ORIGINAL intent resumes to the
+    # canonical hub (both options) — never the legacy provisioning message.
+    st = _create_student(reg="CUS-EF-NL05", current_semester=3, admission_year=2023)
+    cl = TestClient(app)
+    cid = f"nl_{uuid.uuid4().hex[:8]}"
+    ev1 = _chat_events_cid(cl, "exam form", cid)
+    assert any(e.get("type") == "auth_form" for e in ev1), ev1
+    _login(cl, st["reg_no"])
+    ev2 = _chat_events_cid(cl, "Student Services", cid)
+    ids = _chat_option_ids(ev2)
+    assert "exam_form_fill" in ids
+    assert "exam_form_print" in ids
+    texts = " ".join(_chat_token_texts(ev2)).lower()
+    assert "no exam form is available for your profile yet" not in texts
+
+
+def test_chat_nl_fill_exam_form_auth_resume_goes_directly_to_fill():
+    st = _create_student(reg="CUS-EF-NL06", current_semester=3, admission_year=2023)
+    _open_session("TESTCHATNL6")
+    cl = TestClient(app)
+    cid = f"nl_{uuid.uuid4().hex[:8]}"
+    ev1 = _chat_events_cid(cl, "fill exam form", cid)
+    assert any(e.get("type") == "auth_form" for e in ev1), ev1
+    _login(cl, st["reg_no"])
+    ev2 = _chat_events_cid(cl, "Student Services", cid)
+    ids = _chat_option_ids(ev2)
+    picks = [i for i in ids if i.startswith("exam_form_pick") and "testchatnl6" in i]
+    assert picks, f"resumed fill should reach the session picker, got {ids}"
+    assert "exam_form_fill" not in ids, "resumed fill should skip the hub"
+    assert "exam_form_print" not in ids, "resumed fill should skip the hub"

@@ -175,7 +175,8 @@
         '<div class="input-wrap">' +
           '<textarea rows="1" placeholder="Ask anything about Cluster University Srinagar..." aria-label="Type your message"></textarea>' +
           '<button class="mic" type="button" aria-label="Hold to speak" title="Hold to speak" aria-pressed="false">' +
-            '<svg viewBox="0 0 24 24" fill="none" stroke-linejoin="round"><path d="M22 2L2 22"/><path d="M2 22h7.5a4.5 4.5 0 0 1 0 9H5"/><circle cx="9" cy="9" r="4"/><path d="M2 2l20"/><path d="M6 12l3.5-7l3.5 7M15 12l3.5-7l3.5 7"/></svg>' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><line x1="12" y1="19" x2="12" y2="22"/></svg>' +
+            '<span class="mic-label" aria-hidden="true">Listening…</span>' +
           '<button class="send" aria-label="Send message" disabled>' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>' +
           '</button>' +
@@ -399,6 +400,88 @@
     addMsg("bot", html, null, context, queryMeta);
   }
 
+  function renderNoticeList(payload) {
+    // Published university notices / date-sheet documents (public pipeline).
+    // Facts (title, session, programmes, publish date) come only from the
+    // structured notice payload; URLs are never shown as visible text.
+    var message = payload.message || "";
+    var notices = payload.notices || [];
+    var html = "";
+    if (message) html += "<p>" + escapeHtml(message) + "</p>";
+    if (notices.length) {
+      html += '<div class="notice-list">';
+      notices.forEach(function (n) {
+        var title = String(n.title || n.filename || "University Notice");
+        var meta = [];
+        if (n.published_at) meta.push("Published " + String(n.published_at).slice(0, 10));
+        if (n.exam_session_label) meta.push("Session " + String(n.exam_session_label));
+        if (n.programme_ids && n.programme_ids.length) {
+          var progs = n.programme_ids.map(function (p) { return String(p).toUpperCase(); }).join(", ");
+          meta.push("Programmes " + progs);
+        }
+        html += '<div class="ds-notice-card">';
+        html += '<div class="notice-head">';
+        html += '<span class="nicon" role="img" aria-label="Notice">📄</span>';
+        html += '<div class="notice-title">' + escapeHtml(title) + "</div>";
+        html += "</div>";
+        if (meta.length) html += '<div class="notice-meta">' + escapeHtml(meta.join(" · ")) + "</div>";
+        html += '<div class="notice-actions">';
+        html += '<a class="chip" target="_blank" rel="noopener" href="' + escapeHtml(String(n.file_url || "")) + '">View Full Official Date Sheet</a>';
+        html += '<a class="chip" href="' + escapeHtml(String(n.file_url || "")) + '?download=1" download>Download Original</a>';
+        html += "</div></div>";
+      });
+      html += "</div>";
+    } else if (!message) {
+      html += "<p>No published notices are available right now.</p>";
+    }
+    addMsg("bot", html);
+  }
+
+  function renderDateSheet(payload) {
+    // Verified date-sheet schedule — rows are server-derived from
+    // DateSheetEntry records only; the board never fabricates an entry.
+    var schedule = payload.schedule || [];
+    var documents = payload.documents || [];
+    var message = payload.message || "";
+    var html = "";
+    html += '<div class="detail-card">';
+    var prog = String(payload.programme || "").toUpperCase();
+    var title = (prog ? prog + " · " : "") + "Semester " + String(payload.semester == null ? "" : payload.semester) + " Date Sheet";
+    html += '<div class="notice-head">';
+    html += '<span class="nicon" role="img" aria-label="Date sheet">📄</span>';
+    html += '<h4 class="notice-title">' + escapeHtml(title) + "</h4>";
+    html += "</div>";
+    var meta = [];
+    if (payload.stream) meta.push("Stream " + String(payload.stream).toUpperCase());
+    if (payload.batch) meta.push("Batch " + String(payload.batch));
+    if (meta.length) html += '<div class="notice-meta">' + escapeHtml(meta.join(" · ")) + "</div>";
+    if (message) html += "<p>" + escapeHtml(message) + "</p>";
+    html += '<table class="dtbl"><thead><tr>' +
+      "<th>Date</th><th>Day</th><th>Time</th><th>Subject</th><th>Paper Code</th><th>Venue</th>" +
+      "</tr></thead><tbody>";
+    schedule.forEach(function (r) {
+      var t = (r.start_time || "") + (r.end_time ? " – " + r.end_time : "");
+      html += "<tr><td>" + escapeHtml(r.exam_date || "") + "</td>" +
+        "<td>" + escapeHtml(r.day || "") + "</td>" +
+        "<td>" + escapeHtml(t) + "</td>" +
+        "<td>" + escapeHtml(r.subject || "") + "</td>" +
+        "<td>" + escapeHtml(r.paper_code || "") + "</td>" +
+        "<td>" + escapeHtml(r.venue || "") + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    if (documents.length) {
+      html += '<div class="ds-actions">';
+      documents.forEach(function (d) {
+        html += '<a class="chip" target="_blank" rel="noopener" href="' + escapeHtml(String(d.file_url || "")) + '">View Full Official Date Sheet</a>';
+        html += '<a class="chip" href="' + escapeHtml(String(d.file_url || "")) + '?download=1" download>Download Original</a>';
+      });
+      html += "</div>";
+    }
+    html += '<button class="chip back" data-role="option" data-value="back">← Back</button>';
+    html += "</div>";
+    addMsg("bot", html);
+  }
+
   function showTyping() { var row = document.createElement("div"); row.className = "row bot"; row.id = "cus-typing"; row.innerHTML = '<div class="avatar">C</div><div class="msg typing"><span></span><span></span><span></span></div>'; body.appendChild(row); body.scrollTop = body.scrollHeight; }
   function removeTyping() { var t = document.getElementById("cus-typing"); if (t) t.remove(); }
   function showSpinner() {
@@ -411,193 +494,258 @@
   }
   function updateSendState() { if (state.streaming) return; sendBtn.disabled = !input.value.trim(); }
 
-  /* ---------- Voice input (hold-to-speak) ---------- */
+  /* ---------- Voice input (press-and-hold, ChatGPT-style) ---------- */
   var micBtn = root.querySelector(".mic");
+  var micLabelEl = micBtn ? micBtn.querySelector(".mic-label") : null;
   var recognition = null;
-  var isListening = false;
+  var engineActive = false;      // recognition engine currently running
+  var micHeld = false;           // pointer is currently down (user holding)
+  var finalizePending = false;   // released with intent to submit — awaiting final transcript
+  var interrupted = false;       // cancel/error path — never submit
+  var voiceSubmitted = false;    // at-most-one submission per hold cycle
   var interimTranscript = "";
   var finalTranscript = "";
-  var micActive = false;
+  var inputBackup = "";
+  var finalizeTimer = 0;
+  var processingTimer = 0;
 
   function supportsVoiceInput() {
     return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
   }
 
+  function setMicState(st) {
+    if (!micBtn) return;
+    micBtn.classList.toggle("on", st === "listening");
+    micBtn.classList.toggle("processing", st === "processing");
+    if (micLabelEl) micLabelEl.textContent = st === "processing" ? "Sending…" : "Listening…";
+    var held = st === "listening";
+    micBtn.setAttribute("aria-pressed", held ? "true" : "false");
+    if (st === "listening") {
+      micBtn.setAttribute("title", "Release to ask");
+      micBtn.setAttribute("aria-label", "Release to ask");
+    } else if (st === "processing") {
+      micBtn.setAttribute("title", "Processing your message");
+      micBtn.setAttribute("aria-label", "Processing your message");
+    } else {
+      micBtn.setAttribute("title", "Hold to speak");
+      micBtn.setAttribute("aria-label", "Hold to speak");
+    }
+  }
+
+  function restoreInput() {
+    if (!input) return;
+    input.value = inputBackup;
+    autosize();
+  }
+
   function initRecognition() {
     var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (supportsVoiceInput()) {
-      recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-IN";
-      recognition.maxAlternatives = 1;
-
-      recognition.onstart = function () {
-        isListening = true;
-        if (micBtn) {
-          micBtn.setAttribute("aria-pressed", "true");
-          micBtn.setAttribute("title", "Release to stop listening");
-          micBtn.setAttribute("aria-label", "Release to stop listening");
-        }
-      };
-
-      recognition.onerror = function (e) {
-        var err = e.error;
-        if (err === "not-allowed" || err === "permission-denied") {
-          if (micBtn) {
-            micBtn.setAttribute("aria-pressed", "false");
-            micBtn.setAttribute("title", "Hold to speak");
-            micBtn.setAttribute("aria-label", "Hold to speak");
-          }
-        }
-        if (err === "no-speech") {
-          // user was silent — just keep listening, don't stop
-        }
-        if (err === "audio-capture") {
-          // microphone unavailable
-        }
-        if (err === "network") {
-          // speech service unavailable
-        }
-        if (recognition) {
-          recognition.stop();
-          isListening = false;
-          if (micBtn) {
-            micBtn.setAttribute("aria-pressed", "false");
-            micBtn.setAttribute("title", "Hold to speak");
-            micBtn.setAttribute("aria-label", "Hold to speak");
-          }
-        }
-      };
-
-      recognition.onresult = function (e) {
-        var interim = "";
-        var final = "";
-        for (var i = e.resultIndex; i < e.results.length; i++) {
-          if (e.results[i].isFinal) {
-            final += e.results[i][0].transcript;
-          } else {
-            interim += e.results[i][0].transcript;
-          }
-        }
-        interimTranscript = interim;
-        finalTranscript = final;
-
-        // Display in textarea while holding
-        if (input) {
-          input.value = finalTranscript + (interimTranscript ? " " + interimTranscript : "");
-        }
-      };
-
-      recognition.onend = function () {
-        // onend may fire even while still holding (browser interruptions)
-        // We only stop listening if the user has released the pointer.
-        // If still holding, we re-start recognition automatically.
-        if (!micActive) {
-          // User released — do NOT auto-restart; let finalizeVoiceQuery handle it
-          isListening = false;
-          if (micBtn) {
-            micBtn.setAttribute("aria-pressed", "false");
-            micBtn.setAttribute("title", "Hold to speak");
-            micBtn.setAttribute("aria-label", "Hold to speak");
-          }
-        } else {
-          // Still holding — restart recognition
-          try { recognition.start(); } catch (e) {}
-        }
-      };
+    if (!supportsVoiceInput()) {
+      if (micBtn) {
+        micBtn.classList.add("unsupported");
+        micBtn.setAttribute("title", "Speech recognition is not supported in this browser");
+        micBtn.setAttribute("aria-label", "Speech recognition is not supported");
+      }
+      return;
     }
+
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-IN";
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = function () {
+      engineActive = true;
+      if (micHeld) setMicState("listening");
+    };
+
+    recognition.onerror = function (e) {
+      var err = e.error;
+      if (err === "not-allowed" || err === "permission-denied") {
+        toast("Microphone permission is required for voice input.");
+        interrupted = true;
+      } else if (err === "audio-capture") {
+        toast("No microphone detected. Please check your mic.");
+        interrupted = true;
+      } else if (err === "network") {
+        toast("Speech service unavailable. Please try again.");
+        interrupted = true;
+      } else if (err === "no-speech") {
+        // User was silent — keep listening while holding; onend restarts.
+      } else if (err === "aborted") {
+        // Expected when we call stop() — finalized in onend.
+      } else {
+        // Unknown failure — fail safe.
+        interrupted = true;
+      }
+      if (interrupted && micHeld) releaseCapture(false);
+    };
+
+    recognition.onresult = function (e) {
+      // After a cancel/error the engine may still flush a late "final" result —
+      // ignore it so the restored input is never repopulated with partial speech.
+      if (interrupted) return;
+      var interim = "", final = "";
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript;
+        else interim += e.results[i][0].transcript;
+      }
+      if (final) finalTranscript = final;
+      if (interim) interimTranscript = interim;
+
+      // Live preview only while listening — interim is NEVER submitted.
+      if (input) {
+        var base = inputBackup.trim();
+        var live = finalTranscript + (interimTranscript ? " " + interimTranscript : "");
+        live = live.trim();
+        input.value = live ? (base ? base + " " + live : live) : base;
+        autosize();
+      }
+    };
+
+    recognition.onend = function () {
+      // Fires after stop() — the final onresult has already been delivered —
+      // or after a browser-side interruption.
+      if (micHeld) {
+        // Still holding: restart cleanly.
+        engineActive = false;
+        try { recognition.start(); } catch (e) {}
+        return;
+      }
+      if (finalizePending && !interrupted) {
+        finalizeVoiceQuery();   // final transcript (if any) is now in hand
+      } else {
+        setMicState("idle");
+      }
+      engineActive = false;
+    };
+  }
+
+  function startVoiceCapture() {
+    if (state.streaming) { toast("Please wait for the current reply to finish"); return; }
+    if (micHeld || engineActive || !recognition) return;
+    micHeld = true;
+    finalizePending = false;
+    interrupted = false;
+    voiceSubmitted = false;
+    clearTimeout(processingTimer);
+    interimTranscript = "";
+    finalTranscript = "";
+    inputBackup = input ? input.value : "";
+    if (input) input.setSelectionRange(input.value.length, input.value.length);
+    setMicState("listening");
+    try { recognition.start(); } catch (e) { releaseCapture(false); }
+  }
+
+  function releaseCapture(submit) {
+    // Single exit point: pointerup submits, pointercancel/lostpointercapture/errors cancel.
+    micHeld = false;
+    if (submit) {
+      finalizePending = true;
+    } else {
+      finalizePending = false;
+      interrupted = true;
+    }
+    clearTimeout(finalizeTimer);
+    try { if (engineActive) recognition.stop(); } catch (e) {}
+    if (submit) {
+      // The engine flushes the pending utterance as a final result, then onend
+      // runs finalizeVoiceQuery with the transcript in hand. The timer is a
+      // safety net so we never get stuck if onend never fires.
+      finalizeTimer = setTimeout(finalizeVoiceQuery, 2800);
+    } else {
+      setMicState("idle");
+      restoreInput();
+    }
+  }
+
+  function finalizeVoiceQuery() {
+    clearTimeout(finalizeTimer); finalizeTimer = 0;
+    if (voiceSubmitted) return;                    // 0-or-1 submissions per cycle
+    voiceSubmitted = true;
+    if (interrupted || !finalizePending) return;
+
+    // FINAL transcript only — interim results are preview-only and never submitted.
+    var transcript = (finalTranscript || "").trim();
+    if (!transcript) {
+      // No finished speech — do NOT search. Keep any interim preview visible so
+      // nothing the user said is silently discarded; they can send it manually.
+      var interimLive = (interimTranscript || "").trim();
+      var base0 = inputBackup.trim();
+      if (interimLive) {
+        input.value = base0 ? base0 + " " + interimLive : interimLive;
+        autosize();
+      } else {
+        restoreInput();
+      }
+      clearTimeout(processingTimer);
+      finalizePending = false;
+      interrupted = false;
+      setMicState("idle");
+      return;
+    }
+
+    setMicState("processing");
+    var base = inputBackup.trim();
+    input.value = base ? base + " " + transcript : transcript;
+    autosize();
+    sendClick();                                   // same path as typed text
+    finalizePending = false;
+    interrupted = false;
+    // Keep the Processing state visible briefly, then return to Idle.
+    clearTimeout(processingTimer);
+    processingTimer = setTimeout(function () {
+      if (!micHeld && !finalizePending) setMicState("idle");
+    }, 900);
   }
 
   if (supportsVoiceInput() && micBtn) {
     initRecognition();
 
-    /* ---------- Hold-to-speak pointer handlers ---------- */
+    /* ---------- Press-and-hold pointer handlers ---------- */
     micBtn.addEventListener("pointerdown", function (e) {
-      // Prevent default browser actions (e.g., text selection on some devices)
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       e.preventDefault();
+      try { micBtn.setPointerCapture(e.pointerId); } catch (err) {}
       startVoiceCapture();
     });
 
     micBtn.addEventListener("pointerup", function (e) {
-      stopVoiceCapture();
+      if (micHeld) releaseCapture(true);
     });
 
     micBtn.addEventListener("pointercancel", function (e) {
-      stopVoiceCapture();
+      if (micHeld) releaseCapture(false);
     });
 
     micBtn.addEventListener("lostpointercapture", function (e) {
-      stopVoiceCapture();
+      // Fires after pointerup too — micHeld is already false then, so no double handling.
+      if (micHeld) releaseCapture(false);
     });
-  }
 
-  function startVoiceCapture() {
-    if (!recognition) return;
-    if (state.streaming) return;
-    if (isListening) return;
-    isListening = true;
-    micActive = true;
-    interimTranscript = "";
-    finalTranscript = "";
-    try {
-      recognition.start();
-    } catch (e) {
-      isListening = false;
-      micActive = false;
-    }
-  }
+    micBtn.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
-  function stopVoiceCapture() {
-    if (!recognition) return;
-    isListening = false;
-    micActive = false;
-    try {
-      recognition.stop();
-    } catch (e) {}
-    // finalize and submit
-    finalizeVoiceQuery();
-  }
-
-  function finalizeVoiceQuery() {
-    // Build the final transcript: final text + interim text
-    var transcript = finalTranscript + (interimTranscript ? " " + interimTranscript : "");
-    transcript = transcript.trim();
-
-    if (!transcript) {
-      // Empty — do nothing
-      if (micBtn) {
-        micBtn.setAttribute("aria-pressed", "false");
-        micBtn.setAttribute("title", "Hold to speak");
-        micBtn.setAttribute("aria-label", "Hold to speak");
-      }
-      return;
-    }
-
-    // Append to existing textarea content if any, otherwise just set the transcript
-    var current = (input ? input.value : "").trim();
-    if (current) {
-      input.value = current + " " + transcript;
-    } else {
-      input.value = transcript;
-    }
-    autosize();
-
-    // Call existing send function — this is the same path as typed text
-    sendClick();
-
-    // Reset mic state
-    if (micBtn) {
-      micBtn.setAttribute("aria-pressed", "false");
-      micBtn.setAttribute("title", "Hold to speak");
-      micBtn.setAttribute("aria-label", "Hold to speak");
-    }
+    // Safety net: hiding/leaving the page while holding must not leave the mic armed.
+    ["blur", "visibilitychange"].forEach(function (ev) {
+      window.addEventListener(ev, function () {
+        if (micHeld || engineActive) releaseCapture(false);
+      });
+    });
+  } else if (micBtn) {
+    micBtn.classList.add("unsupported");
+    micBtn.setAttribute("title", "Speech recognition is not supported in this browser");
+    micBtn.setAttribute("aria-label", "Speech recognition is not supported");
   }
 
   /* ---------- Message action handlers ---------- */
   body.addEventListener("click", function (e) {
     var rsfEl = e.target.closest("button[data-rsf]");
     if (rsfEl) { rsfOnClick(e); return; }
+    var acdEl = e.target.closest("button[data-acd]");
+    if (acdEl) { acdOnClick(acdEl); return; }
+    var efdEl = e.target.closest("button[data-efd], button[data-efp]");
+    if (efdEl) { ExamFormOnClick(efdEl); return; }
     var t = e.target.closest("button");
     if (!t) return;
     var role = t.getAttribute("data-role");
@@ -850,6 +998,15 @@ var label = t.textContent.replace("←", "").trim();
                 // Structured detail card
                 removeTyping(); hideSpinner();
                 try { var detData = JSON.parse(data); renderDetail(detData); if (detData._query && detData._query.corrected) trackCorrection(detData._query); } catch (e) { addMsg("bot", "<p>⚠️ Could not load details.</p>"); }
+              } else if (ev === "notice_list") {
+                // Public university notices / date-sheet documents
+                removeTyping(); hideSpinner();
+                try { var nlData = JSON.parse(data); renderNoticeList(nlData); } catch (e) { addMsg("bot", "<p>⚠️ Could not load notices.</p>"); }
+              } else if (ev === "date_sheet_schedule") {
+                // Verified date-sheet schedule (rows come from verified
+                // DateSheetEntry records only — never LLM-generated facts)
+                removeTyping(); hideSpinner();
+                try { var dsData = JSON.parse(data); renderDateSheet(dsData); } catch (e) { addMsg("bot", "<p>⚠️ Could not load the date sheet.</p>"); }
               } else if (ev === "grievance") {
                 // Grievance intake: start the in-chat workflow with prefill
                 removeTyping(); hideSpinner();
@@ -876,6 +1033,24 @@ var label = t.textContent.replace("←", "").trim();
                 // and detail is rendered after the attempt is confirmed.
                 removeTyping(); hideSpinner();
                 try { var rsfData = JSON.parse(data); renderResultsForm(rsfData); } catch (e) { addMsg("bot", "<p>⚠️ Could not open the results form.</p>"); }
+              } else if (ev === "admit_card_doc") {
+                // Authenticated Admit Card: the university-document render.
+                // Shown inside the chat with Print / Download actions; the
+                // identity always comes from the HttpOnly student cookie.
+                removeTyping(); hideSpinner();
+                try { var acdData = JSON.parse(data); renderAdmitCardDoc(acdData); } catch (e) { addMsg("bot", "<p>⚠️ Could not open the admit card document.</p>"); }
+              } else if (ev === "exam_form_doc") {
+                // Authenticated Exam Form (Exam Session model): the formal
+                // document render. Print opens a PDF stream (server stamps
+                // printed_at); Download saves the PDF. Identity from cookie.
+                removeTyping(); hideSpinner();
+                try { var efdData = JSON.parse(data); renderExamFormDoc(efdData); } catch (e) { addMsg("bot", "<p>⚠️ Could not open the exam form document.</p>"); }
+              } else if (ev === "exam_form_pay") {
+                // Authenticated Exam Form fee: mock checkout panel. The amount
+                // shown is server-derived (session fee + late fee). "Pay" runs
+                // initiate → confirm server-side, then resubmits the document.
+                removeTyping(); hideSpinner();
+                try { var efpData = JSON.parse(data); renderExamFormPay(efpData); } catch (e) { addMsg("bot", "<p>⚠️ Could not open the fee panel.</p>"); }
               } else if (ev === "logout") {
                 // Student Services signed out — the server revoked the session
                 // and cleared the HttpOnly cookie. Drop any transient sign-in
@@ -1320,6 +1495,324 @@ var label = t.textContent.replace("←", "").trim();
       e.preventDefault();
       rsfSubmit();
     }
+  }
+
+  /* =====================================================================
+     Student Admit Card — university-document View / Print / Download
+     An admit_card_doc SSE event calls renderAdmitCardDoc(): the server
+     renders the same formal document used for the PDF inside an iframe with
+     Print and Download actions. Both actions POST to the print endpoint with
+     the session cookie only; the student is always resolved server-side.
+     ===================================================================== */
+  var AdmitCard = { last: null, busy: false };
+
+  function renderAdmitCardDoc(payload) {
+    var sem = Number(payload.semester) || 1;
+    var ref = addMsg("bot", "");
+    AdmitCard.last = payload;
+    var html = '<div class="detail-card acd-doc">';
+    html += "<h4>My Admit Card · Semester " + sem + "</h4>";
+    html += '<div class="acd-frame"><iframe sandbox="allow-same-origin" srcdoc="' + escapeHtml(payload.document_html || "") + '" title="Admit Card - Semester ' + sem + '"></iframe></div>';
+    html += '<div class="dacts">';
+    html += '<button class="chip" data-acd="print" data-sem="' + sem + '">🖨 Print / Save as PDF</button>';
+    html += '<button class="chip" data-acd="download" data-sem="' + sem + '">⬇ Download PDF</button>';
+    html += "</div>";
+    html += '<button class="chip back" data-role="option" data-value="back">← Back</button>';
+    html += "</div>";
+    if (ref && ref.msgEl) {
+      ref.msgEl.innerHTML = html;
+      var f = ref.msgEl.querySelector("iframe");
+      setTimeout(function () {
+        try { if (f && f.contentWindow && f.contentWindow.document && f.contentWindow.document.body) { f.style.height = Math.min(f.contentWindow.document.body.scrollHeight + 24, 680) + "px"; } } catch (err) { /* same-origin srcdoc is expected to be readable */ }
+      }, 80);
+    }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function acdFetch(sem, attachment) {
+    return fetch(API + "/api/student/admit-cards/" + sem + "/print", {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders(),
+      body: JSON.stringify({ as_attachment: attachment }),
+    });
+  }
+
+  function acdPrint(sem) {
+    if (AdmitCard.busy || !sem) return;
+    AdmitCard.busy = true; showSpinner();
+    acdFetch(sem, false).then(function (r) {
+      if (r.status === 401) {
+        AdmitCard.busy = false; hideSpinner();
+        toast("Your student session has expired. Please sign in again.");
+        return null;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      if (!blob) return;
+      var url = URL.createObjectURL(blob);
+      var w = window.open("", "_blank");
+      if (!w) { URL.revokeObjectURL(url); toast("Please allow pop-ups to print your admit card."); return; }
+      w.document.open();
+      w.document.write('<style>html,body{margin:0;height:100%}</style><iframe style="width:100%;height:100%;border:0" src="' + url + '"></iframe>');
+      w.document.close();
+      var fired = false;
+      function tryPrint() {
+        try { if (!fired) { fired = true; w.focus(); w.frames[0].focus(); w.frames[0].print(); } } catch (err) { fired = true; }
+      }
+      setTimeout(tryPrint, 900);
+      setTimeout(function () { fired = true; URL.revokeObjectURL(url); }, 30000);
+    }).catch(function () { toast("Could not prepare your admit card. Please try again."); })
+      .finally(function () { AdmitCard.busy = false; hideSpinner(); });
+  }
+
+  function acdDownload(sem) {
+    if (AdmitCard.busy || !sem) return;
+    AdmitCard.busy = true; showSpinner();
+    acdFetch(sem, true).then(function (r) {
+      if (r.status === 401) {
+        AdmitCard.busy = false; hideSpinner();
+        toast("Your student session has expired. Please sign in again.");
+        return null;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      if (!blob) return;
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = "Admit_Card_Semester_" + sem + ".pdf";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+    }).catch(function () { toast("Could not download your admit card. Please try again."); })
+      .finally(function () { AdmitCard.busy = false; hideSpinner(); });
+  }
+
+  function acdOnClick(el) {
+    if (state.streaming) return;
+    var act = el.getAttribute("data-acd");
+    var sem = Number(el.getAttribute("data-sem")) || 0;
+    if (act === "print") acdPrint(sem);
+    else if (act === "download") acdDownload(sem);
+  }
+
+  /* =====================================================================
+     Student Exam Form (Exam Session model) — document + mock fee checkout
+     An exam_form_doc SSE event calls renderExamFormDoc(): same formal
+     render used for the PDF, shown in an iframe with Print / Download.
+     An exam_form_pay SSE event calls renderExamFormPay(): a mock checkout
+     showing the server-derived amount; "Pay Now" runs initiate → confirm
+     via REST and then re-requests the document. Submit stays in the chat
+     (exam_form_submit chip) so the gate order (paid → submit) is enforced
+     by the server, never by the client.
+     ===================================================================== */
+  var ExamForm = { last: null, busy: false };
+
+  function eduFee(n) {
+    n = Number(n) || 0;
+    return "₹ " + n.toLocaleString("en-IN");
+  }
+
+  function renderExamFormDoc(payload) {
+    var sem = Number(payload.semester) || 1;
+    var ref = addMsg("bot", "");
+    ExamForm.last = payload;
+    var formNo = payload.form_no || "";
+    var html = '<div class="detail-card efd-doc">';
+    html += "<h4>My Exam Form" + (formNo ? " · " + escapeHtml(formNo) : "") + "</h4>";
+    html += '<div class="acd-frame"><iframe sandbox="allow-same-origin" srcdoc="' + escapeHtml(payload.document_html || "") + '" title="Exam Form - Semester ' + sem + '"></iframe></div>';
+    html += '<div class="dacts">';
+    html += '<button class="chip" data-efd="print" data-form="' + escapeHtml(payload.form_id || "") + '">🖨 Print / Save as PDF</button>';
+    html += '<button class="chip" data-efd="download" data-form="' + escapeHtml(payload.form_id || "") + '">⬇ Download PDF</button>';
+    html += "</div>";
+    html += '<button class="chip back" data-role="option" data-value="back">← Back</button>';
+    html += "</div>";
+    if (ref && ref.msgEl) {
+      ref.msgEl.innerHTML = html;
+      var f = ref.msgEl.querySelector("iframe");
+      setTimeout(function () {
+        try { if (f && f.contentWindow && f.contentWindow.document && f.contentWindow.document.body) { f.style.height = Math.min(f.contentWindow.document.body.scrollHeight + 24, 680) + "px"; } } catch (err) { /* same-origin srcdoc is expected to be readable */ }
+      }, 80);
+    }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function efdFetch(formId, attachment) {
+    return fetch(API + "/api/student/exam-forms/" + encodeURIComponent(formId) + "/print", {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders(),
+      body: JSON.stringify({ as_attachment: attachment }),
+    });
+  }
+
+  function renderExamFormPay(payload) {
+    var ref = addMsg("bot", "");
+    ExamForm.last = payload;
+    var fine = Number(payload.late_fee) || 0;
+    var amount = Number(payload.amount) || Number(payload.fee_total) || 0;
+    var formNo = payload.form_no || "";
+    var html = '<div class="detail-card efp-pay">';
+    html += "<h4>Pay Exam Form Fee" + (formNo ? " · " + escapeHtml(formNo) : "") + "</h4>";
+    html += '<div class="efp-row"><span>Session</span><strong>' + escapeHtml(payload.session_name || "") + "</strong></div>";
+    html += '<div class="efp-row"><span>Programme</span><strong>' + escapeHtml(payload.programme || "") + "</strong></div>";
+    html += '<div class="efp-row"><span>Fee</span><strong>' + eduFee(Number(payload.fee_total) || 0) + "</strong></div>";
+    if (fine > 0) html += '<div class="efp-row"><span>Late fee</span><strong>' + eduFee(fine) + "</strong></div>";
+    html += '<div class="efp-row efp-total"><span>Total payable</span><strong>' + eduFee(amount) + "</strong></div>";
+    html += '<p class="efp-note">This is a demo (mock) payment. No real money is charged.</p>';
+    html += '<button class="chip primary" data-efp="pay" data-form="' + escapeHtml(payload.form_id || "") + '">💳 Pay ' + eduFee(amount) + "</button>";
+    html += '<button class="chip back" data-role="option" data-value="back">← Later</button>';
+    html += "</div>";
+    if (ref && ref.msgEl) { ref.msgEl.innerHTML = html; }
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function efpPay(formId, amount) {
+    if (ExamForm.busy || !formId) return;
+    amount = amount || Number((ExamForm.last || {}).amount) || 0;
+    ExamForm.busy = true; showSpinner();
+    fetch(API + "/api/student/exam-forms/" + encodeURIComponent(formId) + "/payments/initiate", {
+      method: "POST", credentials: "include", headers: authHeaders(),
+    }).then(function (r) {
+      if (r.status === 401) { throw { _auth: true }; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (pay) {
+      return fetch(API + "/api/student/exam-forms/" + encodeURIComponent(formId) + "/payments/" + encodeURIComponent(pay.id) + "/confirm", {
+        method: "POST", credentials: "include", headers: authHeaders(),
+      }).then(function (r) {
+        if (r.status === 401) { throw { _auth: true }; }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      });
+    }).then(function (pay2) {
+      toast("Exam fee paid successfully.");
+      var paid = addMsg("bot", "");
+      var paidHtml = '<div class="detail-card efp-paid">';
+      paidHtml += "<h4>Payment Successful</h4>";
+      paidHtml += '<p class="efp-ok">✅ Exam fee paid successfully.</p>';
+      paidHtml += '<p class="efp-ok">Exam form submitted successfully.</p>';
+      paidHtml += '<div class="efp-row"><span>Amount paid</span><strong>' + eduFee(amount) + "</strong></div>";
+      paidHtml += '<div class="efp-row"><span>Transaction ID</span><strong>' + escapeHtml(pay2.gateway_ref || "") + "</strong></div>";
+      paidHtml += '<div class="dacts">';
+      paidHtml += '<button class="chip" data-efd="receipt-view" data-form="' + escapeHtml(formId) + '">👁 View Receipt</button>';
+      paidHtml += '<button class="chip" data-efd="receipt-dl" data-form="' + escapeHtml(formId) + '">⬇ Download Receipt</button>';
+      paidHtml += '<button class="chip" data-efd="download" data-form="' + escapeHtml(formId) + '">⬇ Download Exam Form</button>';
+      paidHtml += '<button class="chip" data-efd="print" data-form="' + escapeHtml(formId) + '">🖨 Print Exam Form</button>';
+      paidHtml += "</div></div>";
+      if (paid && paid.msgEl) { paid.msgEl.innerHTML = paidHtml; }
+      body.scrollTop = body.scrollHeight;
+      // Re-request the document via chat so the printed record follows the gate
+      // (Form Status: Approved + Paid fee + receipt actions above).
+      sendChat("exam_form_view" + formId);
+    }).catch(function (err) {
+      if (err && err._auth) { toast("Your student session has expired. Please sign in again."); }
+      else { toast("Payment could not be completed. Please try again."); }
+    }).finally(function () { ExamForm.busy = false; hideSpinner(); });
+  }
+
+  function efrFetch(formId, attachment) {
+    return fetch(API + "/api/student/exam-forms/" + encodeURIComponent(formId) + "/receipt", {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders(),
+      body: JSON.stringify({ as_attachment: attachment }),
+    });
+  }
+
+  function ExamFormReceiptPDF(formId, attachment) {
+    if (ExamForm.busy || !formId) return;
+    ExamForm.busy = true; showSpinner();
+    efrFetch(formId, attachment).then(function (r) {
+      if (r.status === 401) {
+        ExamForm.busy = false; hideSpinner();
+        toast("Your student session has expired. Please sign in again.");
+        return null;
+      }
+      if (!r.ok) {
+        return r.json().then(function (j) { throw new Error((j && j.detail) || ("HTTP " + r.status)); });
+      }
+      return r.blob();
+    }).then(function (blob) {
+      if (!blob) return;
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = "Fee_Receipt.pdf";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+    }).catch(function () { toast("Could not download your receipt. Please try again."); })
+      .finally(function () { ExamForm.busy = false; hideSpinner(); });
+  }
+
+  function ExamFormReceiptHTML(formId) {
+    if (ExamForm.busy || !formId) return;
+    ExamForm.busy = true; showSpinner();
+    fetch(API + "/api/student/exam-forms/" + encodeURIComponent(formId) + "/receipt", {
+      method: "GET",
+      credentials: "include",
+      headers: authHeaders(),
+    }).then(function (r) {
+      if (r.status === 401) { throw { _auth: true }; }
+      if (!r.ok) {
+        return r.json().then(function (j) { throw new Error((j && j.detail) || ("HTTP " + r.status)); });
+      }
+      return r.text();
+    }).then(function (html) {
+      var w = window.open("", "_blank");
+      if (!w) { toast("Please allow pop-ups to view your receipt."); return; }
+      w.document.open(); w.document.write(html); w.document.close();
+    }).catch(function (err) {
+      if (err && err._auth) { toast("Your student session has expired. Please sign in again."); }
+      else { toast("Could not open your receipt. Please try again."); }
+    }).finally(function () { ExamForm.busy = false; hideSpinner(); });
+  }
+
+  function ExamFormOnViewPDF(formId, attachment) {
+    if (ExamForm.busy || !formId) return;
+    ExamForm.busy = true; showSpinner();
+    efdFetch(formId, attachment).then(function (r) {
+      if (r.status === 401) {
+        ExamForm.busy = false; hideSpinner();
+        toast("Your student session has expired. Please sign in again.");
+        return null;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      if (!blob) return;
+      var url = URL.createObjectURL(blob);
+      if (attachment) {
+        var a = document.createElement("a");
+        a.href = url; a.download = "Exam_Form.pdf";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+      } else {
+        var w = window.open("", "_blank");
+        if (!w) { URL.revokeObjectURL(url); toast("Please allow pop-ups to print your exam form."); return; }
+        w.document.open();
+        w.document.write('<style>html,body{margin:0;height:100%}</style><iframe style="width:100%;height:100%;border:0" src="' + url + '"></iframe>');
+        w.document.close();
+        var fired = false;
+        function tryPrint() {
+          try { if (!fired) { fired = true; w.focus(); w.frames[0].focus(); w.frames[0].print(); } } catch (err) { fired = true; }
+        }
+        setTimeout(tryPrint, 900);
+        setTimeout(function () { fired = true; URL.revokeObjectURL(url); }, 30000);
+      }
+    }).catch(function () { toast("Could not prepare your exam form. Please try again."); })
+      .finally(function () { ExamForm.busy = false; hideSpinner(); });
+  }
+
+  function ExamFormOnClick(el) {
+    if (state.streaming) return;
+    var act = el.getAttribute("data-efd") || el.getAttribute("data-efp");
+    var formId = el.getAttribute("data-form") || "";
+    if (act === "print") ExamFormOnViewPDF(formId, false);
+    else if (act === "download") ExamFormOnViewPDF(formId, true);
+    else if (act === "receipt-dl") ExamFormReceiptPDF(formId, true);
+    else if (act === "receipt-view") ExamFormReceiptHTML(formId);
+    else if (act === "pay") efpPay(formId, Number(el.getAttribute("data-amount")) || 0);
   }
 
   function govLoadColleges() {

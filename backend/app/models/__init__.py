@@ -39,12 +39,14 @@ from app.catalogue.models import (
 from app.models.db_models import (
     AuditLog,
     Conversation,
+    DateSheetEntry,
     Document,
     DocumentChunk,
     Message,
     RefreshToken,
     Student,
     StudentSession,
+    UniversityNotice,
     User,
 )
 
@@ -52,6 +54,10 @@ from app.models.db_models import (
 from app.models.demo_models import (
     BacklogStatus,
     CourseRegistration,
+    ExamApplicationSubject,
+    ExamEligibility,
+    ExamPayment,
+    ExamSession,
     FeeReceipt,
     HelpdeskTicket,
     MigrationCertificate,
@@ -78,8 +84,13 @@ __all__ = [
     "Conversation",
     "CourseRegistration",
     "CurriculumDocument",
+    "DateSheetEntry",
     "Document",
     "DocumentChunk",
+    "ExamApplicationSubject",
+    "ExamEligibility",
+    "ExamPayment",
+    "ExamSession",
     "FeeReceipt",
     # Grievances
     "Grievance",
@@ -109,6 +120,7 @@ __all__ = [
     "StudentSession",
     "StudentTranscript",
     "SyncSource",
+    "UniversityNotice",
     "User",
     "WebsitePage",
     "WebsitePageVersion",

@@ -250,5 +250,12 @@ def get_confidence_threshold() -> float:
 
 # Warm up on import (optional, called explicitly from startup)
 def warmup() -> None:
-    """Pre-load model and compute centroids."""
+    """Pre-load model and compute centroids.
+
+    `_ensure_loaded()` alone short-circuits when the centroid cache exists and
+    never touches the underlying model, which would defer a ~15-20s
+    sentence-transformers import + model load to the FIRST user query. Loading
+    it here moves that one-time cost into startup so the first query is fast.
+    """
     _ensure_loaded()
+    _get_model()

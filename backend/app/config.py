@@ -226,6 +226,15 @@ class Settings(BaseSettings):
     # Per-IP per-minute attempts on /api/student/verify (separate bucket).
     STUDENT_VERIFY_LIMIT: int = 5
 
+    # ----- Student Exam Form (Phase D2 — Exam Session model) -----
+    # Deterministic eligibility thresholds, applied ONLY when the underlying
+    # data exists (a student with no internals/attendance rows is never failed
+    # on a rule that has no evidence — the rule is reported as "not verified").
+    STUDENT_EXAM_MIN_INTERNAL_PERCENT: float = 40.0
+    STUDENT_EXAM_MIN_ATTENDANCE_PERCENT: float = 75.0
+    # Payment gateway adapter name ("mock" is the default and only built-in).
+    STUDENT_EXAM_PAYMENT_MODE: str = "mock"
+
     # ----- Student Results (Phase B) -----
     # Explicit semester allowlist for "my results" (comma-separated numbers).
     # The student API and the import validator share this single list.
@@ -237,6 +246,19 @@ class Settings(BaseSettings):
     # Hard cap for a single results import file (rows are re-validated
     # server-side on confirm regardless of what the preview showed).
     STUDENT_RESULTS_IMPORT_MAX_MB: int = 5
+
+    # ----- University Notices / Date Sheets -----
+    # Storage directory for uploaded notice files. Kept OUTSIDE the public
+    # /api/uploads mount so unpublished documents are never served by the
+    # static file handler — downloads go through a publish-checked endpoint.
+    NOTICES_DIR: str = "./data/notices"
+    # Publish new uploads automatically? Default OFF — the admin must verify
+    # extracted schedule rows and explicitly publish (two-step lifecycle).
+    NOTICES_PUBLISH_ON_UPLOAD: bool = False
+    # Hard cap for the public "latest notices" search results (document cards).
+    NOTICES_SEARCH_TOP_N: int = 5
+    # Maximum verified schedule rows returned for a single date-sheet query.
+    NOTICES_SCHEDULE_LIMIT: int = 60
 
     @model_validator(mode="after")
     def _validate_security(self) -> "Settings":

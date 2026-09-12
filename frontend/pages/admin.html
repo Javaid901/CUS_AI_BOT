@@ -64,6 +64,7 @@
           <button class="tab-btn" data-tab="catalogue">&#x1f4d6; Catalogue</button>
           <button class="tab-btn" data-tab="authorities">&#x1f3db;&#xfe0f; Authorities</button>
           <button class="tab-btn" data-tab="authorityAdmins">&#x1f465; Authority Admins</button>
+          <button class="tab-btn" data-tab="notices">&#x1f4ec; Universal Notices</button>
           <button class="tab-btn" data-tab="studentServices">&#x1f393; Student Services</button>
           <button class="tab-btn" data-tab="profile">&#x1f464; My Profile</button>
         </div>
@@ -172,18 +173,15 @@
               </div>
               <div style="display:flex;align-items:center;gap:12px;">
                 <button class="btn green" id="wsRunBtn">&#x25b6; Sync Now</button>
+                <button class="btn sm ghost" id="wsDisableBtn" style="display:none;">Disable Website Sync</button>
                 <button class="btn sm ghost" id="wsRefreshBtn">&#x21bb; Refresh</button>
-                <label class="toggle-switch" title="Enable / disable scheduled sync">
-                  <input type="checkbox" id="wsToggle" checked />
-                  <span class="toggle-slider"></span>
-                </label>
+                <span id="wsStateBadge" class="status-badge" style="display:none;"></span>
               </div>
             </div>
 
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
               <label class="muted" for="wsSchedule">Schedule</label>
               <select id="wsSchedule" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);">
-                <option value="disabled">Disabled</option>
                 <option value="manual">Manual only</option>
                 <option value="hourly">Hourly</option>
                 <option value="daily">Daily</option>
@@ -329,6 +327,11 @@
         <!-- === Student Services Tab (Super Admin) === -->
         <div id="tabStudentServices" class="tab-content" style="display:none;">
           <div id="studentAdminRoot" style="min-height:200px;"></div>
+        </div>
+
+        <!-- === University Notices Tab (Super Admin) === -->
+        <div id="tabNotices" class="tab-content" style="display:none;">
+          <div id="noticesAdminRoot" style="min-height:200px;"></div>
         </div>
 
         <!-- === My Profile Tab === -->
@@ -743,5 +746,6 @@
   <script src="../js/admin_student_results.js?v=3"></script>
   <script src="../js/admin_student_admit_cards.js?v=3"></script>
   <script src="../js/admin_student_exam_forms.js?v=3"></script>
+  <script src="../js/admin_notices.js?v=1"></script>
 </body>
 </html>

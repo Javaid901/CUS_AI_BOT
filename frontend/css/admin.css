@@ -173,6 +173,8 @@
 /* ===== Status badge ===== */
 .status-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
 .status-badge.active { background: #e6f7e6; color: var(--green); border: 1px solid var(--green); }
+.status-badge.on { background: #e6f7e6; color: var(--green); border: 1px solid var(--green); }
+.status-badge.off { background: #fff0ee; color: #b23b2e; border: 1px solid #f2c1bb; }
 
 /* ===== Toggle switch ===== */
 .toggle-switch { position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0; cursor: pointer; }
@@ -333,6 +335,16 @@
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--line); }
 .modal-footer .btn { min-width: 100px; }
 
+/* Resolve Knowledge Gap dialog */
+.resolve-gap-details { border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 18px; }
+.resolve-gap-details .row { display: flex; gap: 12px; padding: 9px 13px; font-size: 13px; border-bottom: 1px solid var(--line); }
+.resolve-gap-details .row:last-child { border-bottom: none; }
+.resolve-gap-details .k { flex: 0 0 132px; color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .3px; padding-top: 2px; }
+.resolve-gap-details .v { color: var(--text); word-break: break-word; line-height: 1.45; }
+.rg-textarea { font-family: var(--font); font-size: 14px; line-height: 1.5; padding: 12px 14px; border: 1.5px solid var(--line); border-radius: var(--radius-xs); background: #fff; color: var(--ink); width: 100%; box-sizing: border-box; resize: vertical; min-height: 110px; transition: border-color .2s var(--ease), box-shadow .2s var(--ease); }
+.rg-textarea:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(26,158,99,.15); }
+.rg-helper { font-size: 12.5px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+
 /* ===================================================================
    Trending / Activity Log Styles
    =================================================================== */
@@ -424,6 +436,31 @@
 }
 .trending-logs-table tr.selected td {
   background: #e6f7e6;
+}
+.trending-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--green-50);
+}
+.trending-bulk-hint {
+  font-size: 12.5px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.trending-select-col {
+  width: 36px;
+  text-align: center;
+}
+.trending-select-all,
+.trending-row-checkbox {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--green);
+  vertical-align: middle;
 }
 .query-cell {
   max-width: 320px;

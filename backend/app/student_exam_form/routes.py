@@ -37,6 +37,7 @@ Security contract:
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.auth.security import require_superadmin
@@ -44,6 +45,9 @@ from app.config import settings
 from app.database import get_db
 from app.models import User
 from app.student.session import resolve_session
+from app.student_exam_form import exam_session as es
+from app.student_exam_form import payment as efpay
+from app.student_exam_form import render as efrender
 from app.student_exam_form import service as efs
 from app.student_exam_form.schemas import (
     AdminFormCreate,
@@ -51,6 +55,7 @@ from app.student_exam_form.schemas import (
     FormStatusUpdate,
     ImportBundle,
     StudentFillCreate,
+    StudentPrintBody,
     StudentSubmitBody,
 )
 from app.utils.logging import audit
@@ -157,6 +162,196 @@ def print_exam_form(
     if str(form.student_id) != identity["student_id"]:
         raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
     return {"form": efs.student_dto(form)}
+
+
+# --------------------------------------------------------------------------- #
+# Phase D2 student endpoints: exam sessions, document, PDF print, payments
+# --------------------------------------------------------------------------- #
+@router.get("/sessions")
+def my_exam_sessions(request: Request, db: Session = Depends(get_db)):
+    """OPEN exam sessions matching the student's OWN profile (fill picker)."""
+    identity = _require_student_snapshot(request, db)
+    sessions = es.student_available_sessions(db, identity["student_id"])
+    return {"sessions": sessions}
+
+
+@router.get("/{form_id}/document")
+def exam_form_document(
+    form_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Printable HTML document of the student's OWN exam form (chat preview).
+
+    The same document feeds both view and print → a single source of truth for
+    the printed record (form_no, identity, subjects, fee, reference).
+    """
+    identity = _require_student_snapshot(request, db)
+    data = efs.student_form_document(db, identity["student_id"], form_id)
+    if data is None:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
+    html = efrender.render_exam_form_document_html(data)
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "X-Robots-Tag": "noindex, nofollow",
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'",
+        },
+    )
+
+
+@router.post("/{form_id}/print")
+def download_exam_form_pdf(
+    form_id: str,
+    request: Request,
+    body: StudentPrintBody | None = None,
+    db: Session = Depends(get_db),
+):
+    """Real one-page A4 PDF of the student's OWN exam form (Download / Print).
+
+    Identity comes from the authenticated student session — the form id is
+    re-scoped to that student server-side. `as_attachment=true` → attachment
+    (Download), otherwise inline (preview/Print). Stamps printed_at (server).
+    """
+    identity = _require_student_snapshot(request, db)
+    student_id = identity["student_id"]
+    data = efs.student_form_document(db, student_id, form_id)
+    if data is None:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
+    if not data.get("form_no"):
+        raise HTTPException(status_code=404, detail="This exam form has no printed number yet.")
+    efs.mark_form_printed(db, student_id, form_id)
+
+    pdf_bytes = efrender.render_exam_form_pdf(data)
+    filename = f"Exam_Form_{data.get('form_no') or form_id}.pdf"
+    headers = {
+        "X-Robots-Tag": "noindex, nofollow",
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'",
+        "Content-Disposition": f"{'attachment' if (body and body.as_attachment) else 'inline'}; filename=\"{filename}\"",
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+@router.get("/{form_id}/receipt")
+def view_exam_form_receipt(
+    form_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """HTML fee receipt of the student's OWN form (after successful payment).
+
+    Only a server-confirmed successful payment produces a receipt; an unpaid
+    form is rejected with 409. Identity comes from the authenticated student
+    session and the form id is re-scoped to that student (IDOR-safe, same
+    source of truth as the exam-form document).
+    """
+    identity = _require_student_snapshot(request, db)
+    data = efs.student_payment_receipt(db, identity["student_id"], form_id)
+    if data is None:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
+    if (data.get("fee_status") or "Unpaid") != "Paid":
+        raise HTTPException(status_code=409, detail="No successful payment has been recorded for this exam form yet.")
+    html = efrender.render_fee_receipt_html(data)
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "X-Robots-Tag": "noindex, nofollow",
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'",
+        },
+    )
+
+
+@router.post("/{form_id}/receipt")
+def download_exam_form_receipt(
+    form_id: str,
+    request: Request,
+    body: StudentPrintBody | None = None,
+    db: Session = Depends(get_db),
+):
+    """One-page A4 PDF fee receipt (Download / Print) for the student's OWN
+    successful payment. Same ownership + payment gating as the HTML receipt."""
+    identity = _require_student_snapshot(request, db)
+    data = efs.student_payment_receipt(db, identity["student_id"], form_id)
+    if data is None:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
+    if (data.get("fee_status") or "Unpaid") != "Paid":
+        raise HTTPException(status_code=409, detail="No successful payment has been recorded for this exam form yet.")
+
+    pdf_bytes = efrender.render_fee_receipt_pdf(data)
+    filename = f"Fee_Receipt_{data.get('form_no') or form_id}.pdf"
+    headers = {
+        "X-Robots-Tag": "noindex, nofollow",
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'",
+        "Content-Disposition": f"{'attachment' if (body and body.as_attachment) else 'inline'}; filename=\"{filename}\"",
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+@router.post("/{form_id}/payments/initiate")
+def initiate_exam_payment(
+    form_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Open an `initiated` payment for the student's OWN form (amount server-side)."""
+    identity = _require_student_snapshot(request, db)
+    try:
+        form = efs.form_or_404(db, form_id)
+        payment = efpay.initiate_payment(db, form, identity["student_id"])
+    except ValueError as exc:
+        raise _value_error(exc)
+    audit(
+        db, "student_exam_form.pay_initiate", actor_id=identity.get("actor_id"),
+        actor_role="student", target=str(form.id),
+        detail=f"Student initiated a payment of ₹{payment['amount']} for exam form {form.form_no or form_id}",
+        ip=_ip(request),
+    )
+    return payment
+
+
+@router.post("/{form_id}/payments/{payment_id}/confirm")
+def confirm_exam_payment(
+    form_id: str,
+    payment_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Run the payment backend on an initiated payment → success (server-side)."""
+    identity = _require_student_snapshot(request, db)
+    try:
+        payment = efpay.confirm_payment(db, payment_id, identity["student_id"])
+    except ValueError as exc:
+        raise _value_error(exc)
+    audit(
+        db, "student_exam_form.pay_confirm", actor_id=identity.get("actor_id"),
+        actor_role="student", target=payment["form_id"],
+        detail=f"Student payment confirmed: {payment.get('gateway_ref') or payment['id']}",
+        ip=_ip(request),
+    )
+    return payment
+
+
+@router.get("/{form_id}/payments")
+def list_exam_payments(
+    form_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Payment history for the student's OWN form (initiated/success/refunded)."""
+    identity = _require_student_snapshot(request, db)
+    try:
+        form = efs.form_or_404(db, form_id)
+    except ValueError as exc:
+        raise _value_error(exc)
+    if str(form.student_id) != identity["student_id"]:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this form.")
+    return {"payments": efpay.list_form_payments(db, form_id)}
 
 
 # --------------------------------------------------------------------------- #

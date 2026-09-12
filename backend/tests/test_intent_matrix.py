@@ -289,34 +289,97 @@ def test_fallback_builder():
 # ---------------------------------------------------------------------------
 
 def test_match_for_grievance():
-    print("-- 5. grievance authority matching --")
+    print("-- 5. grievance authority matching (eligible = active + admin-backed) --")
+    from app.auth.security import hash_password
+    from app.authority.models import Authority
     from app.authority.service import authority_service
+    from app.models import User
 
     db = SessionLocal()
+    created_ids: list[str] = []
     try:
+        def _mk_auth(name: str, dept: str, active: bool = True) -> Authority:
+            a = Authority(
+                id=str(uuid.uuid4()),
+                department_name=dept,
+                authority_name=name,
+                designation="Head",
+                email=f"{name.lower().replace(' ', '-')[:24]}-{uuid.uuid4().hex[:6]}@test.local",
+                phone="0194-0000000",
+                active=active,
+            )
+            db.add(a)
+            db.commit()
+            db.refresh(a)
+            created_ids.append(str(a.id))
+            return a
+
+        def _mk_admin(auth_id: str) -> None:
+            db.add(User(
+                id=uuid.uuid4(),
+                username=f"__im_adm_{uuid.uuid4().hex[:8]}",
+                email=f"im-adm-{uuid.uuid4().hex[:8]}@test.local",
+                hashed_password=hash_password("pass1234"),
+                role="authority_admin",
+                is_active=True,
+                authority_id=auth_id,
+                full_name="Seed admin",
+                designation="Office Head",
+            ))
+            db.commit()
+
+        # Aliases resolve via department_name, so each target department is
+        # given its OWN admin-backed (eligible) test authority. Live seeded
+        # authorities share those department names but have no admin account,
+        # so they must NOT compete for the auto-matched result.
+        coe = _mk_auth("Controller of Examinations (Test)", "Controller of Examinations")
+        _mk_admin(coe.id)
+        fin = _mk_auth("Finance Section (Test)", "Finance")
+        _mk_admin(fin.id)
+        adm = _mk_auth("Admissions Office (Test)", "Admissions")
+        _mk_admin(adm.id)
+        dean = _mk_auth("Dean Science (Test)", "Dean Science")
+        _mk_admin(dean.id)
+        inactive = _mk_auth("Student Welfare Office (Test)", "Student Welfare", active=False)
+        unstaffed = _mk_auth("Unstaffed Handlers Wing", "Handlers Wing")
+        authority_service.refresh_cache(db)
+
+        from app.authority.repository import grievance_eligible_ids as _eligible_ids
+        _eligible = _eligible_ids(db)
+
         r = authority_service.match_for_grievance(db, "I want to complain about my result")
         check("result complaint -> CoE (alias)", r.get("status") == "matched"
-              and r["authority"].get("authority_name") == "Controller of Examinations", str(r))
+              and r["authority"].get("authority_id") == coe.id, str(r))
 
         r = authority_service.match_for_grievance(db, "I have a grievance with the examination branch")
         check("examination branch -> CoE (alias)", r.get("status") == "matched"
-              and r["authority"].get("authority_name") == "Controller of Examinations", str(r))
+              and r["authority"].get("authority_id") == coe.id, str(r))
 
         r = authority_service.match_for_grievance(db, "i have a fee complaint")
         check("fee complaint -> Finance (alias)", r.get("status") == "matched"
-              and r["authority"].get("authority_name") == "Finance Officer", str(r))
+              and r["authority"].get("authority_id") == fin.id, str(r))
 
         r = authority_service.match_for_grievance(db, "complaint about my admission process")
-        check("admission complaint -> Admissions (alias)", r.get("status") == "matched"
-              and r["authority"].get("authority_name") == "Admissions Office", str(r))
+        # Either the test's Admissions office or the equally-eligible live
+        # "Admission Block" may win; the invariant is only that the result is
+        # an ELIGIBLE admissions department — never the unstaffed live office.
+        matched = r.get("authority") or {}
+        admission_depts = {"admissions", "admission"}
+        check("admission complaint -> eligible Admissions office", r.get("status") == "matched"
+              and (matched.get("department_name") or "").lower() in admission_depts
+              and matched.get("authority_id") in _eligible, str(r))
 
         r = authority_service.match_for_grievance(db, "I want to complain to the Dean of Science")
         check("Dean of Science named -> matched", r.get("status") == "matched"
-              and r["authority"].get("authority_name") == "Dean Science", str(r))
+              and r["authority"].get("authority_id") == dean.id, str(r))
 
         r = authority_service.match_for_grievance(db, "I have a complaint about student welfare")
         check("inactive record -> unavailable (never auto-matched)", r.get("status") == "unavailable"
               and "Student Welfare Office" in r.get("names", []), str(r))
+
+        r = authority_service.match_for_grievance(db, "I want to complain to the Unstaffed Handlers Wing")
+        check("active-but-unstaffed -> unavailable (never auto-matched)", r.get("status") == "unavailable"
+              and "Unstaffed Handlers Wing" in r.get("names", []), str(r))
 
         r = authority_service.match_for_grievance(db, "zzz qqq ww")
         check("gibberish -> none", r.get("status") == "none", str(r))
@@ -324,6 +387,12 @@ def test_match_for_grievance():
         r = authority_service.match_for_grievance(db, "hi")
         check("too short -> none", r.get("status") == "none", str(r))
     finally:
+        # Clean up users (FK) then the test authorities, in that order.
+        for aid in created_ids:
+            db.query(User).filter(User.authority_id == aid).delete(synchronize_session=False)
+            db.query(Authority).filter(Authority.id == aid).delete(synchronize_session=False)
+        db.commit()
+        authority_service.refresh_cache(db)
         db.close()
 
 
