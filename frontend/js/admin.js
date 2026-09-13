@@ -766,6 +766,9 @@
       var tab = document.getElementById(tabId);
       if (tab) tab.style.display = "block";
       if (btn.dataset.tab === "websiteSync") { loadWebsiteSync(); }
+      if (btn.dataset.tab === "syncDocuments") {
+        if (window.CUS && window.CUS.syncDocumentsInit) window.CUS.syncDocumentsInit();
+      }
       if (btn.dataset.tab === "colleges") { loadColleges(); }
       if (btn.dataset.tab === "insights") {
         if (window.CUS && window.CUS.insightsInit) window.CUS.insightsInit();

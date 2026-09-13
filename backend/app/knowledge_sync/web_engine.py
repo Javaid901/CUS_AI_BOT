@@ -50,6 +50,7 @@ from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.knowledge_sync.document_classifier import normalize_title_hash
 from app.knowledge_sync.web_classifier import classify_page, normalize_title
 from app.knowledge_sync.web_crawler import (
     CrawlResult,
@@ -593,6 +594,11 @@ class WebsiteSyncEngine:
                 page.title = title or page.title
                 page.content_hash = h
                 page.last_synced = utcnow()
+                if not page.doc_type or page.content_hash != h:
+                    classification, meta = self._classify_resource(result, title, content)
+                    raw_info = self._store_raw(result)
+                    page.title_hash = normalize_title_hash(normalized or None)
+                    self._apply_document_attributes(page, result, classification, meta, raw_info)
                 self.db.commit()
                 stats["updated_pages"] += 1
                 if self.index_rag:
@@ -604,6 +610,14 @@ class WebsiteSyncEngine:
                 page.etag = result.etag
                 page.last_modified = result.last_modified
                 page.last_synced = utcnow()
+                # Legacy rows predating Phase 1 have no classification fields.
+                # Backfill them in place without bumping the version, so the
+                # intelligence layer sees every page without a re-crawl.
+                if not page.doc_type:
+                    classification, meta = self._classify_resource(result, title, content)
+                    raw_info = self._store_raw(result)
+                    page.title_hash = normalize_title_hash(normalized or None)
+                    self._apply_document_attributes(page, result, classification, meta, raw_info)
                 self.db.commit()
                 stats["unchanged_pages"] += 1
             else:
@@ -612,7 +626,10 @@ class WebsiteSyncEngine:
                 page.normalized_title = normalized
                 page.content = content or page.content
                 page.content_hash = h
-                page.category = self._classify(result, title, content)
+                classification, meta = self._classify_resource(result, title, content)
+                raw_info = self._store_raw(result)
+                page.title_hash = normalize_title_hash(normalized or None)
+                self._apply_document_attributes(page, result, classification, meta, raw_info)
                 page.http_status = result.http_status
                 page.etag = result.etag
                 page.last_modified = result.last_modified
@@ -655,6 +672,110 @@ class WebsiteSyncEngine:
     def _classify(self, result: CrawlResult, title: str, content: str) -> str:
         return classify_page(title=title, url=result.url, text=content)
 
+    # -- Phase 1: intelligent document ingestion -----------------------------
+    def _classify_resource(
+        self, result: CrawlResult, title: str, content: str
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Run Phase 1 classification + metadata for a crawled resource.
+
+        Returns (classification, meta). Never raises: classification failure
+        falls back to the legacy classify_page result so the sync pipeline can
+        never be aborted by the intelligence layer.
+        """
+        from app.knowledge_sync.document_classifier import classify_document
+        from app.knowledge_sync.web_metadata import extract_meta
+
+        is_doc = (result.kind or "") == "document"
+        raw = result.raw if is_doc else None
+        ext = ""
+        if is_doc:
+            ext = (
+                result.url.split("?", 1)[0].rsplit(".", 1)[-1].lower()
+                if "." in result.url.split("?", 1)[0]
+                else ""
+            )
+        try:
+            classification = classify_document(
+                title=title or "",
+                url=result.url,
+                text=content or "",
+                content_type=result.kind or "html",
+                raw=raw,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Classification failed for %s: %s", result.url, exc)
+            classification = {
+                "doc_type": "knowledge" if not is_doc else "ambiguous",
+                "category": self._classify(result, title, content),
+                "confidence": {"band": "low", "score": 0},
+                "signals": ["classification error: legacy fallback"],
+            }
+        try:
+            meta = extract_meta(
+                filename=result.url.split("?", 1)[0].rsplit("/", 1)[-1],
+                url=result.url,
+                ext=result.content_type or ext,
+                raw=raw,
+                extracted_text=content or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Metadata extraction failed for %s: %s", result.url, exc)
+            meta = None
+        return classification, meta
+
+    def _store_raw(self, result: CrawlResult) -> tuple[str | None, str | None, int | None]:
+        """Persist raw document bytes; return (rel_path, sha256, size) or Nones.
+
+        Returns None for HTML pages (nothing to preserve), unparseable
+        extensions that are not whitelisted, or when the write fails — never
+        raises, so a storage hiccup cannot abort the sync pass.
+        """
+        from app.knowledge_sync.raw_store import store_raw
+
+        if (result.kind or "") != "document" or not result.raw:
+            return (None, None, None)
+        path_name = result.url.split("?", 1)[0].rsplit("/", 1)[-1]
+        ext = path_name.rsplit(".", 1)[-1].lower() if "." in path_name else ""
+        try:
+            info = store_raw(result.raw, ext)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Raw storage failed for %s: %s", result.url, exc)
+            return (None, None, None)
+        if not info:
+            return (None, None, None)
+        return (info["rel_path"], info["sha256"], info["size"])
+
+    def _apply_document_attributes(
+        self,
+        page: WebsitePage,
+        result: CrawlResult,
+        classification: dict[str, Any],
+        meta: dict[str, Any] | None,
+        raw_info: tuple[str | None, str | None, int | None],
+    ) -> None:
+        """Assign Phase 1 classification/trust fields onto a WebsitePage."""
+        from app.knowledge_sync.document_classifier import classification_state_for
+
+        is_doc = (result.kind or "") == "document"
+        page.doc_type = classification.get("doc_type")
+        page.category = classification.get("category") or page.category
+        page.classification_confidence = classification.get("confidence")
+        page.classification_signals = classification.get("signals")
+        page.doc_meta = meta
+        rel_path, sha256, size = raw_info
+        if rel_path:
+            page.raw_path = rel_path
+        if sha256:
+            page.raw_sha256 = sha256
+        if size is not None:
+            page.raw_size = size
+        page.classification_status = classification_state_for(
+            classification, is_document=is_doc
+        )
+        # Model papers are ALWAYS held for review, regardless of confidence.
+        if classification.get("category") == "model-paper":
+            page.classification_status = "pending_review"
+
     def _find_page(self, url: str) -> WebsitePage | None:
         return self.db.query(WebsitePage).filter(WebsitePage.url == url).first()
 
@@ -666,15 +787,19 @@ class WebsiteSyncEngine:
     def _create_page(
         self, result: CrawlResult, url: str, title: str, content: str, h: str
     ) -> WebsitePage:
+        classification, meta = self._classify_resource(result, title, content)
+        raw_info = self._store_raw(result)
+
         page = WebsitePage(
             url=url,
             base_url=self.base_url,
             title=title or None,
             normalized_title=normalize_title(title) or None,
-            category=self._classify(result, title, content),
+            category=classification.get("category") or self._classify(result, title, content),
             content_type=result.kind,
             content=content or None,
             content_hash=h,
+            title_hash=normalize_title_hash(normalize_title(title) or None),
             http_status=result.http_status,
             etag=result.etag,
             last_modified=result.last_modified,
@@ -683,6 +808,7 @@ class WebsiteSyncEngine:
             first_seen=utcnow(),
             last_synced=utcnow(),
         )
+        self._apply_document_attributes(page, result, classification, meta, raw_info)
         self.db.add(page)
         self.db.commit()
         self.db.refresh(page)
@@ -697,6 +823,8 @@ class WebsiteSyncEngine:
             category=page.category,
             content=page.content,
             content_hash=page.content_hash,
+            raw_path=page.raw_path,
+            raw_sha256=page.raw_sha256,
             http_status=page.http_status,
             etag=page.etag,
             last_modified=page.last_modified,

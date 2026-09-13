@@ -59,6 +59,7 @@
         <div class="tab-bar">
           <button class="tab-btn active" data-tab="sources">&#x1f4da; Sources</button>
           <button class="tab-btn" data-tab="websiteSync">&#x1f310; Website Sync</button>
+          <button class="tab-btn" data-tab="syncDocuments">&#x1f4c1; Sync Documents</button>
           <button class="tab-btn" data-tab="colleges">&#x1f3db; Colleges</button>
           <button class="tab-btn" data-tab="insights">&#x1f4ca; AI Insights</button>
           <button class="tab-btn" data-tab="catalogue">&#x1f4d6; Catalogue</button>
@@ -232,6 +233,11 @@
             <p class="sub" style="margin:0 0 10px 0;">Every crawl pass is recorded with its counters.</p>
             <div id="wsRunList"></div>
           </div>
+        </div>
+
+        <!-- === Sync Documents Tab === -->
+        <div id="tabSyncDocuments" class="tab-content" style="display:none;">
+          <div class="admin-card" id="syncDocumentsRoot"><p class="sub">Loading document review queue...</p></div>
         </div>
 
         <!-- === Colleges Tab === -->
@@ -747,5 +753,6 @@
   <script src="../js/admin_student_admit_cards.js?v=3"></script>
   <script src="../js/admin_student_exam_forms.js?v=3"></script>
   <script src="../js/admin_notices.js?v=1"></script>
+  <script src="../js/admin_sync_documents.js?v=1"></script>
 </body>
 </html>

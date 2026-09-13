@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import JSON, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
 
 from app.database import Base, utcnow
 
@@ -41,6 +41,22 @@ class WebsitePage(Base):
     # status: new | unchanged | updated | archived | failed
     status = Column(String(20), default="new", nullable=False, index=True)
     document_id = Column(String(36), nullable=True)        # linked Document row (RAG source)
+    # --- Phase 1: document intelligence (intelligent ingestion) ---
+    # doc_type: knowledge | official | ambiguous
+    doc_type = Column(String(20), nullable=True, index=True)
+    # classification OWNS the category value below. Top-level page category
+    # remains the coarse bucket (used by existing UI); this column carries the
+    # structured classification result.
+    # classification_status: draft | pending_review | verified | hidden_hold
+    classification_status = Column(String(30), default="draft", nullable=False, index=True)
+    classification_confidence = Column(JSON, nullable=True)   # {"band": str, "score": float}
+    classification_signals = Column(JSON, nullable=True)      # list[str] human-readable reasons
+    doc_meta = Column(JSON, nullable=True)                    # {"mime", "size_bytes", "page_count", ...}
+    raw_sha256 = Column(String(64), nullable=True, index=True)
+    raw_size = Column(Integer, nullable=True)
+    reviewed_by = Column(String(200), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    review_note = Column(Text, nullable=True)
     first_seen = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_synced = Column(DateTime(timezone=True), nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)
@@ -61,6 +77,17 @@ class WebsitePage(Base):
             "version": self.version,
             "status": self.status,
             "document_id": self.document_id,
+            "doc_type": self.doc_type,
+            "classification_status": self.classification_status,
+            "classification_confidence": self.classification_confidence,
+            "classification_signals": self.classification_signals,
+            "doc_meta": self.doc_meta,
+            "raw_path": self.raw_path,
+            "raw_sha256": self.raw_sha256,
+            "raw_size": self.raw_size,
+            "reviewed_by": self.reviewed_by,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "review_note": self.review_note,
             "char_len": len(self.content or ""),
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_synced": self.last_synced.isoformat() if self.last_synced else None,
@@ -80,6 +107,8 @@ class WebsitePageVersion(Base):
     category = Column(String(50), nullable=True)
     content = Column(Text, nullable=True)                  # immutable snapshot
     content_hash = Column(String(64), nullable=True)
+    raw_path = Column(String(500), nullable=True)          # preserved raw bytes at this version
+    raw_sha256 = Column(String(64), nullable=True)
     http_status = Column(Integer, nullable=True)
     etag = Column(String(255), nullable=True)
     last_modified = Column(String(100), nullable=True)
@@ -93,6 +122,8 @@ class WebsitePageVersion(Base):
             "title": self.title,
             "category": self.category,
             "content_hash": self.content_hash,
+            "raw_path": self.raw_path,
+            "raw_sha256": self.raw_sha256,
             "http_status": self.http_status,
             "etag": self.etag,
             "last_modified": self.last_modified,

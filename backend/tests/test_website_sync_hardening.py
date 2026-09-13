@@ -41,6 +41,10 @@ os.environ.setdefault(
     "WEBSITE_SYNC_STATE_FILE",
     str(Path(os.environ.get("TEMP", tempfile.gettempdir())) / "_website_sync_test_state.json"),
 )
+os.environ.setdefault(
+    "WEBSITE_SYNC_RAW_DIR",
+    str(Path(os.environ.get("TEMP", tempfile.gettempdir())) / "_website_sync_test_raw"),
+)
 
 import app.models  # noqa: F401  (register tables before any session)
 import app.knowledge_sync.web_engine as web_engine_mod  # noqa: F401

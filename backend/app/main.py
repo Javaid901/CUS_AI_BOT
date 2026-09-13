@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from app.admin.profile import router as admin_profile_router
 from app.admin.routes import router as admin_router
 from app.admin.notices import router as admin_notices_router
+from app.admin.sync_documents import router as admin_sync_documents_router
 from app.analytics.routes import router as analytics_router
 from app.auth.routes import router as auth_router
 from app.authority.routes import public_router as authority_lookup_router
@@ -78,6 +79,7 @@ app.include_router(chat_router)
 app.include_router(admin_router)
 app.include_router(admin_profile_router)
 app.include_router(admin_notices_router)
+app.include_router(admin_sync_documents_router)
 app.include_router(college_router)
 app.include_router(analytics_router)
 app.include_router(catalogue_router)

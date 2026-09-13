@@ -180,6 +180,11 @@ class Settings(BaseSettings):
     # Persistent scheduler state (enabled flag + cadence + runtime state machine
     # status) shared by the dashboard toggle and the background scheduler.
     WEBSITE_SYNC_STATE_FILE: str = "./sync_downloads/website_sync_state.json"
+    # Root directory for preserved raw document bytes (pdf/docx/xlsx/pptx/...)
+    # discovered during a website sync. Kept OUTSIDE the public /api/uploads
+    # mount so raw files are never served by the static file handler. Each raw
+    # file is stored under a UUID-prefixed name (never the original filename).
+    WEBSITE_SYNC_RAW_DIR: str = "./data/sync_documents"
 
     # ----- Demo Mode -----
     # When enabled, seeds demo student data and synthetic service records on startup.

@@ -27,6 +27,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalized_title_hash(normalized_title: str | None) -> str | None:
+    """sha256 hex of the normalized title, matching the engine's title_hash."""
+    if not normalized_title:
+        return None
+    return __import__("hashlib").sha256(normalized_title.encode("utf-8")).hexdigest()
+
+
 class Base(DeclarativeBase):
     """Declarative base for all ORM models."""
 
@@ -178,6 +185,23 @@ def _upgrade_schema() -> None:
             "resolution_text": "TEXT",
             "resolved_by": "VARCHAR(200)",
         },
+        # Phase 1 — Intelligent Website Document Ingestion (additive only).
+        "website_pages": {
+            "doc_type": "VARCHAR(20)",
+            "classification_status": "VARCHAR(30)",
+            "classification_confidence": "TEXT",
+            "classification_signals": "TEXT",
+            "doc_meta": "TEXT",
+            "raw_sha256": "VARCHAR(64)",
+            "raw_size": "INTEGER",
+            "reviewed_by": "VARCHAR(200)",
+            "reviewed_at": "DATETIME",
+            "review_note": "TEXT",
+        },
+        "website_page_versions": {
+            "raw_path": "VARCHAR(500)",
+            "raw_sha256": "VARCHAR(64)",
+        },
     }
     inspector = inspect(engine)
     try:
@@ -307,5 +331,35 @@ def _upgrade_schema() -> None:
     try:
         from app.ingest.store import backfill_scope_metadata
         backfill_scope_metadata("university")
+    except Exception:
+        pass
+
+    # Phase 1 backfill: existing website pages exposed to the new
+    # classification-state columns get a sane default so the non-null ORM
+    # constraint and admin filters stay consistent for pre-upgrade rows.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE website_pages SET classification_status = 'draft' "
+                "WHERE classification_status IS NULL"
+            ))
+    except Exception:
+        pass
+
+    # Title-similarity dedup relies on title_hash, which pre-upgrade rows never
+    # received. Compute it deterministically from the normalized title using
+    # the same hashing scheme as the engine.
+    try:
+        from app.models.website_sync import WebsitePage
+
+        with SessionLocal() as _db:
+            pending = _db.query(WebsitePage).filter(
+                WebsitePage.title_hash.is_(None),
+                WebsitePage.normalized_title.isnot(None),
+            ).all()
+            for p in pending:
+                p.title_hash = _normalized_title_hash(p.normalized_title)
+            if pending:
+                _db.commit()
     except Exception:
         pass
