@@ -180,10 +180,10 @@
     fetchStats().then(function (stats) {
       var chipsEl = $("sd_chips");
       if (chipsEl) {
-        if (!stats) {
+        if (!stats || !stats.by_category) {
           chipsEl.innerHTML = '<span class="muted">Category counts unavailable</span>';
         } else {
-          var cats = stats.by_category || {};
+          var cats = stats.by_category;
           chipsEl.innerHTML = CHIPS.map(function (c) {
             var key = c[0], label = c[1];
             var count = key === "all" ? (stats.total_pages || 0) : (cats[c[2]] != null ? cats[c[2]] : 0);

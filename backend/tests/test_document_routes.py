@@ -221,6 +221,25 @@ def test_routes() -> None:
     check("stats pending_review 2", st.get("pending_review") == 2, str(st.get("pending_review")))
     check("stats last_run present", st.get("last_run") is not None and st["last_run"].get("status") == "completed", str(st.get("last_run")))
 
+    # Stats-contract assertions: category chips must be DB-backed and GLOBAL.
+    bc = st.get("by_category", {})
+    check("stats by_category present", isinstance(bc, dict), str(bc))
+    canonical = {"date-sheet", "model-paper", "official-notification", "other-official-document", "knowledge", "ambiguous"}
+    check("by_category has 6 canonical keys", set(bc) == canonical, str(sorted(bc)))
+    check("by_category sums to total", sum(bc.values()) == st.get("total_pages") == 2, f"{sum(bc.values())}/{st.get('total_pages')}")
+    check("by_category.model-paper counts model-paper rows",
+          bc.get("model-paper") == client.get("/api/admin/sync-documents?category=model-paper", headers=A).json().get("total") == 1,
+          str(bc.get("model-paper")))
+    check("zero categories are zero", bc.get("date-sheet") == 1 and bc.get("official-notification") == 0
+          and bc.get("other-official-document") == 0 and bc.get("knowledge") == 0 and bc.get("ambiguous") == 0, str(bc))
+    # Stats are independent of list filters: filtered lists return subsets while
+    # stats keep the full dataset totals.
+    filtered = client.get("/api/admin/sync-documents?classification_status=pending_review", headers=A).json()["total"]
+    subset = client.get("/api/admin/sync-documents?q=UG_Date_Sheet", headers=A).json()["total"]
+    check("stats global vs list filters", filtered == 2 and subset == 1
+          and st.get("total_pages") == 2 and bc.get("model-paper") == 1, f"{filtered}/{subset}")
+    check("filtered list independent of stats", subset == 1 and st.get("total_pages") == 2, f"{subset}/{st.get('total_pages')}")
+
     r = client.get(f"/api/admin/sync-documents/{ids['date_sheet']}", headers=A)
     detail = r.json()
     check("detail 200", r.status_code == 200, str(r.status_code))
