@@ -1,13 +1,29 @@
 {
   "enabled": false,
   "hours": 0,
-  "last_counts": null,
-  "last_run_at": null,
+  "last_counts": {
+    "archived_pages": 0,
+    "duplicates_skipped": 8,
+    "failed_pages": 95,
+    "indexed_pages": 0,
+    "new_pages": 33,
+    "pages_found": 136,
+    "status": "completed",
+    "total_urls": 136,
+    "trigger": "manual",
+    "unchanged_pages": 0,
+    "updated_pages": 0
+  },
+  "last_run_at": "2026-09-13T08:26:47.408808",
   "next_run_at": null,
   "runtime": {
-    "message": "Idle",
-    "progress": null,
-    "state": "Disconnected"
+    "message": "Completed with 95 failed page(s)",
+    "progress": {
+      "current": 136,
+      "phase": "done",
+      "total": 136
+    },
+    "state": "Warning"
   },
   "schedule": "disabled"
 }

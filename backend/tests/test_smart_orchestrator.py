@@ -265,9 +265,15 @@ def test_admissions():
 _NEWS_CASES = [
     "latest admission notice",
     "latest circular",
-    "examination notification",
     "holiday notice",
     "academic calendar",
+]
+
+# Official-notification queries are served from the canonical university-document
+# repository (verified + published), not from website-news knowledge.  Bare
+# notices/circulars deliberately stay in _NEWS_CASES above.
+_OFFICIAL_DOC_CASES = [
+    "examination notification",
     "latest exam notification",
 ]
 
@@ -280,6 +286,11 @@ def test_website_knowledge():
               f"got action={p.action} target={p.target} reason={p.reason}")
         # Never a dead-end menu for a news query
         check(f"news {raw!r} not a menu", p.action != "navigation", p.reason)
+
+    for raw in _OFFICIAL_DOC_CASES:
+        p = _plan(raw)
+        check(f"official-doc {raw!r} -> official_documents", p.action == "official_documents",
+              f"got action={p.action} target={p.target} reason={p.reason}")
 
 
 # ---------------------------------------------------------------------------

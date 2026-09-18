@@ -44,6 +44,7 @@ from app.utils.logging import audit
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.catalogue import service
@@ -248,15 +249,31 @@ def get_programme(pid: str, db: Session = Depends(get_db), current: User = _prot
 
 @router.post(f"{_prefix}/programmes")
 def create_programme(data: ProgrammeIn, db: Session = Depends(get_db), current: User = _protected):
-    prog = service.create_programme(db, data.model_dump())
+    try:
+        prog = service.create_programme(db, data.model_dump())
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A programme with this name or code already exists.")
+    except DataError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail="A value is too long or invalid for its field (name <= 150, code <= 40, degree_level <= 40).")
     audit(db, "catalogue_programme_created", actor_id=str(current.id), actor_role=current.role, target=prog["code"])
     return prog
 
 
 @router.put(f"{_prefix}/programmes/{{pid}}")
 def update_programme(pid: str, data: ProgrammeUpdate, db: Session = Depends(get_db), current: User = _protected):
+    if _as_uuid(pid) is None:
+        raise HTTPException(status_code=404, detail="Programme not found")
     payload = {k: v for k, v in data.model_dump().items() if v is not None}
-    prog = service.update_programme(db, pid, payload)
+    try:
+        prog = service.update_programme(db, pid, payload)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A programme with this name or code already exists.")
+    except DataError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail="A value is too long or invalid for its field (name <= 150, code <= 40, degree_level <= 40).")
     if not prog:
         raise HTTPException(status_code=404, detail="Programme not found")
     return prog
@@ -264,6 +281,8 @@ def update_programme(pid: str, data: ProgrammeUpdate, db: Session = Depends(get_
 
 @router.delete(f"{_prefix}/programmes/{{pid}}")
 def delete_programme(pid: str, db: Session = Depends(get_db), current: User = _protected):
+    if _as_uuid(pid) is None:
+        raise HTTPException(status_code=404, detail="Programme not found")
     if not service.delete_programme(db, pid):
         raise HTTPException(status_code=404, detail="Programme not found")
     return {"ok": "Deleted"}

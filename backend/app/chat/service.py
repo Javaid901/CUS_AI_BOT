@@ -29,7 +29,9 @@ from typing import Any
 
 from app.config import settings
 from app.chat.fallback import _is_outside_scope, build_fallback_response
+from app.database import SessionLocal
 from app.ingest.generator import GenerationError, stream_answer_async
+from app.llm.gate import shared_llm_gate
 from app.ingest.prompts import format_context, display_title
 from app.ingest.retrieve import retrieve
 from app.ingest.retriever import get_diagnostics
@@ -38,6 +40,19 @@ from app.orchestrator.cache import get_cache
 from app.orchestrator.context import PROGRAMME_ALIASES, PROGRAMME_PATTERN
 from app.utils.logging import log
 from sqlalchemy.orm import Session
+
+
+# Strict no-substitution text for document-scoped follow-ups (spec): a
+# selected Model Paper that cannot answer the question must return EXACTLY
+# this string — the bot must never guess or pull facts from another paper.
+_DOC_SCOPED_UNAVAILABLE = "I don't have information available."
+
+
+def _doc_scope_active(context: dict[str, Any] | None) -> bool:
+    """True when retrieval is pinned to a specific document scope."""
+    if not context:
+        return False
+    return bool(context.get("document_ids") or context.get("document_id"))
 
 
 def _dedupe_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -84,6 +99,43 @@ def _chat_id_or_new(db: Session, chat_id: str | None, user_id) -> Conversation:
         except (ValueError, AttributeError):
             pass
     return _new_conversation(db, user_id)
+
+
+def _persist_assistant_turn(
+    conversation_id, assistant_text: str, cited: list[dict[str, Any]], original_message: str,
+) -> None:
+    """Persist the assistant turn in its OWN short-lived session.
+
+    Phase 3C-5.1: the long-lived request session is closed before the
+    retrieval / LLM-generation wait so it never parks a pooled connection
+    behind an SSE stream. The conversation already committed the user message
+    (and the Conversation row) before that close, so the assistant turn is
+    written here in a fresh session: open -> re-fetch conversation -> write ->
+    commit -> close. Exceptions are contained so the stream always survives.
+    """
+    persist_db: Session = SessionLocal()
+    try:
+        conv = persist_db.get(Conversation, conversation_id)
+        if conv is None:
+            return
+        persist_db.add(
+            Message(
+                conversation_id=conv.id,
+                role="assistant",
+                content=assistant_text,
+                citations=json.dumps(cited),
+                model=settings.LLM_MODEL,
+            )
+        )
+        conv.updated_at = datetime.now(timezone.utc)
+        if conv.title is None:
+            conv.title = (original_message[:80]) or "Chat"
+        persist_db.commit()
+    except Exception as exc:  # noqa: BLE001 - persistence failure must not kill the stream
+        persist_db.rollback()
+        log.error("Failed to persist conversation: %s", exc)
+    finally:
+        persist_db.close()
 
 
 def _chunk_score(chunk: dict[str, Any]) -> float:
@@ -153,6 +205,27 @@ def _scope_chunks(chunks: list[dict[str, Any]], context: dict[str, Any] | None) 
             continue  # foreign chunk (names other programmes, never the target)
         kept.append(chunk)
     return kept or chunks  # never empty the evidence set
+
+
+def _scope_to_documents(
+    chunks: list[dict[str, Any]],
+    context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Restrict chunks to a conversation's document scope (follow-ups).
+
+    When the orchestrator sets ``context["document_ids"]`` (e.g. a Model Paper
+    follow-up right after the paper was shown), only chunks belonging to those
+    documents are kept. An empty/invalid scope yields [] so the caller emits
+    the honest fallback; an absent scope changes nothing.
+    """
+    context = context or {}
+    ids = context.get("document_ids") or context.get("document_id")
+    if not ids:
+        return chunks
+    allow = {str(i) for i in ([ids] if isinstance(ids, str) else ids)}
+    if not allow:
+        return chunks
+    return [c for c in chunks if str(c.get("document_id") or "") in allow]
 
 
 def _scope_note(context: dict[str, Any] | None) -> str | None:
@@ -282,9 +355,20 @@ async def run_chat(
       {"type": "error", "message": "..."}
     """
     conv = _chat_id_or_new(db, chat_id, user_id)
-    user_msg = Message(conversation_id=conv.id, role="user", content=message)
+    # Loaded column captured BEFORE the close: Session.close() expires every
+    # attribute, so touching conv.* afterwards would raise DetachedInstanceError.
+    conv_id = conv.id
+    user_msg = Message(conversation_id=conv_id, role="user", content=message)
     db.add(user_msg)
     db.commit()
+
+    # Phase 3C-5.1: release the request session NOW. Retrieval and LLM
+    # generation can take tens of seconds and must not hold a pooled DB
+    # connection (the SSE stream is open the whole time). The assistant-turn
+    # persistence below uses a fresh short-lived session, the route's streaming
+    # audit writes use their own sessions, and nothing in `run_chat` touches
+    # this session again.
+    db.close()
 
     # Build retrieval context from conversation state if available
     retrieval_context = context or {}
@@ -325,12 +409,15 @@ async def run_chat(
                     "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
                     "ref": hashlib.sha1(str(chat_id or "").encode()).hexdigest()[:8],
                 }
-                yield {"type": "done", "chat_id": str(conv.id), "cited_chunks": []}
+                yield {"type": "done", "chat_id": str(conv_id), "cited_chunks": []}
                 return
 
     # Scope chunks to the conversation's programme so a "BCA" answer never
     # carries MCA facts. Comparisons (programmes list) keep all targets.
     chunks = _scope_chunks(chunks, retrieval_context)
+    # Document-scoped follow-ups (dedicated examination services, college
+    # corpus reads) restrict retrieval to the conversation's documents.
+    chunks = _scope_to_documents(chunks, retrieval_context)
 
     cited = _dedupe_citations([to_citation(c) for c in chunks])
 
@@ -343,9 +430,16 @@ async def run_chat(
 
     assistant_text = ""
     if not chunks:
-        events, assistant_text = _fallback_events(message)
-        for event in events:
-            yield event
+        if _doc_scope_active(retrieval_context):
+            # Strict no-substitution rule for document-scoped follow-ups (e.g.
+            # a Model Paper selected earlier): when nothing in that document
+            # answers, respond EXACTLY this text — never a generic guess.
+            assistant_text = _DOC_SCOPED_UNAVAILABLE
+            yield {"type": "token", "text": assistant_text}
+        else:
+            events, assistant_text = _fallback_events(message)
+            for event in events:
+                yield event
     else:
         # Generate fully BEFORE streaming anything to the client: with a
         # small local model, a generation can be poisoned (it echoes the
@@ -356,19 +450,35 @@ async def run_chat(
         scope_note = _scope_note(retrieval_context)
         if scope_note:
             context_block = f"{context_block}\n\n{scope_note}"
-        try:
-            async for token in stream_answer_async(message, context_block):
-                assistant_text += token
-        except GenerationError as exc:
-            log.error("Generation failed: %s", exc)
+        acquired = await shared_llm_gate.acquire(timeout=settings.MAX_SEMAPHORE_WAIT)
+        if not acquired:
+            # Shared LLM budget exhausted (chat + grievance). Fall back cleanly —
+            # the user never waits on a busy local model, and one path can never
+            # starve the other.
+            log.warning("Shared LLM gate busy on chat=%s; using fallback", chat_id)
             events, assistant_text = _fallback_events(message)
             for event in events:
                 yield event
-        except Exception as exc:
-            log.error("Generation error chat=%s: %s", chat_id, exc)
-            events, assistant_text = _fallback_events(message)
-            for event in events:
-                yield event
+        else:
+            try:
+                try:
+                    async for token in stream_answer_async(message, context_block):
+                        assistant_text += token
+                except GenerationError as exc:
+                    log.error("Generation failed: %s", exc)
+                    events, assistant_text = _fallback_events(message)
+                    for event in events:
+                        yield event
+                except Exception as exc:
+                    log.error("Generation error chat=%s: %s", chat_id, exc)
+                    events, assistant_text = _fallback_events(message)
+                    for event in events:
+                        yield event
+            finally:
+                # Guaranteed slot release on success, failure AND cancellation —
+                # an asyncio.CancelledError during stream_answer_async unwinds
+                # the Ollama HTTP stream and still returns the gate slot.
+                shared_llm_gate.release()
         # Never emit an empty bubble: an empty / whitespace-only generation is
         # replaced with the full professional fallback (text + options).
         if not assistant_text.strip():
@@ -382,44 +492,37 @@ async def run_chat(
             for event in events:
                 yield event
         elif _llm_confessed_unknown(assistant_text):
-            cut = _confession_cut(assistant_text)
-            prefix = assistant_text[:cut].rstrip() if cut > 0 else assistant_text
-            if prefix.strip():
-                assistant_text = prefix
+            if _doc_scope_active(retrieval_context):
+                # Selected Model Paper (document-scoped) follow-up: the
+                # in-scope evidence does not support the requested answer.
+                # Return the EXACT no-substitution text — never the generic
+                # knowledge-base refusal, and never an unvalidated prefix.
+                assistant_text = _DOC_SCOPED_UNAVAILABLE
                 yield {"type": "token", "text": assistant_text}
-                for event in _llm_fallback_events(message):
-                    yield event
             else:
-                # The model answered with ONLY the "not in knowledge base"
-                # sentence — the prefix is empty. Keep it clean: emit the full
-                # fallback (text + authority card + options) instead of an
-                # empty token.
-                events, assistant_text = _fallback_events(message)
-                for event in events:
-                    yield event
+                cut = _confession_cut(assistant_text)
+                prefix = assistant_text[:cut].rstrip() if cut > 0 else assistant_text
+                if prefix.strip():
+                    assistant_text = prefix
+                    yield {"type": "token", "text": assistant_text}
+                    for event in _llm_fallback_events(message):
+                        yield event
+                else:
+                    # The model answered with ONLY the "not in knowledge base"
+                    # sentence — the prefix is empty. Keep it clean: emit the full
+                    # fallback (text + authority card + options) instead of an
+                    # empty token.
+                    events, assistant_text = _fallback_events(message)
+                    for event in events:
+                        yield event
         else:
             yield {"type": "token", "text": assistant_text}
 
-    # Persist assistant message + update conversation timestamp.
-    try:
-        db.add(
-            Message(
-                conversation_id=conv.id,
-                role="assistant",
-                content=assistant_text,
-                citations=json.dumps(cited),
-                model=settings.LLM_MODEL,
-            )
-        )
-        conv.updated_at = datetime.now(timezone.utc)
-        if conv.title is None:
-            conv.title = (message[:80]) or "Chat"
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        log.error("Failed to persist conversation: %s", exc)
+    # Persist assistant message + update conversation timestamp in a fresh
+    # short-lived session (the request session was already released).
+    _persist_assistant_turn(conv_id, assistant_text, cited, message)
 
-    done_event: dict[str, Any] = {"type": "done", "chat_id": str(conv.id), "cited_chunks": cited}
+    done_event: dict[str, Any] = {"type": "done", "chat_id": str(conv_id), "cited_chunks": cited}
     if retrieval_debug:
         done_event["retrieval_debug"] = retrieval_debug
     yield done_event

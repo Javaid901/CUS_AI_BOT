@@ -8,6 +8,10 @@
   var token = localStorage.getItem("cus_admin_token") || null;
   function authHeaders() { var h = {}; if (token) h.Authorization = "Bearer " + token; return h; }
   function setToken(t) { token = t; if (t) localStorage.setItem("cus_admin_token", t); else localStorage.removeItem("cus_admin_token"); }
+  var refreshToken = localStorage.getItem("cus_admin_refresh") || null;
+  var _refreshTimer = 0;
+  function setRefreshToken(rt) { refreshToken = rt; if (rt) localStorage.setItem("cus_admin_refresh", rt); else localStorage.removeItem("cus_admin_refresh"); }
+  function scheduleTokenRefresh() { clearTimeout(_refreshTimer); if (!refreshToken || !token) return; _refreshTimer = setTimeout(function () { if (!refreshToken || !token) return; fetch(API + "/api/auth/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ refresh_token: refreshToken }) }).then(function (r) { if (!r.ok) { var _e = new Error("refresh failed"); _e.status = r.status; throw _e; } return r.json(); }).then(function (d) { if (d.access_token) { setToken(d.access_token); scheduleTokenRefresh(); } }).catch(function (err) { if (err && err.status >= 400 && err.status < 500) { setToken(null); setRefreshToken(null); disconnectSSE(); showLogin(); } else { scheduleTokenRefresh(); } }); }, 50 * 60 * 1000); }
   function handleUnauthorized() { console.warn("[Admin] Unauthorized"); setToken(null); disconnectSSE(); showLogin(); }
 
   // ===== Helpers =====
@@ -47,9 +51,12 @@
     loadHealth();
     loadDocs();
     connectSSE();
+    scheduleTokenRefresh();
   }
   function showLogin() {
+    clearTimeout(_refreshTimer);
     setToken(null);
+    setRefreshToken(null);
     disconnectSSE();
     dashView.style.display = "none"; loginView.style.display = "block";
     $("userLabel").style.display = "none"; $("logoutBtn").style.display = "none"; $("profileBtn").style.display = "none";
@@ -67,6 +74,7 @@
       .then(function (res) {
         if (res.ok && res.d.access_token) {
           setToken(res.d.access_token);
+          if (res.d.refresh_token) setRefreshToken(res.d.refresh_token);
           showDash();
         } else {
           toast("Login failed: " + (res.d.detail || "invalid credentials"), "error");
@@ -766,8 +774,8 @@
       var tab = document.getElementById(tabId);
       if (tab) tab.style.display = "block";
       if (btn.dataset.tab === "websiteSync") { loadWebsiteSync(); }
-      if (btn.dataset.tab === "syncDocuments") {
-        if (window.CUS && window.CUS.syncDocumentsInit) window.CUS.syncDocumentsInit();
+      if (btn.dataset.tab === "universityDocuments") {
+        if (window.CUS && window.CUS.universityDocumentsInit) window.CUS.universityDocumentsInit();
       }
       if (btn.dataset.tab === "colleges") { loadColleges(); }
       if (btn.dataset.tab === "insights") {
@@ -784,9 +792,6 @@
       }
       if (btn.dataset.tab === "studentServices") {
         if (window.CUS && window.CUS.studentAdminInit) window.CUS.studentAdminInit();
-      }
-      if (btn.dataset.tab === "notices") {
-        if (window.CUS && window.CUS.noticesAdminInit) window.CUS.noticesAdminInit();
       }
       if (btn.dataset.tab === "profile") { loadProfile(); }
     });

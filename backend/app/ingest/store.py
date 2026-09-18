@@ -65,6 +65,8 @@ FILTER_METADATA_KEYS = (
     "semester",
     "document_type",
     "category",
+    "doc_type",
+    "classification_confidence",
     "source_url",
     "source",
     "college_id",

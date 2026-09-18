@@ -1,0 +1,115 @@
+SECRET_KEY not configured; generated a random dev key (existing JWT tokens will be invalidated on the next restart).
+-- HTML pages keep knowledge classification --
+  PASS  admissions is knowledge  {'doc_type': 'knowledge', 'category': 'admissions', 'confidence': {'band': 'high', 'score': 80}, 'signals': ["knowledge category 'admissions' matched"]}
+  PASS  html date sheet is knowledge/examinations  {'doc_type': 'knowledge', 'category': 'examinations', 'confidence': {'band': 'high', 'score': 80}, 'signals': ["knowledge category 'examinations' matched"]}
+  PASS  unknown html -> ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no classification signal']}
+-- date sheets -> official/date-sheet, high confidence --
+  PASS  date sheet doc_type  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  date sheet category  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  date sheet high confidence  {'band': 'high', 'score': 80}
+  PASS  date sheet signals present  ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']
+-- model paper: labelled + held for review --
+  PASS  model paper doc_type  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper: Model Paper', 'model-paper: Model Paper', 'model paper: label + hold for review']}
+  PASS  model paper category  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper: Model Paper', 'model-paper: Model Paper', 'model paper: label + hold for review']}
+  PASS  model paper label+hold signal  ['model-paper: Model Paper', 'model-paper: Model Paper', 'model paper: label + hold for review']
+-- model-paper exclusions win over markers --
+  PASS  exclusion 'Model Paper Previous Year Question Paper' != model-paper  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['model-paper excluded: Previous Year, notice', 'official-notification: notice']}
+  PASS  exclusion 'Model Paper Previous Year Question Paper' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['model-paper excluded: Previous Year, notice', 'official-notification: notice']}
+  PASS  exclusion 'MCA Previous Year Question Paper' != model-paper  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  exclusion 'MCA Previous Year Question Paper' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  exclusion 'Model Paper Syllabus BoS' != model-paper  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['model-paper excluded: Syllabus, BoS, notice', 'other-official-document: Syllabus']}
+  PASS  exclusion 'Model Paper Syllabus BoS' -> other-official-document  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['model-paper excluded: Syllabus, BoS, notice', 'other-official-document: Syllabus']}
+  PASS  exclusion 'Model Paper and Date Sheet' != model-paper  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper excluded: Date Sheet, notice', 'date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  exclusion 'Model Paper and Date Sheet' -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper excluded: Date Sheet, notice', 'date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+-- MCA Previous Year Question Paper must NOT become model-paper --
+  PASS  not model-paper  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  official-notification (notices url)  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  low confidence  {'band': 'low', 'score': 20}
+-- syllabus -> other-official-document --
+  PASS  syllabus is official  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['other-official-document: Syllabus', 'other-official-document: curriculum']}
+  PASS  syllabus -> other-official-document  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['other-official-document: Syllabus', 'other-official-document: curriculum']}
+-- ambiguous + conflicting-signal safety --
+  PASS  EVSSem1.pdf stays ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+  PASS  EnglishSem-2.pdf stays ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+  PASS  Course Brochure 2026 stays ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+  PASS  close conflicting signals -> ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['conflicting official signals: official-notification, other-official-document']}
+  PASS  conflict signal recorded  ['conflicting official signals: official-notification, other-official-document']
+-- confidence bands --
+  PASS  date sheet -> high  {'band': 'high', 'score': 80}
+  PASS  syllabus -> medium  {'band': 'medium', 'score': 40}
+  PASS  banner-less notification -> low  {'band': 'low', 'score': 20}
+  PASS  score bounded 0..100  80
+  PASS  score bounded 0..100  40
+  PASS  score bounded 0..100  20
+-- acceptance category mapping (A-G) --
+  PASS  A: date sheet official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  A: date sheet category  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  B: true model paper official  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['model-paper: Model Question Paper', 'model paper: label + hold for review']}
+  PASS  B: true model paper category  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['model-paper: Model Question Paper', 'model paper: label + hold for review']}
+  PASS  C: notice official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  C: notice category  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  D: regulations official  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['other-official-document: Regulations']}
+  PASS  D: regulations category  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['other-official-document: Regulations']}
+  PASS  E: faculty stays knowledge  {'doc_type': 'knowledge', 'category': 'faculty', 'confidence': {'band': 'high', 'score': 80}, 'signals': ["knowledge category 'faculty' matched"]}
+  PASS  E: knowledge stays faculty bucket  {'doc_type': 'knowledge', 'category': 'faculty', 'confidence': {'band': 'high', 'score': 80}, 'signals': ["knowledge category 'faculty' matched"]}
+  PASS  F: previous year NOT model-paper  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  G: unclear doc ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+-- real CUS date sheets carry 'Date Sheet for...' only in the body --
+  PASS  text date sheet b_ed_2ndsemsterbatch2025supp.pdf official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet b_ed_2ndsemsterbatch2025supp.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet b_ed_2ndsemsterbatch2025supp.pdf signal  ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']
+  PASS  text date sheet b_ed_2ndsemsterbatch2025supp.pdf band low/medium  {'band': 'low', 'score': 20}
+  PASS  text date sheet b_ed_3rdsemster2025aug2026.pdf official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet b_ed_3rdsemster2025aug2026.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet b_ed_3rdsemster2025aug2026.pdf signal  ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']
+  PASS  text date sheet b_ed_3rdsemster2025aug2026.pdf band low/medium  {'band': 'low', 'score': 20}
+  PASS  text date sheet pg1stsemregularbatch2025.pdf official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet pg1stsemregularbatch2025.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet pg1stsemregularbatch2025.pdf signal  ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']
+  PASS  text date sheet pg1stsemregularbatch2025.pdf band low/medium  {'band': 'low', 'score': 20}
+  PASS  text date sheet dspg2ndsembacklogbatch202224.pdf official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet dspg2ndsembacklogbatch202224.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  text date sheet dspg2ndsembacklogbatch202224.pdf signal  ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']
+  PASS  text date sheet dspg2ndsembacklogbatch202224.pdf band low/medium  {'band': 'low', 'score': 20}
+  PASS  stray date-sheet mention stays ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+-- official notification strong title signals --
+  PASS  notification 'Notice for submission of examination forms' official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  notification 'Notice for submission of examination forms' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  notification 'Notification regarding examination' official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['official-notification: notice', 'official-notification: Notification']}
+  PASS  notification 'Notification regarding examination' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['official-notification: notice', 'official-notification: Notification']}
+  PASS  notification 'Official notification' official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['official-notification: notice', 'official-notification: notification']}
+  PASS  notification 'Official notification' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['official-notification: notice', 'official-notification: notification']}
+  PASS  notification 'Examination form notice' official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: notice']}
+  PASS  notification 'Examination form notice' -> official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: notice']}
+  PASS  date sheet not swallowed by notification noise  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+-- exact requested category cases --
+  PASS  case 'MCA Date Sheet.pdf' doc_type=official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  case 'MCA Date Sheet.pdf' category=date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  case 'Revised Date Sheet UG 6th Semester.pdf' doc_type=official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  case 'Revised Date Sheet UG 6th Semester.pdf' category=date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  case 'Notice for submission of examination forms.pdf' doc_type=official  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  case 'Notice for submission of examination forms.pdf' category=official-notification  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['official-notification: Notice']}
+  PASS  case 'MCA Model Question Paper.pdf' doc_type=official  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['model-paper: Model Question Paper', 'model paper: label + hold for review']}
+  PASS  case 'MCA Model Question Paper.pdf' category=model-paper  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['model-paper: Model Question Paper', 'model paper: label + hold for review']}
+  PASS  case 'MCA Model Question Paper.pdf' state=pending_review  pending_review
+  PASS  case 'MCA Previous Year Question Paper.pdf' NOT model-paper  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+  PASS  case 'CUS Regulations 2026.pdf' doc_type=official  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['other-official-document: Regulations']}
+  PASS  case 'CUS Regulations 2026.pdf' category=other-official-document  {'doc_type': 'official', 'category': 'other-official-document', 'confidence': {'band': 'high', 'score': 90}, 'signals': ['other-official-document: Regulations']}
+  PASS  case 'zqwv document without signals.pdf' doc_type=ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+  PASS  case 'zqwv document without signals.pdf' category=ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+-- real corpus date sheets in backend/app/data/notices (skip if absent) --
+  PASS  corpus b_ed_3rdsemster2025aug2026.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus b_ed_2ndsemsterbatch2025supp.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus pg1stsemregularbatch2025.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus dspg2ndsembacklogbatch202224.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus ug4thsemesternepbatch2024backlog.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus pg1stsemregularbatch2025.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['date-sheet: Date Sheet', 'date-sheet: Date Sheet']}
+  PASS  corpus ugdatesheet2ndsem2025cbcs.pdf -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['date-sheet: datesheet', 'date-sheet: datesheet', 'date-sheet: datesheet']}
+-- classification contract shape --
+  PASS  contract keys  ['category', 'confidence', 'doc_type', 'signals']
+  PASS  confidence keys  {'band': 'high', 'score': 80}
+  PASS  signals is list of str
+
+SUMMARY
+  Passed: 96/96
+  Failed: 0/96

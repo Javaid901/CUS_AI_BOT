@@ -3,25 +3,25 @@
   "hours": 0,
   "last_counts": {
     "archived_pages": 0,
-    "duplicates_skipped": 7,
-    "failed_pages": 95,
-    "indexed_pages": 0,
+    "duplicates_skipped": 15,
+    "failed_pages": 94,
+    "indexed_pages": 1,
     "new_pages": 0,
-    "pages_found": 135,
+    "pages_found": 142,
     "status": "completed",
-    "total_urls": 135,
+    "total_urls": 142,
     "trigger": "manual",
-    "unchanged_pages": 33,
-    "updated_pages": 0
+    "unchanged_pages": 32,
+    "updated_pages": 1
   },
-  "last_run_at": "2026-09-12T06:24:47.075292",
+  "last_run_at": "2026-09-16T19:55:17.128701+05:30",
   "next_run_at": null,
   "runtime": {
-    "message": "Completed with 95 failed page(s)",
+    "message": "Completed with 94 failed page(s)",
     "progress": {
-      "current": 135,
+      "current": 142,
       "phase": "done",
-      "total": 135
+      "total": 142
     },
     "state": "Warning"
   },

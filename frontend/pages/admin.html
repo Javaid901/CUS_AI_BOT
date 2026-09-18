@@ -59,13 +59,12 @@
         <div class="tab-bar">
           <button class="tab-btn active" data-tab="sources">&#x1f4da; Sources</button>
           <button class="tab-btn" data-tab="websiteSync">&#x1f310; Website Sync</button>
-          <button class="tab-btn" data-tab="syncDocuments">&#x1f4c1; Sync Documents</button>
+          <button class="tab-btn" data-tab="universityDocuments">&#x1f4c1; University Documents</button>
           <button class="tab-btn" data-tab="colleges">&#x1f3db; Colleges</button>
           <button class="tab-btn" data-tab="insights">&#x1f4ca; AI Insights</button>
           <button class="tab-btn" data-tab="catalogue">&#x1f4d6; Catalogue</button>
           <button class="tab-btn" data-tab="authorities">&#x1f3db;&#xfe0f; Authorities</button>
           <button class="tab-btn" data-tab="authorityAdmins">&#x1f465; Authority Admins</button>
-          <button class="tab-btn" data-tab="notices">&#x1f4ec; Universal Notices</button>
           <button class="tab-btn" data-tab="studentServices">&#x1f393; Student Services</button>
           <button class="tab-btn" data-tab="profile">&#x1f464; My Profile</button>
         </div>
@@ -235,9 +234,9 @@
           </div>
         </div>
 
-        <!-- === Sync Documents Tab === -->
-        <div id="tabSyncDocuments" class="tab-content" style="display:none;">
-          <div class="admin-card" id="syncDocumentsRoot"><p class="sub">Loading document review queue...</p></div>
+        <!-- === University Documents Tab (Consolidated: crawler + manual upload) === -->
+        <div id="tabUniversityDocuments" class="tab-content" style="display:none;">
+          <div class="admin-card" id="universityDocumentsRoot"><p class="sub">Loading University Documents...</p></div>
         </div>
 
         <!-- === Colleges Tab === -->
@@ -335,10 +334,7 @@
           <div id="studentAdminRoot" style="min-height:200px;"></div>
         </div>
 
-        <!-- === University Notices Tab (Super Admin) === -->
-        <div id="tabNotices" class="tab-content" style="display:none;">
-          <div id="noticesAdminRoot" style="min-height:200px;"></div>
-        </div>
+
 
         <!-- === My Profile Tab === -->
       <div id="tabProfile" class="tab-content" style="display:none;">
@@ -754,5 +750,6 @@
   <script src="../js/admin_student_exam_forms.js?v=3"></script>
   <script src="../js/admin_notices.js?v=1"></script>
   <script src="../js/admin_sync_documents.js?v=2"></script>
+  <script src="../js/admin_university_documents.js?v=1"></script>
 </body>
 </html>

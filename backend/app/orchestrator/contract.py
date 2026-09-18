@@ -19,8 +19,90 @@ No LLM calls — pure rules for speed and determinism.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from app.orchestrator.context import is_referential_followup, is_university_related
+
+# ---------------------------------------------------------------------------
+# Fee type detection (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+_FEE_EXAMINATION_PATTERNS = (
+    "exam fee",
+    "fees of exam",
+    "fee for exam",
+    "examination fee",
+    "fees of examination",
+    "fee for examination",
+    "examination fee structure",
+    "exam fee structure",
+    "exam form fee",
+    "examination form fee",
+    "form fee",
+    "form fees",
+    "form charges",
+    "examination charges",
+    "exam charges",
+    "examination fee details",
+)
+
+_FEE_PROGRAMME_PATTERNS = (
+    "programme fee",
+    "programme fees",
+    "course fee",
+    "course fees",
+    "tuition fee",
+    "tuition fees",
+    "admission fee",
+    "admission fees",
+    "program fee",
+    "program fees",
+)
+
+_EXAM_WORDS = ("exam", "examination")
+_FEE_WORDS = ("fee", "fees", "charges", "amount")
+
+# Whole-phrase match helper
+def _in(phrase: str, norm: str) -> bool:
+    return bool(re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", norm))
+
+
+def detect_fee_type(message: str, entities: Any | None = None, ctx: Any | None = None) -> str | None:
+    """Detect the fee type from a message.
+
+    Returns "examination" | "programme" | None.
+    Priority: explicit current message > context.
+    """
+    if not message:
+        return None
+    norm = re.sub(r"[\s_\-]+", " ", message.strip().lower())
+
+    # Explicit examination fee phrases
+    if any(_in(p, norm) for p in _FEE_EXAMINATION_PATTERNS):
+        return "examination"
+    # Explicit programme fee phrases
+    if any(_in(p, norm) for p in _FEE_PROGRAMME_PATTERNS):
+        return "programme"
+    # "exam" + "fee" combination without programme fee phrases
+    has_exam = any(_in(w, norm) for w in _EXAM_WORDS)
+    has_fee = any(_in(w, norm) for w in _FEE_WORDS)
+    if has_exam and has_fee:
+        return "examination"
+
+    # Context inheritance (only for university-related or referential messages)
+    if ctx is not None and (is_university_related(message, entities) or is_referential_followup(message)):
+        # First try context.fee_type (set by planner/examination action)
+        fee_type = getattr(ctx, "fee_type", None)
+        if fee_type:
+            return fee_type
+        # Fallback: check persisted contract's fee_type
+        last_contract = getattr(ctx, "_last_contract", None)
+        if isinstance(last_contract, dict):
+            return last_contract.get("fee_type")
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Intent taxonomy (university domain)
@@ -74,6 +156,7 @@ class QueryContract:
     topic: str | None = None              # canonical topic key ("fee", "eligibility", ...)
     service: str | None = None            # student-service id (transactional)
     authority: str | None = None          # office / department name
+    fee_type: str | None = None           # "programme" | "examination" — fee disambiguation
     confidence: float = 0.0
     needs_clarification: bool = False
     clarification_field: str | None = None
@@ -98,6 +181,7 @@ class QueryContract:
             "topic": self.topic,
             "service": self.service,
             "authority": self.authority,
+            "fee_type": self.fee_type,
             "confidence": round(self.confidence, 3),
             "needs_clarification": self.needs_clarification,
             "clarification_field": self.clarification_field,
@@ -215,8 +299,15 @@ def build_contract(
         c.programmes = list(programmes)
         c.comparison = len(programmes) > 1
 
+    # ---- Fee type detection (explicit > context) ----
+    c.fee_type = detect_fee_type(message, entities, ctx)
+
     # ---- Context fill-in (only where the message itself is silent) ----
-    if ctx is not None:
+    # Context is only consulted when the current message is genuinely about the
+    # university or points back at an earlier entity. An unrelated question
+    # ("what is the capital of France?") must never inherit the last programme.
+    inherit_context = is_university_related(message, entities) or is_referential_followup(message)
+    if ctx is not None and inherit_context:
         if not c.programme:
             c.programme = getattr(ctx, "programme", None)
         if not c.programme_id:

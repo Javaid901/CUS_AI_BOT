@@ -26,7 +26,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.orchestrator.context import PROGRAMME_ALIASES  # noqa: F401  (alias lookup kept for API parity)
+from app.orchestrator.context import (  # noqa: E402
+    PROGRAMME_ALIASES,  # noqa: F401  (alias lookup kept for API parity)
+    is_referential_followup,
+    is_university_related,
+)
 
 from app.catalogue.service import (  # noqa: E402
     get_category_subjects,
@@ -410,6 +414,9 @@ def detect_catalogue_request(
 
     # ---- 6) Fee structure (structured priority over legacy data) ----------
     if _FEE.search(lowered):
+        # Skip catalogue fee if fee_type is explicitly examination (handled by examination service)
+        if ctx is not None and getattr(ctx, "fee_type", None) == "examination":
+            return None
         if resolved:
             prog = programme_by_id(prog_id)
             if prog and prog.get("fee_structure"):
@@ -501,6 +508,12 @@ def detect_catalogue_request(
         if topic and not _EXPLICIT_OVERVIEW.search(lowered):
             return None  # specific facts (fee/eligibility/...) keep the existing flow
         if resolved:
+            # `resolved` may have come from conversation context. Only inherit it
+            # when the current message is actually about the university or points
+            # back at an earlier entity — an unrelated "what is ..." question
+            # must never be answered with the last programme's overview.
+            if not is_university_related(lowered, entities) and not is_referential_followup(lowered):
+                return None
             return {"op": "overview", "programme": prog_id, "code": resolved["code"], "name": resolved["name"]}
         return None
 

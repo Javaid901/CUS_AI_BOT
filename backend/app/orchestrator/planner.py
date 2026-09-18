@@ -78,8 +78,11 @@ from app.orchestrator.context import (
     PROGRAMME_ALIASES,
     ConversationContext,
     detect_programme_switch,
+    is_referential_followup,
+    is_university_related,
 )
-from app.orchestrator.contract import build_contract
+from app.orchestrator.contract import build_contract, detect_fee_type
+from app.multi_source.decompose import decompose_query, query_category
 from app.orchestrator.extractor import (
     extract_entities,
     is_informational_question,
@@ -250,6 +253,20 @@ def plan(
             plan_target=result.target,
         )
         result.extra["contract"] = contract.as_dict()
+        # Phase 1 (Safe Intelligence Foundation): attach advisory intelligence
+        # metadata ONLY when INTELLIGENCE_ENABLED=True. When the flag is off
+        # (default) nothing here runs — no extra imports, no retrieval, no model
+        # calls, no user-visible change. The catch below means a failure can
+        # never break planning.
+        try:
+            from app.config import settings as _ai_settings
+            if getattr(_ai_settings, "INTELLIGENCE_ENABLED", False):
+                from app.intelligence.contract_ext import build_intelligence_contract
+                result.extra["intelligence"] = build_intelligence_contract(
+                    message, entities, ctx=ctx, plan=result,
+                ).as_dict()
+        except Exception:
+            pass  # intelligence metadata must never break planning
     except Exception:
         pass  # a contract must never break planning
     return result
@@ -324,6 +341,34 @@ def _plan_inner(
             reason=f"Exam form intent: {_ev}",
             extra={"service": "exam_form", "exam_intent": _ev},
         )
+
+    # ---- Stage 0-pre-ms: Multi-source knowledge questions ----
+    # A compound question spanning two or more university sources ("what is
+    # the MCA eligibility, duration and exam fee?") is decomposed into
+    # sub-questions and answered by collecting evidence from each authoritative
+    # source. This gate runs on the RAW message — before query-understanding
+    # preprocessing, which can mangle multi-clause sentences — and fires only
+    # for GENUINE multi-source questions (>=2 fragments with >=2 distinct
+    # source classes, at least one university source). Single-topic messages
+    # return None here and flow through the existing pipeline unmodified, so
+    # the dedicated examination / notices / catalogue / comparison / service
+    # paths are never hijacked.
+    try:
+        subs = decompose_query(message, entities, ctx)
+        if subs:
+            return Plan(
+                action="multi_source",
+                target=clean,
+                confidence=0.86,
+                reason=f"Multi-source knowledge question ({len(subs)} sub-queries)",
+                extra={
+                    "multi_source": [s.as_dict() for s in subs],
+                    "original_query": message.strip(),
+                    "category": query_category(subs),
+                },
+            )
+    except Exception:
+        pass  # decomposition must never break the normal flow
 
     # ---- Stage 0: Query Understanding preprocessing ----
     # Lightweight normalization, spelling correction, alias expansion.
@@ -550,6 +595,53 @@ def _plan_inner(
                 extra=notice_intent,
             )
 
+    # ---- Rule 3aa: Examinations dedicated services ----
+    # The Examinations menu hosts three dedicated services (Model Papers, Exam
+    # Fee Structure, Division Improvement). They run their OWN structured
+    # pipelines — never the generic RAG loop. This gate runs BEFORE the
+    # catalogue block so "bca exam fee" / "bca model papers" can never be read
+    # as catalogue fee requests, before the news block, and before option
+    # selection (Rule 9): clicking these menu chips used to fall through to
+    # get_selection_response (no entry -> {"type": "rag"}) and the semantic
+    # classifier (model papers -> examination category -> menu loop). The
+    # spec's exclusions live in app/examination/detect.py.
+    exam_intent = _detect_examination_intent(text, e, message)
+    if exam_intent:
+        exam_pid = (exam_intent.get("programme") or "").strip().lower() or None
+        if exam_pid:
+            ctx.programme = exam_pid
+            ctx.programme_id = exam_pid
+        return Plan(
+            action="examination",
+            target=exam_intent["target"],
+            confidence=exam_intent.get("confidence", 0.9),
+            reason=exam_intent.get("reason", f"Examination service: {exam_intent['target']}"),
+            extra=exam_intent,
+        )
+
+    # ---- Rule 3ab: Official notifications / other official documents ----
+    # Student-facing read path over the canonical university_documents
+    # repository. Runs AFTER the date-sheet / examination services (so a date
+    # sheet or model paper still wins) and BEFORE the catalogue block (so
+    # "official documents for MCA" is not misread as a catalogue "documents
+    # required" request) and BEFORE the news block (so notification lookups
+    # come from the verified repository, never free-form website knowledge).
+    # Bare "notice"/"notices"/"circular" keep their existing news / button
+    # flows — only notification(s), official notice(s) and official document(s)
+    # route here.
+    if not (e.word_count <= 1 and is_option_selection(text)):
+        official_doc_intent = _detect_official_document_intent(text, e)
+        if official_doc_intent:
+            return Plan(
+                action="official_documents",
+                target=official_doc_intent.get("q") or text,
+                confidence=official_doc_intent.get("confidence", 0.9),
+                reason=official_doc_intent.get(
+                    "reason", "Official documents / notifications intent"
+                ),
+                extra=official_doc_intent,
+            )
+
     # ---- Rule 3b: Academic catalogue (NEP) ----
     # Structured catalogue data (programmes, subjects, VAC/SEC/AEC, credits,
     # outcomes, curriculum docs) takes priority over generic RAG. Detection is
@@ -649,6 +741,15 @@ def _plan_inner(
     # structured lookup takes priority over navigation. Skipped when the message
     # names a DIFFERENT programme — that is a switch handled by Rule 5b/12.
     if ctx.programme and e.topic and not (e.programme and e.programme != ctx.programme):
+        # Fee type disambiguation: if fee_type is explicitly "examination", route to examination service
+        if e.topic == "fee" and getattr(ctx, "fee_type", None) == "examination":
+            return Plan(
+                action="examination",
+                target="fee_structure_exam",
+                confidence=0.95,
+                reason=f"Examination fee for {ctx.programme} (from context fee_type)",
+                extra={"programme": ctx.programme},
+            )
         value = lookup_field(ctx.programme, e.topic)
         if value:
             detail = lookup_programme(ctx.programme)
@@ -678,6 +779,15 @@ def _plan_inner(
         ctx.programme = e.programme
         ctx.programme_id = e.programme
         _derive_level_for(ctx, e.programme)
+        # Fee type disambiguation: explicit examination fee or context fee_type
+        if e.topic == "fee" and (detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination"):
+            return Plan(
+                action="examination",
+                target="fee_structure_exam",
+                confidence=0.95,
+                reason=f"Examination fee for {e.programme} (explicit or context)",
+                extra={"programme": e.programme},
+            )
         value = lookup_field(e.programme, e.topic)
         if value:
             detail = lookup_programme(e.programme)
@@ -722,6 +832,15 @@ def _plan_inner(
                         break
             if college_topic:
                 if college_topic == "fee":
+                    # Fee type disambiguation: if explicitly examination fee, route to examination service
+                    if detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination":
+                        return Plan(
+                            action="examination",
+                            target="fee_structure_exam",
+                            confidence=0.9,
+                            reason=f"Examination fee in college context ({college_id})",
+                            extra={"programme": ctx.programme},
+                        )
                     fees = _college_svc.get_fees(college_id)
                     return Plan(
                         action="structured",
@@ -894,6 +1013,15 @@ def _plan_inner(
         for kw, mapped in COLLEGE_TOPICS.items():
             if _word_in_text(kw, text):
                 if mapped == "fee":
+                    # Fee type disambiguation: if explicitly examination fee, route to examination service
+                    if detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination":
+                        return Plan(
+                            action="examination",
+                            target="fee_structure_exam",
+                            confidence=0.9,
+                            reason=f"Examination fee follow-up in college context ({ctx.college})",
+                            extra={"programme": ctx.programme},
+                        )
                     fees = _college_svc.get_fees(ctx.college)
                     return Plan(
                         action="structured",
@@ -1148,6 +1276,15 @@ def _plan_inner(
     if ctx.college and ctx.programme and e.topic:
         # Check if the college has this programme
         if college_course_map.has_college_programme(ctx.college, ctx.programme):
+            # Fee type disambiguation
+            if e.topic == "fee" and (detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination"):
+                return Plan(
+                    action="examination",
+                    target="fee_structure_exam",
+                    confidence=0.95,
+                    reason=f"Examination fee for college {ctx.college} programme {ctx.programme}",
+                    extra={"programme": ctx.programme, "college_id": ctx.college},
+                )
             value = lookup_field(ctx.programme, e.topic)
             if value:
                 college = _college_svc.get_college(ctx.college)
@@ -1241,6 +1378,39 @@ def _plan_inner(
             extra={"service": _unavailable_service},
         )
 
+    # ---- Rule 10b-1: Fee ambiguity clarification ----
+    # When the user asks about "fee" without specifying which fee type
+    # (programme/course/tuition vs examination), and no fee_type can be
+    # inferred from the message or inherited from context, ask for clarification.
+    # Explicit fee types: "examination fee" -> examination, "programme fee" -> programme.
+    if e.topic == "fee" or ctx.topic == "fee":
+        fee_type = detect_fee_type(message, e, ctx)
+        if fee_type is None:
+            # Check if we have a programme context to disambiguate
+            # If no programme anywhere, let Rule 10b handle "which programme?"
+            # If we have a programme but fee_type is still ambiguous, clarify fee type.
+            has_programme = bool(e.programme or ctx.programme or ctx.catalogue_programme_code)
+            if has_programme:
+                return Plan(
+                    action="clarify",
+                    target="fee_type",
+                    confidence=0.85,
+                    reason=f"Fee type ambiguous for programme {e.programme or ctx.programme} — clarify programme vs examination fee",
+                    extra={"slot": "fee_type", "pending_topic": "fee", "pending_programme": e.programme or ctx.programme},
+                )
+        else:
+            # Fee type was determined (explicit or from context). Route accordingly.
+            # If examination fee, route to examination service (works without programme).
+            # If programme fee, fall through to programme slot-fill (needs programme).
+            if fee_type == "examination":
+                return Plan(
+                    action="examination",
+                    target="fee_structure_exam",
+                    confidence=0.9,
+                    reason=f"Examination fee (fee_type={fee_type} from {'context' if getattr(ctx, 'fee_type', None) == 'examination' else 'explicit message'})",
+                    extra={"programme": e.programme or ctx.programme},
+                )
+
     # ---- Rule 10b: Topic without programme → targeted slot-fill question ----
     # A concrete topic (fee, eligibility, duration, documents, ...) with no
     # programme anywhere (message, context, domain, college) can't be answered
@@ -1285,8 +1455,17 @@ def _plan_inner(
     # ---- Rule 11: Programme + topic without structured data → RAG ----
     # Skipped when the message names a different programme (switch → Rule 5b/12).
     if ctx.programme and e.topic and not (e.programme and e.programme != ctx.programme):
+        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        if e.topic == "fee" and getattr(ctx, "fee_type", None) == "examination":
+            return Plan(
+                action="examination",
+                target="fee_structure_exam",
+                confidence=0.9,
+                reason=f"Examination fee for {ctx.programme} (context fee_type, no structured data)",
+                extra={"programme": ctx.programme},
+            )
         # No structured data found, try RAG
-        augmented = _augment_for_rag(ctx, e.topic)
+        augmented = _augment_for_rag(ctx, e.topic, e)
         return Plan(
             action="rag",
             target=augmented,
@@ -1300,6 +1479,15 @@ def _plan_inner(
     if prog_switch and (not ctx.programme or prog_switch != ctx.programme):
         # If the switch is accompanied by a topic, handle as structured
         if e.topic:
+            # Fee type disambiguation for programme switch
+            if e.topic == "fee" and (detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination"):
+                return Plan(
+                    action="examination",
+                    target="fee_structure_exam",
+                    confidence=0.95,
+                    reason=f"Examination fee for {prog_switch} (explicit or context)",
+                    extra={"programme": prog_switch},
+                )
             value = lookup_field(prog_switch, e.topic)
             if value:
                 detail = lookup_programme(prog_switch)
@@ -1351,7 +1539,16 @@ def _plan_inner(
 
     # ---- Rule 14: Short follow-up with programme context ----
     if ctx.programme and _is_short_followup(text, e):
-        augmented = _augment_for_rag(ctx, clean)
+        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        if (e.topic == "fee" or ctx.topic == "fee") and getattr(ctx, "fee_type", None) == "examination":
+            return Plan(
+                action="examination",
+                target="fee_structure_exam",
+                confidence=0.85,
+                reason=f"Examination fee follow-up for {ctx.programme} (context fee_type)",
+                extra={"programme": ctx.programme},
+            )
+        augmented = _augment_for_rag(ctx, clean, e)
         return Plan(
             action="rag",
             target=augmented,
@@ -1362,7 +1559,16 @@ def _plan_inner(
 
     # ---- Rule 15: Broad question with context → RAG ----
     if e.is_question and ctx.programme:
-        augmented = _augment_for_rag(ctx, text)
+        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        if (e.topic == "fee" or ctx.topic == "fee") and getattr(ctx, "fee_type", None) == "examination":
+            return Plan(
+                action="examination",
+                target="fee_structure_exam",
+                confidence=0.8,
+                reason=f"Examination fee question for {ctx.programme} (context fee_type)",
+                extra={"programme": ctx.programme},
+            )
+        augmented = _augment_for_rag(ctx, text, e)
         return Plan(
             action="rag",
             target=augmented,
@@ -1391,7 +1597,7 @@ def _plan_inner(
         )
 
     # ---- Rule 18: Everything else → RAG ----
-    augmented = _augment_for_rag(ctx, text) if ctx.programme else text
+    augmented = _augment_for_rag(ctx, text, e) if ctx.programme else text
     extra = {"original_query": text, "augmented_query": augmented}
     if _semantic_intent and _semantic_intent != "unknown":
         extra["semantic_intent"] = _semantic_intent
@@ -1525,8 +1731,21 @@ def _build_context_dict(ctx: ConversationContext) -> dict[str, Any]:
     return result
 
 
-def _augment_for_rag(ctx: ConversationContext, text: str) -> str:
-    """Build a context-augmented query string for RAG."""
+def _augment_for_rag(ctx: ConversationContext, text: str, entities: Any | None = None) -> str:
+    """Build a context-augmented query string for RAG.
+
+    Context is only folded in when the current message is about the university
+    or points back at an earlier entity (a referential follow-up). A clear
+    off-domain question ("what is the capital of France?") must never be scoped
+    to the last programme just because it happens to be in conversation memory.
+    """
+    if (
+        entities is not None
+        and getattr(entities, "is_question", False)
+        and not is_university_related(text, entities)
+        and not is_referential_followup(text)
+    ):
+        return text
     from app.orchestrator.context import _get_programme_label
     parts = []
     if ctx.programme:
@@ -1979,3 +2198,85 @@ def _detect_notice_intent(text: str, e: Any) -> dict | None:
         "confidence": conf,
         "reason": reason,
     }
+
+
+# ---------------------------------------------------------------------------
+# Official notifications / other official documents (canonical repository)
+# ---------------------------------------------------------------------------
+
+# Vocabulary for the student-facing official-document read path (Rule 3ab).
+# Deliberately narrower than _NEWS_NOUNS: bare "notice"/"notices"/"circular"
+# keep their existing news / option flows, so only notification(s), official
+# notice(s) and official document(s) are routed to the verified repository.
+_OFFICIAL_DOC_PATTERNS = (
+    re.compile(r"\bnotifications?\b"),
+    re.compile(r"\bofficial\s+notices?\b"),
+    re.compile(r"\bofficial\s+documents?\b"),
+)
+_OFFICIAL_DOC_OTHER_RE = re.compile(r"\bother\s+official\b")
+
+# Words stripped from a request to leave only the topic used to search document
+# titles/filenames. Anything not listed is treated as topic content.
+_OFFICIAL_DOC_STOPWORDS = frozenset({
+    "official", "document", "documents", "notification", "notifications",
+    "notice", "notices", "university", "latest", "recent", "new", "newest",
+    "show", "list", "me", "all", "the", "a", "an", "please", "give", "get",
+    "find", "download", "open", "any", "for", "of", "about", "related",
+    "to", "with", "and", "in", "on", "some", "doc", "docs", "file", "files",
+    "other", "official's", "everything", "them",
+})
+
+
+def _detect_official_document_intent(text: str, e: Any) -> dict | None:
+    """Detect an official-notification / official-document request (Rule 3ab).
+
+    Returns a dict (doc_types, programme, q, query, confidence, reason) or None.
+    Generic requests search BOTH ``official_notification`` and
+    ``other_official_document``; an explicit "other official document" narrows to
+    that family only. The LLM never invents a document — the engine serves only
+    published + verified rows, with an honest fallback when none match.
+    """
+    low = text.strip().lower()
+    if not any(p.search(low) for p in _OFFICIAL_DOC_PATTERNS):
+        return None
+    programmes = list(getattr(e, "programmes", None) or [])
+    programme = programmes[0] if programmes else (getattr(e, "programme", None) or None)
+    discipline = _detect_programme_discipline(low)
+    if discipline:
+        programme = discipline
+    if _OFFICIAL_DOC_OTHER_RE.search(low):
+        doc_types = ["other_official_document"]
+    else:
+        doc_types = ["official_notification", "other_official_document"]
+    prog_tokens = set(re.findall(r"[a-z0-9]+", str(programme or "").replace("-", " ").lower()))
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", low)
+        if t not in _OFFICIAL_DOC_STOPWORDS and t not in prog_tokens
+    ]
+    q = " ".join(tokens).strip() or None
+    return {
+        "doc_types": doc_types,
+        "programme": programme,
+        "q": q,
+        "query": low,
+        "confidence": 0.9,
+        "reason": "Official university documents / notifications",
+    }
+
+
+def _detect_examination_intent(text: str, e: Any, raw: str | None = None) -> dict | None:
+    """Detect the Examinations menu's dedicated services (Rule 3aa).
+
+    Delegates to app/examination/detect.py, which is keyword/phrase-gated and
+    enforces the spec's exclusions (PYQ / previous-year / non-exam fees /
+    bare marks-improvement are NOT routed here). Any failure degrades to None
+    so the rest of the pipeline handles the message unchanged. ``raw`` is the
+    original user message, used for deterministic filter-constraint extraction
+    so the query-understanding rewrite never drops a programme/semester/
+    subject/batch/academic-year filter.
+    """
+    try:
+        from app.examination.detect import detect_examination_intent
+        return detect_examination_intent(text, e, raw=raw)
+    except Exception:
+        return None

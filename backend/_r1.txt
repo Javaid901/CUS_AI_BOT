@@ -1,0 +1,103 @@
+SECRET_KEY not configured; generated a random dev key (existing JWT tokens will be invalidated on the next restart).
+-- content-only model/question paper (opaque filename, /notices URL) --
+  PASS  structural model paper -> official  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper content structure: 5 enumerated questions', 'model paper: label + hold for review']}
+  PASS  structural model paper -> model-paper  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 80}, 'signals': ['model-paper content structure: 5 enumerated questions', 'model paper: label + hold for review']}
+  PASS  structural model paper signal  ['model-paper content structure: 5 enumerated questions', 'model paper: label + hold for review']
+  PASS  structural model paper confidence >= medium  {'band': 'high', 'score': 80}
+-- 'Model Question Paper' phrase in content beats /notices URL --
+  PASS  phrase model paper -> model-paper  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['model-paper excluded: notice', 'model-paper content structure: 4 enumerated questions', 'model paper: label + hold for review']}
+  PASS  phrase model paper not notification  {'doc_type': 'official', 'category': 'model-paper', 'confidence': {'band': 'high', 'score': 100}, 'signals': ['model-paper excluded: notice', 'model-paper content structure: 4 enumerated questions', 'model paper: label + hold for review']}
+-- structured previous-year paper stays OUT of model-paper --
+  PASS  previous-year NOT model-paper  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+  PASS  previous-year still classified (not crash)  {'doc_type': 'official', 'category': 'official-notification', 'confidence': {'band': 'low', 'score': 20}, 'signals': ['official-notification: notice']}
+-- content-only date table with opaque filename --
+  PASS  date table -> official  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['date-sheet content structure: 4 date rows']}
+  PASS  date table -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['date-sheet content structure: 4 date rows']}
+-- numbered date sheet rows must NOT flip to model-paper --
+  PASS  numbered date sheet -> date-sheet  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['date-sheet content structure: 4 date rows']}
+  PASS  numbered date sheet NOT model-paper  {'doc_type': 'official', 'category': 'date-sheet', 'confidence': {'band': 'medium', 'score': 40}, 'signals': ['date-sheet content structure: 4 date rows']}
+-- unparseable/empty binary text -> ambiguous (needs_review) --
+  PASS  empty text -> ambiguous  {'doc_type': 'ambiguous', 'category': 'ambiguous', 'confidence': {'band': 'low', 'score': 0}, 'signals': ['no confident official category']}
+-- HTML pages keep knowledge classification --
+  PASS  html -> knowledge  {'doc_type': 'knowledge', 'category': 'admissions', 'confidence': {'band': 'high', 'score': 80}, 'signals': ["knowledge category 'admissions' matched"]}
+-- canonical doc_type mapping --
+  PASS  canonical date-sheet -> date_sheet  date_sheet
+  PASS  canonical model-paper -> model_paper  model_paper
+  PASS  canonical official-notification -> official_notification  official_notification
+  PASS  canonical other-official-document -> other_official_document  other_official_document
+  PASS  canonical admissions -> knowledge  knowledge
+  PASS  canonical ambiguous -> needs_review  needs_review
+  PASS  canonical_doc_type('date-sheet')
+  PASS  canonical_doc_type('ambiguous')
+  PASS  canonical_doc_type('admissions') -> knowledge
+-- backfill: WebsitePage category (not coarse doc_type) drives canonical --
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('f4fe65ef749e449da1d35e397de030a7', '4bb2c94b6d2f48ea84e6e4805144237e', None, 'document.backfill_legacy', None, 'created=4 skipped=0 errors=0', None, '2026-09-17 03:53:23.039404')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  backfill created 4  {'created': 4, 'skipped': 0, 'errors': 0}
+  PASS  model_paper present  {'knowledge', 'date_sheet', 'needs_review', 'model_paper'}
+  PASS  date_sheet present  {'knowledge', 'date_sheet', 'needs_review', 'model_paper'}
+  PASS  knowledge present  {'knowledge', 'date_sheet', 'needs_review', 'model_paper'}
+  PASS  needs_review present  {'knowledge', 'date_sheet', 'needs_review', 'model_paper'}
+  PASS  no false official_notification  {'knowledge', 'date_sheet', 'needs_review', 'model_paper'}
+  PASS  confidence recorded  {'band': 'high', 'score': 90}
+  PASS  provenance.signals recorded  {'signals': ['model-paper matched'], 'category': 'model-paper', 'doc_type': 'official', 'legacy_backfill': True}
+  PASS  backfill idempotent  {'created': 0, 'skipped': 4, 'errors': 0}
+-- record_crawled_document: explicit sha256 idempotency + metadata --
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('b3ff3f6e016b44c28dc38d071ae31a01', None, None, 'document.record_crawled', '11c7d227-8e6f-4765-a2a7-db9a7521683a', 'model_paper: MCA Model Paper', None, '2026-09-17 03:53:23.155246')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  sha256 dedup returns same row  11c7d227-8e6f-4765-a2a7-db9a7521683a vs 11c7d227-8e6f-4765-a2a7-db9a7521683a
+  PASS  single canonical row  1
+  PASS  source_url stored  https://x/notices/m.pdf
+  PASS  site_page_id stored  page-1
+  PASS  provenance stored  {'signals': ['model-paper content structure: 5 enumerated questions']}
+  PASS  confidence stored  {'band': 'high', 'score': 90}
+-- safe auto-reclassification of pending_review crawler rows --
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('c4693e22f82e41c6a43a29ba16f75ef0', '8065370fbd044e67835e489eafef2139', None, 'document.backfill_legacy', None, 'created=2 skipped=0 errors=0', None, '2026-09-17 03:53:23.282651')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  seed row is official_notification  official_notification
+  PASS  dry_run reports change  [{'id': '62bb5bb4-f54e-4ff0-9b43-0f5f7c3f4e66', 'title': 'StatePaper', 'from': 'official_notification', 'to': 'model_paper'}]
+  PASS  dry_run leaves doc_type  official_notification
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('8da4678ac2614da0adb0c021c1c772c8', '38a15fd6154c48f2a47d92b289007900', None, 'document.reclassify_auto', '62bb5bb4-f54e-4ff0-9b43-0f5f7c3f4e66', 'official_notification -> model_paper', None, '2026-09-17 03:53:23.299033')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  reclassify corrected 1  [{'id': '62bb5bb4-f54e-4ff0-9b43-0f5f7c3f4e66', 'title': 'StatePaper', 'from': 'official_notification', 'to': 'model_paper'}]
+  PASS  doc_type corrected  model_paper
+  PASS  confidence refreshed  {'band': 'high', 'score': 80}
+  PASS  signals refreshed  {'signals': ['model-paper content structure: 5 enumerated questions', 'model paper: label + hold for review'], 'category': 'model-paper', 'doc_type': 'official', 'legacy_backfill': True, 'reclassified_at': '2026-09-17T03:53:23.296084+00:00'}
+  PASS  knowledge row untouched
+  PASS  second pass no changes  {'changed': 0, 'skipped': 2, 'errors': 0, 'corrected': []}
+-- reclassification respects manual/verified rows --
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('94e7b44d7aeb419ba8a1bd1e31b89f99', 'f772cadef3ce43798e9c05b8787fcff7', None, 'document.backfill_legacy', None, 'created=1 skipped=0 errors=0', None, '2026-09-17 03:53:23.374044')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('5d13f4ff3d734b13acb3471b7baa76e4', 'b5ae0748d5c049e2b1d23f7c4b2e58ec', 'admin', 'document.verify', '677dd85c-cd86-4205-bd10-d9b90e289745', 'VerifiedNotice', None, '2026-09-17 03:53:23.378392')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  verified row skipped  {'changed': 0, 'skipped': 0, 'errors': 0, 'corrected': []}
+  PASS  verified row doc_type unchanged  official_notification
+  PASS  verified row still verified  verified
+-- web_engine integration: _apply_document_attributes -> canonical --
+2026-09-17T09:23:23 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('0c4b3f842f7b48c0a7262b904a648180', None, None, 'document.record_crawled', '013d3d4d-bd57-47c7-8e10-9b5da37b07f8', 'model_paper: pgp2026sem1.pdf', None, '2026-09-17 03:53:23.426961')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+  PASS  canonical row created from crawl  sha=ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d
+  PASS  canonical doc_type = model_paper  model_paper
+  PASS  canonical source = crawler  crawler
+  PASS  canonical site_page_id linked  6f881cbd-7bed-4762-913b-834b2e291986
+  PASS  canonical confidence stored  {'band': 'high', 'score': 80}
+  PASS  canonical provenance.signals  {'signals': ['model-paper content structure: 5 enumerated questions', 'model paper: label + hold for review'], 'category': 'model-paper', 'raw_path': 'raw/abc.pdf', 'http_status': 200, 'crawled_at': '2026-09-17T03:53:23.421263+00:00'}
+  PASS  re-crawl does not duplicate canonical row  1
+
+SUMMARY
+  Passed: 57/57
+  Failed: 0/57

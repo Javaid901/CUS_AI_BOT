@@ -428,8 +428,11 @@ def list_notices(
             )
         )
     qry = qry.order_by(
-        # SQLite puts NULLs last in DESC order; unpublished/in-verified rows sink below.
-        UniversityNotice.published_at.desc(),
+        # Unpublished/in-verified rows sink below published ones on both
+        # dialects: SQLite already puts NULLs last in DESC order, and the
+        # explicit nulls_last() reproduces exactly that behavior on PostgreSQL
+        # (whose default is NULLs FIRST in DESC).
+        UniversityNotice.published_at.desc().nulls_last(),
         UniversityNotice.created_at.desc(),
     )
     return qry.limit(limit).all()

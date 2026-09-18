@@ -104,7 +104,7 @@
     root().innerHTML = html;
 
     var nb = document.getElementById("catNewProg");
-    if (nb) nb.addEventListener("click", showProgrammeForm);
+    if (nb) nb.addEventListener("click", function () { showProgrammeForm(null); });
     document.getElementById("catTabSchemes").addEventListener("click", function () { _view = "schemes"; render(); });
     document.getElementById("catTabUploads").addEventListener("click", function () { openUploads(); });
     root().querySelectorAll("[data-act=open]").forEach(function (b) {

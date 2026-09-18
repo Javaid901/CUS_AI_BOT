@@ -30,6 +30,7 @@ import re
 import httpx
 
 from app.config import settings
+from app.llm.gate import shared_llm_gate
 
 _log = logging.getLogger("cus_ai")
 
@@ -124,12 +125,29 @@ def formalize(raw_input: str, model: str | None = None) -> dict:
             "num_predict": 700,
         },
     }
+    if not shared_llm_gate.acquire_sync(timeout=settings.MAX_SEMAPHORE_WAIT):
+        # Shared LLM budget exhausted (grievance + chat). Never block the
+        # student — fall back to the deterministic manual draft.
+        _log.warning("grievance formalization gate busy; using manual draft")
+        draft = _manual_draft(clean)
+        return {
+            "generated": False,
+            "subject": draft["subject"],
+            "text": draft["text"],
+            "error": "LLM budget busy",
+            "manual": True,
+        }
     try:
-        with httpx.Client(base_url=settings.OLLAMA_BASE_URL, timeout=_TIMEOUT) as client:
-            resp = client.post("/api/chat", json=payload)
-            resp.raise_for_status()
-            content = resp.json().get("message", {}).get("content", "")
-        data = _parse_llm_json(content)
+        try:
+            with httpx.Client(base_url=settings.OLLAMA_BASE_URL, timeout=_TIMEOUT) as client:
+                resp = client.post("/api/chat", json=payload)
+                resp.raise_for_status()
+                content = resp.json().get("message", {}).get("content", "")
+            data = _parse_llm_json(content)
+        finally:
+            # Guaranteed slot release on success, failure AND client-abort —
+            # one code path can never starve the other.
+            shared_llm_gate.release()
         return {
             "generated": True,
             "subject": data["subject"],

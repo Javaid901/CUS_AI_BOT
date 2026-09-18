@@ -16,19 +16,51 @@ from __future__ import annotations
 import asyncio
 import time
 
+from app.utils import redis_client
 from app.utils.logging import log
 
 _AGGREGATION_INTERVAL = 3600  # 1 hour
 _CLEANUP_INTERVAL = 86400     # 24 hours
 _INSIGHT_INTERVAL = 7200       # 2 hours
 
+_MAINT_GUARDS = {
+    "aggregation": "analytics:aggregation",
+    "cleanup": "analytics:cleanup",
+    "insights": "analytics:insights",
+}
+
 _task: asyncio.Task | None = None
 _running = False
+
+
+async def _maint_guard(name: str) -> str | None:
+    """Single-owner guard across workers. None => another worker is running
+    this maintenance task (or Redis is unavailable -> local behavior)."""
+    if not (redis_client.runtime.enabled() and redis_client.runtime.available_now()):
+        return "local"
+    try:
+        return await asyncio.wait_for(
+            redis_client.maint_try_acquire(name), timeout=0.5
+        )
+    except Exception:  # noqa: BLE001
+        return "local"
+
+
+async def _maint_unlock(name: str, guard: str | None) -> None:
+    if guard and guard != "local":
+        try:
+            await redis_client.maint_release(name, guard)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _run_aggregation() -> None:
     """Run aggregation in a thread to avoid blocking."""
     from app.analytics.aggregator import run_aggregation
+
+    guard = await _maint_guard(_MAINT_GUARDS["aggregation"])
+    if guard is None:
+        return
     loop = asyncio.get_event_loop()
     t0 = time.monotonic()
     try:
@@ -37,25 +69,40 @@ async def _run_aggregation() -> None:
         log.info("Analytics aggregation completed in %.2fs: %s", elapsed, result)
     except Exception as exc:
         log.warning("Analytics aggregation failed: %s", exc)
+    finally:
+        await _maint_unlock(_MAINT_GUARDS["aggregation"], guard)
 
 
 async def _run_cleanup(retention_days: int = 365) -> None:
     """Run data cleanup."""
     from app.analytics.aggregator import run_cleanup
+
+    guard = await _maint_guard(_MAINT_GUARDS["cleanup"])
+    if guard is None:
+        return
     loop = asyncio.get_event_loop()
     t0 = time.monotonic()
     try:
         result = await loop.run_in_executor(None, run_cleanup, retention_days)
         elapsed = time.monotonic() - t0
         if result.get("events") or result.get("samples"):
-            log.info("Analytics cleanup removed %s events, %s samples (%.2fs)", result.get("events", 0), result.get("samples", 0), elapsed)
+            log.info(
+                "Analytics cleanup removed %s events, %s samples (%.2fs)",
+                result.get("events", 0), result.get("samples", 0), elapsed,
+            )
     except Exception as exc:
         log.warning("Analytics cleanup failed: %s", exc)
+    finally:
+        await _maint_unlock(_MAINT_GUARDS["cleanup"], guard)
 
 
 async def _run_insights() -> None:
     """Generate and log automated insights."""
     from app.analytics.insights import generate_insights
+
+    guard = await _maint_guard(_MAINT_GUARDS["insights"])
+    if guard is None:
+        return
     loop = asyncio.get_event_loop()
     try:
         insights = await loop.run_in_executor(None, generate_insights)
@@ -65,6 +112,8 @@ async def _run_insights() -> None:
                 log.debug("Insight [%s]: %s", ins.get("severity"), ins.get("message"))
     except Exception as exc:
         log.warning("Analytics insight generation failed: %s", exc)
+    finally:
+        await _maint_unlock(_MAINT_GUARDS["insights"], guard)
 
 
 async def _scheduler_loop(aggregation_interval: int, cleanup_interval: int, insight_interval: int) -> None:

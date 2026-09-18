@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from app.config import settings
 from app.ingest.generator import is_ollama_available, list_models
+from app.utils import redis_client
 from fastapi import APIRouter
 
 router = APIRouter(tags=["public"])
@@ -36,6 +37,11 @@ def suggested_questions():
 @router.get(f"{settings.API_PREFIX}/health")
 def health():
     ollama_ok = is_ollama_available()
+    # Redis: enabled=False is healthy (not configured); enabled=True
+    # but unreachable is degraded.
+    redis_enabled = redis_client.runtime.enabled()
+    redis_ok = redis_client.runtime.health_ok()
+    redis_status = "healthy" if redis_ok else ("degraded" if redis_enabled else "not_configured")
     try:
         from app.orchestrator.metrics import metrics_summary
         metrics = metrics_summary()
@@ -51,6 +57,10 @@ def health():
             "llm_model": settings.LLM_MODEL,
             "embed_model": settings.EMBED_MODEL,
             "models": list_models() if ollama_ok else [],
+        },
+        "redis": {
+            "enabled": redis_enabled,
+            "status": redis_status,
         },
         "metrics": metrics,
     }

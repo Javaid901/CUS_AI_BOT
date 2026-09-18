@@ -37,12 +37,12 @@ def _get_client() -> httpx.Client:
     return _HTTP_CLIENT
 
 
-def _build_payload(question: str, context: str) -> dict:
+def _build_payload(question: str, context: str, system: str | None = None) -> dict:
     prompt = CONTEXT_TEMPLATE.format(context=context, question=question)
     return {
         "model": settings.LLM_MODEL,
         "prompt": prompt,
-        "system": SYSTEM_PROMPT,
+        "system": system or SYSTEM_PROMPT,
         "stream": True,
         "keep_alive": f"{settings.OLLAMA_KEEP_ALIVE}s",
         "options": {
@@ -53,15 +53,17 @@ def _build_payload(question: str, context: str) -> dict:
     }
 
 
-def stream_answer(question: str, context: str):
+def stream_answer(question: str, context: str, system: str | None = None):
     """
     Yield tokens (strings) from the Ollama streaming endpoint.
     Raises GenerationError on connection/HTTP failure.
 
     Sync variant — for CLI/standalone use. The async SSE path must use
     stream_answer_async so per-token network reads never block the event loop.
+
+    ``system`` optionally overrides the system prompt (multi-source synthesis).
     """
-    payload = _build_payload(question, context)
+    payload = _build_payload(question, context, system=system)
     client = _get_client()
     try:
         with client.stream(
@@ -85,15 +87,17 @@ def stream_answer(question: str, context: str):
         raise GenerationError(f"Ollama request failed: {exc}") from exc
 
 
-async def stream_answer_async(question: str, context: str):
+async def stream_answer_async(question: str, context: str, system: str | None = None):
     """
     Async twin of stream_answer — yields tokens without blocking the loop.
 
     Uses its own AsyncClient per call so the pooled sync client and its lock
     stay untouched; an async context manager guarantees connection cleanup.
     Raises GenerationError on connection/HTTP failure.
+
+    ``system`` optionally overrides the system prompt (multi-source synthesis).
     """
-    payload = _build_payload(question, context)
+    payload = _build_payload(question, context, system=system)
     try:
         async with httpx.AsyncClient(timeout=_GEN_TIMEOUT) as client:
             async with client.stream(

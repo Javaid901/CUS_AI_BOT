@@ -20,6 +20,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from app.utils import redis_client
+
+_NS = "orrch"
+_REDIS_OP_TIMEOUT = 0.35  # hard ceiling per shared-cache op
+
 _MAX_ENTRIES_PER_NS = 256
 _DEFAULT_TTL: dict[str, float] = {
     "intent": 30.0,
@@ -48,7 +53,23 @@ class TtlCache:
             self._locks[namespace] = asyncio.Lock()
         return self._locks[namespace]
 
+    def _rkey(self, namespace: str, key: str) -> str:
+        return f"{namespace}:{key}"
+
+    async def _rget(self, ckey: str) -> Any:
+        try:
+            return await asyncio.wait_for(
+                redis_client.cache_get(_NS, ckey), timeout=_REDIS_OP_TIMEOUT
+            )
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return None
+
     async def get(self, namespace: str, key: str) -> Any | None:
+        if redis_client.runtime.enabled():
+            value = await self._rget(self._rkey(namespace, key))
+            # malformed/absent shared value -> miss; never crash
+            if value is not None:
+                return value
         async with self._lock(namespace):
             store = self._stores.get(namespace)
             if store is None:
@@ -76,16 +97,40 @@ class TtlCache:
                 )
                 if oldest_key != key:
                     del store[oldest_key]
+        if redis_client.runtime.enabled():
+            try:
+                await asyncio.wait_for(
+                    redis_client.cache_set(_NS, self._rkey(namespace, key), value, int(ttl)),
+                    timeout=_REDIS_OP_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
 
     async def delete(self, namespace: str, key: str) -> None:
         async with self._lock(namespace):
             store = self._stores.get(namespace)
             if store:
                 store.pop(key, None)
+        if redis_client.runtime.enabled():
+            try:
+                await asyncio.wait_for(
+                    redis_client.cache_delete(_NS, self._rkey(namespace, key)),
+                    timeout=_REDIS_OP_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
 
     async def clear_namespace(self, namespace: str) -> None:
         async with self._lock(namespace):
             self._stores.pop(namespace, None)
+        if redis_client.runtime.enabled():
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(redis_client.cache_purge_sync, _NS),
+                    timeout=_REDIS_OP_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
 
     async def clear_all(self) -> None:
         self._stores.clear()

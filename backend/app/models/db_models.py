@@ -278,7 +278,7 @@ class DateSheetEntry(Base):
     id = Column(_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     notice_id = Column(_UUID(as_uuid=True), ForeignKey("university_notices.id", ondelete="CASCADE"), nullable=False, index=True)
     row_no = Column(Integer, nullable=False, default=0)
-    programme_id = Column(String(20), nullable=True, index=True)
+    programme_id = Column(String(60), nullable=True, index=True)
     programme_name = Column(String(200), nullable=True)
     stream = Column(String(60), nullable=True)
     semester = Column(String(10), nullable=True, index=True)

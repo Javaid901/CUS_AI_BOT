@@ -1,0 +1,78 @@
+..F....F..........                                                       [100%]
+================================== FAILURES ===================================
+_______________________ test_sha256_dedup_is_idempotent _______________________
+
+db = <sqlalchemy.orm.session.Session object at 0x0000020D5C6E9940>
+
+    def test_sha256_dedup_is_idempotent(db):
+        first = _manual(db, title="Dedup Target", doc_type="official_notification")
+        second = _manual(db, title="Dedup Target", doc_type="official_notification")
+        n = (
+            db.query(UniversityDocument)
+            .filter(UniversityDocument.title == "Dedup Target")
+            .count()
+        )
+>       assert n == 1
+E       assert 2 == 1
+
+tests\test_z3c7_final.py:90: AssertionError
+---------------------------- Captured stdout call -----------------------------
+2026-09-17T09:23:30 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('f421d093aade4ab3ac9d3aeb6d3cf4cc', '3177a427935942eaa7b877778746b6de', 'admin', 'document.record_manual_upload', '87252cce-62cb-4257-b9bd-2c82a926f5b0', 'official_notification: Dedup Target', None, '2026-09-17 03:53:30.771988')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+2026-09-17T09:23:30 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('71305edb04834a768ae173d70905551b', 'd8f28a66ef994585bcb807343d24f4ab', 'admin', 'document.record_manual_upload', '2520fec0-7de3-48f1-b071-ac91b69c9d46', 'official_notification: Dedup Target', None, '2026-09-17 03:53:30.773484')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+------------------------------ Captured log call ------------------------------
+WARNING  cus_ai:logging.py:74 audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('f421d093aade4ab3ac9d3aeb6d3cf4cc', '3177a427935942eaa7b877778746b6de', 'admin', 'document.record_manual_upload', '87252cce-62cb-4257-b9bd-2c82a926f5b0', 'official_notification: Dedup Target', None, '2026-09-17 03:53:30.771988')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+WARNING  cus_ai:logging.py:74 audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('71305edb04834a768ae173d70905551b', 'd8f28a66ef994585bcb807343d24f4ab', 'admin', 'document.record_manual_upload', '2520fec0-7de3-48f1-b071-ac91b69c9d46', 'official_notification: Dedup Target', None, '2026-09-17 03:53:30.773484')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+_______________________ test_sha256_dedup_is_idempotent _______________________
+
+ses = <sqlalchemy.orm.session.Session object at 0x0000020D5C6E8EC0>
+
+    def test_sha256_dedup_is_idempotent(ses: Session):
+        m1 = _manual(
+            ses, title="Dedup Target Notification", doc_type="official_notification"
+        )
+        m2 = _manual(
+            ses, title="Dedup Target Notification", doc_type="official_notification"
+        )
+        n = (
+            ses.query(UniversityDocument)
+            .filter(UniversityDocument.title == "Dedup Target Notification")
+            .count()
+        )
+>       assert n == 1
+E       assert 2 == 1
+
+tests\test_p3c7f_ud.py:121: AssertionError
+---------------------------- Captured stdout call -----------------------------
+2026-09-17T09:23:31 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('51f0440fc2cd459693349a917a37101c', '21deedf82fe141d0bd4e939ee0d0857e', 'admin', 'document.record_manual_upload', 'b122cc63-a007-46c4-8155-fecd4ee02bf2', 'official_notification: Dedup Target Notification', None, '2026-09-17 03:53:31.080972')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+2026-09-17T09:23:31 | WARNING  | cus_ai | audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('c0824784da484a8088e10487eda13af1', '3caf42ba18294740bdf696105b12d524', 'admin', 'document.record_manual_upload', '638bdb57-32aa-4418-8b68-3bbb9e125e81', 'official_notification: Dedup Target Notification', None, '2026-09-17 03:53:31.083734')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+------------------------------ Captured log call ------------------------------
+WARNING  cus_ai:logging.py:74 audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('51f0440fc2cd459693349a917a37101c', '21deedf82fe141d0bd4e939ee0d0857e', 'admin', 'document.record_manual_upload', 'b122cc63-a007-46c4-8155-fecd4ee02bf2', 'official_notification: Dedup Target Notification', None, '2026-09-17 03:53:31.080972')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+WARNING  cus_ai:logging.py:74 audit log write failed: (sqlite3.OperationalError) no such table: audit_logs
+[SQL: INSERT INTO audit_logs (id, actor_id, actor_role, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)]
+[parameters: ('c0824784da484a8088e10487eda13af1', '3caf42ba18294740bdf696105b12d524', 'admin', 'document.record_manual_upload', '638bdb57-32aa-4418-8b68-3bbb9e125e81', 'official_notification: Dedup Target Notification', None, '2026-09-17 03:53:31.083734')]
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+=========================== short test summary info ===========================
+FAILED tests/test_z3c7_final.py::test_sha256_dedup_is_idempotent - assert 2 == 1
+FAILED tests/test_p3c7f_ud.py::test_sha256_dedup_is_idempotent - assert 2 == 1
+2 failed, 16 passed in 2.81s

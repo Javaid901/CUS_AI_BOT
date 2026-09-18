@@ -37,6 +37,7 @@ GET /api/admin/website-sync/status):
 from __future__ import annotations
 
 import asyncio
+import asyncio
 import hashlib
 import json
 import os
@@ -59,6 +60,7 @@ from app.knowledge_sync.web_crawler import (
     normalize_url,
 )
 from app.models.website_sync import CrawlRun, WebsitePage, WebsitePageVersion
+from app.utils import redis_client
 from app.utils.logging import log
 
 try:
@@ -67,6 +69,8 @@ except ImportError:  # pragma: no cover
     from app.models.db_models import Document
 
 _RUN_LOCK = threading.Lock()
+_SYNC_LOCK_NAME = "sync:website"
+_SYNC_LOCK_OP_TIMEOUT = 0.5
 
 
 def resolve_source_url(url: str | None = None) -> str:
@@ -384,9 +388,46 @@ class WebsiteSyncEngine:
     async def run_async(
         self, trigger: str = "manual", seed_urls: list[str] | None = None
     ) -> dict[str, Any]:
-        """Async entry point. Serialized per process via _RUN_LOCK."""
-        with _RUN_LOCK:
-            return await self._sync(trigger=trigger, seed_urls=seed_urls)
+        """Async entry point.
+
+        Phase 3C-5: when Redis is reachable a distributed lock keeps exactly one
+        worker's website sync running across the fleet; the per-process
+        `_RUN_LOCK` still serializes within a worker. Redis unavailable falls
+        back to process-local behavior.
+        """
+        lock_owner: str | None = None
+        renew_task: asyncio.Task | None = None
+        if redis_client.runtime.enabled() and redis_client.runtime.available_now():
+            try:
+                lock_owner = await asyncio.wait_for(
+                    redis_client.acquire_lock(
+                        _SYNC_LOCK_NAME, settings.REDIS_SYNC_LOCK_TTL
+                    ),
+                    timeout=_SYNC_LOCK_OP_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001
+                lock_owner = None
+            if lock_owner is None:
+                log.info("Website sync skipped: distributed sync lock held by another worker")
+                return {
+                    "trigger": trigger,
+                    "status": "skipped",
+                    "reason": "sync lock held by another worker",
+                }
+            renew_task = await redis_client.renewal_loop(
+                _SYNC_LOCK_NAME, lock_owner, settings.REDIS_SYNC_LOCK_TTL
+            )
+        try:
+            with _RUN_LOCK:
+                return await self._sync(trigger=trigger, seed_urls=seed_urls)
+        finally:
+            if renew_task is not None:
+                renew_task.cancel()
+            if lock_owner:
+                try:
+                    await redis_client.release_lock(_SYNC_LOCK_NAME, lock_owner)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # -- core pass -----------------------------------------------------------
     async def _sync(self, trigger: str, seed_urls: list[str] | None) -> dict[str, Any]:
@@ -775,6 +816,58 @@ class WebsiteSyncEngine:
         # Model papers are ALWAYS held for review, regardless of confidence.
         if classification.get("category") == "model-paper":
             page.classification_status = "pending_review"
+        # Crawled binary documents land in the canonical repository
+        # (university_documents) with their content-derived classification.
+        # HTML knowledge pages stay WebsitePage-only (never duplicated).
+        self._sync_canonical_document(page)
+
+    def _sync_canonical_document(self, page: WebsitePage) -> None:
+        """Mirror a classified binary page into the canonical repository.
+
+        Idempotent at the storage layer (sha256 dedup). Never raises: a
+        canonical-write failure only downgrades the page, it cannot abort the
+        sync pass.
+        """
+        if (page.content_type or "") != "document" or not page.raw_sha256:
+            return
+        try:
+            from app.knowledge_sync.document_classifier import canonical_doc_type_for
+            from app.knowledge_sync.raw_store import resolve_contained
+            from app.university_documents.service import record_crawled_document
+
+            classification = {
+                "doc_type": page.doc_type,
+                "category": page.category,
+                "confidence": page.classification_confidence
+                or {"band": "low", "score": 0},
+                "signals": page.classification_signals or [],
+            }
+            rel = page.raw_path or None
+            abs_path = resolve_contained(rel) if rel else None
+            record_crawled_document(
+                self.db,
+                title=page.title or "Untitled university document",
+                doc_type=canonical_doc_type_for(classification),
+                file_path=str(abs_path) if abs_path else rel,
+                original_filename=rel,
+                file_type=(rel.rsplit(".", 1)[-1] if rel and "." in rel else None),
+                file_size=page.raw_size,
+                sha256=page.raw_sha256,
+                source_url=page.url,
+                site_page_id=str(page.id),
+                confidence=page.classification_confidence
+                or {"band": "low", "score": 0},
+                provenance={
+                    "signals": page.classification_signals or [],
+                    "category": page.category,
+                    "raw_path": rel,
+                    "http_status": page.http_status,
+                    "crawled_at": utcnow().isoformat(),
+                },
+                provider="system",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Canonical document record failed for %s: %s", page.url, exc)
 
     def _find_page(self, url: str) -> WebsitePage | None:
         return self.db.query(WebsitePage).filter(WebsitePage.url == url).first()
@@ -883,6 +976,15 @@ class WebsiteSyncEngine:
             if page.document_id != str(doc.id):
                 page.document_id = str(doc.id)
             delete_document(str(doc.id))
+            from app.knowledge_sync.document_classifier import canonical_doc_type_for
+
+            classification = {
+                "doc_type": page.doc_type,
+                "category": page.category,
+                "confidence": page.classification_confidence
+                or {"band": "low", "score": 0},
+                "signals": page.classification_signals or [],
+            }
             add_chunks_with_embeddings(
                 str(doc.id),
                 doc.title,
@@ -891,6 +993,10 @@ class WebsiteSyncEngine:
                 {
                     "document_type": "website",
                     "category": page.category or "",
+                    "doc_type": canonical_doc_type_for(classification),
+                    "classification_confidence": (
+                        page.classification_confidence or {}
+                    ).get("band", ""),
                     "source_url": page.url,
                     "source": "website",
                 },

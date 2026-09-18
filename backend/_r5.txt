@@ -1,0 +1,119 @@
+SECRET_KEY not configured; generated a random dev key (existing JWT tokens will be invalidated on the next restart).
+-- web_extractor: semantic extraction --
+  PASS  title extracted  Admission Notification 2026
+  PASS  description extracted  PG admission notification for the academic session 2026.
+  PASS  no nav text
+  PASS  no footer boilerplate
+  PASS  no cookie banner
+  PASS  no script junk
+  PASS  heading present in text
+  PASS  heading listed  ['PG Admissions 2026']
+  PASS  body content kept
+  PASS  external link kept
+  PASS  relative link resolved
+-- web_classifier: 18 categories --
+  PASS  18 categories  18
+  PASS  classify 'Admissions 2026 notification'  got=admissions
+  PASS  classify 'PG admission notice'  got=admissions
+  PASS  classify 'Examination date sheet 2026'  got=examinations
+  PASS  classify 'Department of Computer Science'  got=departments
+  PASS  classify 'B.Tech programme syllabus'  got=programmes
+  PASS  classify 'Latest news roundup'  got=news
+  PASS  classify 'Public notice: re-opening'  got=notices
+  PASS  classify 'Faculty profile - Dr X'  got=faculty
+  PASS  classify 'Merit scholarship details'  got=scholarships
+  PASS  classify 'Hostel accommodation rules'  got=hostels
+  PASS  classify 'Campus transport schedule'  got=transport
+  PASS  classify 'Registrar office administration'  got=administration
+  PASS  classify 'Research journal publications'  got=research
+  PASS  classify 'Academic calendar 2026-27'  got=academic-calendar
+  PASS  classify 'Annual cultural fest 2026'  got=events
+  PASS  classify 'Student grievance helpdesk'  got=student-services
+  PASS  classify 'Anti-ragging policy PDF'  got=policies
+  PASS  classify 'Download application form'  got=downloads
+  PASS  unknown fallback
+-- web_crawler: bounded same-domain crawl --
+  PASS  same domain true
+  PASS  external rejected
+  PASS  normalize strips fragment
+2026-09-17T09:24:22 | INFO     | cus_ai | robots.txt for 127.0.0.1:51394 disallows 1 paths
+2026-09-17T09:24:22 | INFO     | cus_ai | Crawl finished: 4 results, 4 visited
+  PASS  crawl discovered root  ['http://127.0.0.1:51394/', 'http://127.0.0.1:51394/admissions', 'http://127.0.0.1:51394/admissions/applications', 'http://127.0.0.1:51394/brochure.pdf']
+  PASS  crawl followed same-domain
+  PASS  crawl found nested page
+  PASS  crawl did NOT follow external
+  PASS  crawl skipped robots /admin
+  PASS  no duplicate urls
+  PASS  PDF discovered + downloaded
+  PASS  html text extracted
+-- web_engine: incremental sync lifecycle --
+2026-09-17T09:24:24 | INFO     | cus_ai | robots.txt for 127.0.0.1:51404 disallows 1 paths
+2026-09-17T09:24:26 | INFO     | cus_ai | Crawl finished: 5 results, 5 visited
+EOF marker not found
+2026-09-17T09:24:26 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+EOF marker not found
+2026-09-17T09:24:26 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+2026-09-17T09:24:26 | INFO     | cus_ai | Website sync completed: 5 new, 0 updated, 0 unchanged, 0 archived, 0 failed
+  PASS  run1: pages created  n=5
+  PASS  run1: new counted  5
+  PASS  run1: all new  ['new', 'new', 'new', 'new', 'new']
+  PASS  run1: version 1
+  PASS  run1: run row recorded
+2026-09-17T09:24:27 | INFO     | cus_ai | robots.txt for 127.0.0.1:51404 disallows 1 paths
+2026-09-17T09:24:29 | INFO     | cus_ai | Crawl finished: 5 results, 5 visited
+EOF marker not found
+2026-09-17T09:24:29 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+EOF marker not found
+2026-09-17T09:24:29 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+2026-09-17T09:24:29 | INFO     | cus_ai | Website sync completed: 0 new, 0 updated, 5 unchanged, 0 archived, 0 failed
+  PASS  run2: zero new  0
+  PASS  run2: unchanged counted  5
+  PASS  run2: no version growth
+2026-09-17T09:24:30 | INFO     | cus_ai | robots.txt for 127.0.0.1:51404 disallows 1 paths
+2026-09-17T09:24:32 | INFO     | cus_ai | Crawl finished: 5 results, 5 visited
+EOF marker not found
+2026-09-17T09:24:32 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+EOF marker not found
+2026-09-17T09:24:32 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+2026-09-17T09:24:32 | INFO     | cus_ai | Website sync completed: 0 new, 1 updated, 4 unchanged, 0 archived, 0 failed
+  PASS  run3: updated counted  1
+  PASS  run3: page marked updated  updated
+  PASS  run3: version bumped  v=2
+  PASS  run3: old snapshot archived  n=1
+  PASS  run3: nothing archived  0
+2026-09-17T09:24:33 | INFO     | cus_ai | robots.txt for 127.0.0.1:51404 disallows 1 paths
+2026-09-17T09:24:34 | INFO     | cus_ai | Crawl finished: 3 results, 3 visited
+EOF marker not found
+2026-09-17T09:24:34 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+2026-09-17T09:24:34 | INFO     | cus_ai | Website sync completed: 0 new, 1 updated, 2 unchanged, 2 archived, 0 failed
+  PASS  run4: disappeared page archived  archived
+  PASS  run4: archived counted  2
+  PASS  nothing deleted
+-- duplicate detection + admin ops --
+2026-09-17T09:24:35 | INFO     | cus_ai | robots.txt for 127.0.0.1:54892 disallows 1 paths
+2026-09-17T09:24:36 | INFO     | cus_ai | Crawl finished: 3 results, 3 visited
+EOF marker not found
+2026-09-17T09:24:36 | WARNING  | cus_ai | Document parse failed (pdf): 422: Could not read PDF: Stream has ended unexpectedly
+2026-09-17T09:24:36 | INFO     | cus_ai | Website sync completed: 3 new, 0 updated, 0 unchanged, 3 archived, 0 failed
+  PASS  duplicate group detected  {'duplicate_groups': 3, 'duplicate_pages': 4, 'groups': [[{'id': '9c5c3712-21a1-4a8f-bbb8-22a33ee13376', 'url': 'http://127.0.0.1:51404/', 'base_url': 'http://127.0.0.1:51404/', 'title': 'Home - CU', 'category': 'ambiguous', 'content_type': 'html', 'content_hash': '3a16637bec9083f94a4c453ccd3227e55516694be95c43dda9e1b003861ddc25', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 2, 'status': 'archived', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no classification signal'], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': '127.0.0.1:51404', 'page_count': None, 'table_like': False, 'extracted_chars': 37}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 37, 'first_seen': '2026-09-17T03:54:26.344665', 'last_synced': '2026-09-17T03:54:36.659012', 'archived_at': '2026-09-17T03:54:36.659000', 'last_error': None}, {'id': '83d832b0-3729-462d-ba9a-0d8708358654', 'url': 'http://127.0.0.1:54892/', 'base_url': 'http://127.0.0.1:54892/', 'title': 'Home - CU', 'category': 'ambiguous', 'content_type': 'html', 'content_hash': '3a16637bec9083f94a4c453ccd3227e55516694be95c43dda9e1b003861ddc25', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no classification signal'], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': '127.0.0.1:54892', 'page_count': None, 'table_like': False, 'extracted_chars': 37}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 37, 'first_seen': '2026-09-17T03:54:36.560610', 'last_synced': '2026-09-17T03:54:36.560617', 'archived_at': None, 'last_error': None}], [{'id': '5e490601-14ab-480a-94c9-959e2634bd26', 'url': 'http://127.0.0.1:51404/admissions', 'base_url': 'http://127.0.0.1:51404/', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': 'html', 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 4, 'status': 'archived', 'document_id': None, 'doc_type': 'knowledge', 'classification_status': 'verified', 'classification_confidence': {'band': 'high', 'score': 80}, 'classification_signals': ["knowledge category 'admissions' matched"], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': 'admissions', 'page_count': None, 'table_like': False, 'extracted_chars': 55}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:26.366858', 'last_synced': '2026-09-17T03:54:36.680630', 'archived_at': '2026-09-17T03:54:36.680621', 'last_error': None}, {'id': 'd75f46ba-8264-4fba-a6d7-17a9bd966547', 'url': 'http://127.0.0.1:54892/admissions', 'base_url': 'http://127.0.0.1:54892/', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': 'html', 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'knowledge', 'classification_status': 'verified', 'classification_confidence': {'band': 'high', 'score': 80}, 'classification_signals': ["knowledge category 'admissions' matched"], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': 'admissions', 'page_count': None, 'table_like': False, 'extracted_chars': 55}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:36.610481', 'last_synced': '2026-09-17T03:54:36.610488', 'archived_at': None, 'last_error': None}, {'id': '54daf16e-539f-4765-bd77-a14438b3b414', 'url': 'http://127.0.0.1:54892/mirror', 'base_url': 'http://127.0.0.1:54892', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': None, 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': None, 'classification_status': 'draft', 'classification_confidence': None, 'classification_signals': None, 'doc_meta': None, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:36.707423', 'last_synced': None, 'archived_at': None, 'last_error': None}], [{'id': '7c721296-39e2-4fcf-8337-afcb297bc1eb', 'url': 'http://127.0.0.1:51404/brochure.pdf', 'base_url': 'http://127.0.0.1:51404/', 'title': 'brochure.pdf', 'category': 'ambiguous', 'content_type': 'document', 'content_hash': '04a1c5702bdf419f6c475abccb16a2e0d206a48c6f247ffabed1bda94a62e198', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 2, 'status': 'archived', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no confident official category'], 'doc_meta': {'content_type': 'pdf', 'mime': 'application/pdf', 'size_bytes': 28, 'sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'title': 'brochure.pdf', 'page_count': None, 'table_like': None, 'extracted_chars': 0}, 'raw_path': 'e72b179b09754b87bb64aab517dddfdd.pdf', 'raw_sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'raw_size': 28, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 0, 'first_seen': '2026-09-17T03:54:26.853700', 'last_synced': '2026-09-17T03:54:36.670784', 'archived_at': '2026-09-17T03:54:36.670777', 'last_error': None}, {'id': '114eb7da-6fad-455d-823b-0c279f394457', 'url': 'http://127.0.0.1:54892/brochure.pdf', 'base_url': 'http://127.0.0.1:54892/', 'title': 'brochure.pdf', 'category': 'ambiguous', 'content_type': 'document', 'content_hash': '04a1c5702bdf419f6c475abccb16a2e0d206a48c6f247ffabed1bda94a62e198', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no confident official category'], 'doc_meta': {'content_type': 'pdf', 'mime': 'application/pdf', 'size_bytes': 28, 'sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'title': 'brochure.pdf', 'page_count': None, 'table_like': None, 'extracted_chars': 0}, 'raw_path': '581de2c398a5486188225dd280442d0c.pdf', 'raw_sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'raw_size': 28, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 0, 'first_seen': '2026-09-17T03:54:36.636535', 'last_synced': '2026-09-17T03:54:36.636588', 'archived_at': None, 'last_error': None}]]}
+  PASS  duplicate page counted  {'duplicate_groups': 3, 'duplicate_pages': 4, 'groups': [[{'id': '9c5c3712-21a1-4a8f-bbb8-22a33ee13376', 'url': 'http://127.0.0.1:51404/', 'base_url': 'http://127.0.0.1:51404/', 'title': 'Home - CU', 'category': 'ambiguous', 'content_type': 'html', 'content_hash': '3a16637bec9083f94a4c453ccd3227e55516694be95c43dda9e1b003861ddc25', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 2, 'status': 'archived', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no classification signal'], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': '127.0.0.1:51404', 'page_count': None, 'table_like': False, 'extracted_chars': 37}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 37, 'first_seen': '2026-09-17T03:54:26.344665', 'last_synced': '2026-09-17T03:54:36.659012', 'archived_at': '2026-09-17T03:54:36.659000', 'last_error': None}, {'id': '83d832b0-3729-462d-ba9a-0d8708358654', 'url': 'http://127.0.0.1:54892/', 'base_url': 'http://127.0.0.1:54892/', 'title': 'Home - CU', 'category': 'ambiguous', 'content_type': 'html', 'content_hash': '3a16637bec9083f94a4c453ccd3227e55516694be95c43dda9e1b003861ddc25', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no classification signal'], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': '127.0.0.1:54892', 'page_count': None, 'table_like': False, 'extracted_chars': 37}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 37, 'first_seen': '2026-09-17T03:54:36.560610', 'last_synced': '2026-09-17T03:54:36.560617', 'archived_at': None, 'last_error': None}], [{'id': '5e490601-14ab-480a-94c9-959e2634bd26', 'url': 'http://127.0.0.1:51404/admissions', 'base_url': 'http://127.0.0.1:51404/', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': 'html', 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 4, 'status': 'archived', 'document_id': None, 'doc_type': 'knowledge', 'classification_status': 'verified', 'classification_confidence': {'band': 'high', 'score': 80}, 'classification_signals': ["knowledge category 'admissions' matched"], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': 'admissions', 'page_count': None, 'table_like': False, 'extracted_chars': 55}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:26.366858', 'last_synced': '2026-09-17T03:54:36.680630', 'archived_at': '2026-09-17T03:54:36.680621', 'last_error': None}, {'id': 'd75f46ba-8264-4fba-a6d7-17a9bd966547', 'url': 'http://127.0.0.1:54892/admissions', 'base_url': 'http://127.0.0.1:54892/', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': 'html', 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'knowledge', 'classification_status': 'verified', 'classification_confidence': {'band': 'high', 'score': 80}, 'classification_signals': ["knowledge category 'admissions' matched"], 'doc_meta': {'content_type': 'text/html', 'mime': None, 'size_bytes': None, 'sha256': None, 'title': 'admissions', 'page_count': None, 'table_like': False, 'extracted_chars': 55}, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:36.610481', 'last_synced': '2026-09-17T03:54:36.610488', 'archived_at': None, 'last_error': None}, {'id': '54daf16e-539f-4765-bd77-a14438b3b414', 'url': 'http://127.0.0.1:54892/mirror', 'base_url': 'http://127.0.0.1:54892', 'title': 'Admissions 2027', 'category': 'admissions', 'content_type': None, 'content_hash': '00315e6f5adcf17c91eaaf73bf1fc227cb0e7459761ebefece8eb2170a7e474b', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': None, 'classification_status': 'draft', 'classification_confidence': None, 'classification_signals': None, 'doc_meta': None, 'raw_path': None, 'raw_sha256': None, 'raw_size': None, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 55, 'first_seen': '2026-09-17T03:54:36.707423', 'last_synced': None, 'archived_at': None, 'last_error': None}], [{'id': '7c721296-39e2-4fcf-8337-afcb297bc1eb', 'url': 'http://127.0.0.1:51404/brochure.pdf', 'base_url': 'http://127.0.0.1:51404/', 'title': 'brochure.pdf', 'category': 'ambiguous', 'content_type': 'document', 'content_hash': '04a1c5702bdf419f6c475abccb16a2e0d206a48c6f247ffabed1bda94a62e198', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 2, 'status': 'archived', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no confident official category'], 'doc_meta': {'content_type': 'pdf', 'mime': 'application/pdf', 'size_bytes': 28, 'sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'title': 'brochure.pdf', 'page_count': None, 'table_like': None, 'extracted_chars': 0}, 'raw_path': 'e72b179b09754b87bb64aab517dddfdd.pdf', 'raw_sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'raw_size': 28, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 0, 'first_seen': '2026-09-17T03:54:26.853700', 'last_synced': '2026-09-17T03:54:36.670784', 'archived_at': '2026-09-17T03:54:36.670777', 'last_error': None}, {'id': '114eb7da-6fad-455d-823b-0c279f394457', 'url': 'http://127.0.0.1:54892/brochure.pdf', 'base_url': 'http://127.0.0.1:54892/', 'title': 'brochure.pdf', 'category': 'ambiguous', 'content_type': 'document', 'content_hash': '04a1c5702bdf419f6c475abccb16a2e0d206a48c6f247ffabed1bda94a62e198', 'http_status': 200, 'etag': None, 'last_modified': None, 'version': 1, 'status': 'new', 'document_id': None, 'doc_type': 'ambiguous', 'classification_status': 'pending_review', 'classification_confidence': {'band': 'low', 'score': 0}, 'classification_signals': ['no confident official category'], 'doc_meta': {'content_type': 'pdf', 'mime': 'application/pdf', 'size_bytes': 28, 'sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'title': 'brochure.pdf', 'page_count': None, 'table_like': None, 'extracted_chars': 0}, 'raw_path': '581de2c398a5486188225dd280442d0c.pdf', 'raw_sha256': 'ad040c8b8a5d74f7cdae419f6491702f68ec00f5c208416af3de01681c23417d', 'raw_size': 28, 'reviewed_by': None, 'reviewed_at': None, 'review_note': None, 'char_len': 0, 'first_seen': '2026-09-17T03:54:36.636535', 'last_synced': '2026-09-17T03:54:36.636588', 'archived_at': None, 'last_error': None}]]}
+  PASS  status total_pages  9
+  PASS  list_pages works
+  PASS  list_runs works
+  PASS  list_versions works
+-- RAG integration: source_url attribution --
+2026-09-17T09:24:38 | INFO     | cus_ai | robots.txt for 127.0.0.1:54901 disallows 1 paths
+2026-09-17T09:24:39 | INFO     | cus_ai | Crawl finished: 2 results, 2 visited
+2026-09-17T09:24:42 | INFO     | cus_ai | Deleted vectors for document f298cc6f-1ace-4d5a-b1b0-fe882f0bbf3b
+2026-09-17T09:24:42 | INFO     | cus_ai | Skipped 1 duplicate chunks for f298cc6f-1ace-4d5a-b1b0-fe882f0bbf3b
+2026-09-17T09:24:42 | INFO     | cus_ai | Stored 0 chunks for document f298cc6f-1ace-4d5a-b1b0-fe882f0bbf3b (1 skipped)
+2026-09-17T09:24:42 | INFO     | cus_ai | Deleted vectors for document fbbde274-577d-442e-8ce4-b7e1a958c43a
+2026-09-17T09:24:42 | INFO     | cus_ai | Stored 1 chunks for document fbbde274-577d-442e-8ce4-b7e1a958c43a (0 skipped)
+2026-09-17T09:24:42 | INFO     | cus_ai | Website sync completed: 2 new, 0 updated, 0 unchanged, 4 archived, 0 failed
+  PASS  page indexed into RAG  new
+  PASS  chunks carry source_url  {'', 'http://127.0.0.1:54229/', 'http://127.0.0.1:54901/rag', 'https://www.cusrinagar.edu.in/FolderManager/Downloads/ScehemeRegulationsofCUS2021NEP.pdf', 'https://www.cusrinagar.edu.in/FolderManager/Downloads/CVMobin.pdf'}
+2026-09-17T09:24:42 | INFO     | cus_ai | Deleted vectors for document fbbde274-577d-442e-8ce4-b7e1a958c43a
+
+SUMMARY
+  Passed: 66/66
+  Failed: 0/66

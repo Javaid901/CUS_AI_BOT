@@ -15,6 +15,12 @@ import tempfile
 _TEST_ROOT = tempfile.mkdtemp(prefix="cus_test_env_")
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TEST_ROOT, 'test.db')}"
 
+# Phase 3C-5: the main suite must stay byte-for-byte single-process. Force
+# REDIS_URL empty (overriding any developer .env) so the Redis layer is
+# disabled for the whole deterministic suite. Redis integration tests opt in
+# via TEST_REDIS_URL + runtime.configure().
+os.environ["REDIS_URL"] = ""
+
 # Website sync runtime state must stay out of the tracked production file.
 os.environ["WEBSITE_SYNC_STATE_FILE"] = os.path.join(_TEST_ROOT, "website_sync_state.json")
 

@@ -40,6 +40,7 @@ from app.orchestrator.context import (
     PROGRAMME_ALIASES,
     ConversationContext,
     clear_college_context,
+    resolve_followup,
     update_context_for_college,
 )
 from app.orchestrator.extractor import extract_entities
@@ -50,7 +51,9 @@ from app.orchestrator.state import (
     ConversationState,
     clear_state,
     get_state,
+    persist_current,
     push_breadcrumb,
+    set_state,
 )
 from app.student.gate import (
     auth_form_event,
@@ -97,9 +100,39 @@ async def process(
     The access decision is still made solely by `student_session`; the hint
     only changes the sign-in message so a logged-out student is never falsely
     told their session newly "expired".
+
+    Phase 3C-5: acquires the conversation state, delegates execution to
+    `_process`, then ALWAYS persists the (possibly mutated) state afterwards —
+    on every early return and during cancellation — so multi-worker
+    deployments share each turn's result through Redis.
+    """
+    state = await get_state(chat_id)
+    try:
+        async for event in _process(
+            db, user_id, message, chat_id, state,
+            student_session=student_session,
+            student_auth_kind=student_auth_kind,
+        ):
+            yield event
+    finally:
+        await persist_current(chat_id)
+
+
+async def _process(
+    db: Session,
+    user_id: str,
+    message: str,
+    chat_id: str,
+    state: ConversationState,
+    student_session: dict[str, Any] | None = None,
+    student_auth_kind: str = "none",
+) -> AsyncGenerator[dict[str, Any], None]:
+    """
+    Execution core — same flow as `process` but operating on a caller-supplied
+    conversation `state` (the working copy). Called by `process`, which owns
+    state acquisition and persistence.
     """
     with stage_timer("total"):
-        state = await get_state(chat_id)
         text = message.strip()
         ctx = state.context
 
@@ -108,9 +141,28 @@ async def process(
             entities = extract_entities(text)
         log_stage("entity_extraction", f"prog={entities.programme} topic={entities.topic}")
 
+        # ----- Stage 1a: Deterministic follow-up resolution -----
+        # Resolve anaphoric / exam references to previously discussed entities
+        # BEFORE planning ("when are those exams?" -> "<programme> semester N
+        # date sheet exam schedule"). Only the planner input is rewritten; the
+        # user's original message is kept for display and retrieval. Pure rules,
+        # no LLM, no I/O.
+        planning_text = text
+        try:
+            resolution = resolve_followup(text, entities, ctx)
+            if resolution.planning_text:
+                planning_text = resolution.planning_text
+                entities = extract_entities(planning_text)
+                log_stage(
+                    "followup_resolution",
+                    f"kind={resolution.kind} -> {planning_text}",
+                )
+        except Exception:
+            planning_text = text
+
         # ----- Stage 1b: Catalogue picker continuation -----
         # A previous catalogue turn (scheme picker, level picker, semester /
-        # minor / curriculum-doc selector) left state.catalogue_pending. The
+# minor / curriculum-doc selector) left state.catalogue_pending. The
         # next message is that picker's option id (a scheme UUID, "level:ug",
         # "menu:fee", "semester:2", ...) — continue the flow directly instead
         # of planning it as free text.
@@ -120,8 +172,7 @@ async def process(
                     from app.catalogue.backend import continue_pending
                     events = await continue_pending(db, user_id, text, chat_id, state)
                 except Exception as exc:
-                    from app.utils.logging import log as _log
-                    _log.error("catalogue continue failed chat=%s: %s", chat_id, exc)
+                    logger.error("catalogue continue failed chat=%s: %s", chat_id, exc)
                     events = None
             if events:
                 for event in events:
@@ -136,6 +187,33 @@ async def process(
         # request directly ("MCA" after "fee structure of which programme?"
         # must answer MCA fees, not show the MCA overview).
         if state.slot_topic and not entities.topic:
+            # Handle fee_type option selection (user clicked "programme_fee" or "examination_fee")
+            slot_request = state.slot_request or {}
+            if slot_request.get("slot") == "fee_type":
+                text_lower = text.strip().lower()
+                fee_type = None
+                if text_lower == "programme_fee" or "programme" in text_lower or "course" in text_lower or "tuition" in text_lower or "admission" in text_lower:
+                    fee_type = "programme"
+                elif text_lower == "examination_fee" or "examination" in text_lower or "exam" in text_lower:
+                    fee_type = "examination"
+                if fee_type:
+                    ctx.fee_type = fee_type
+                    state.slot_topic = None
+                    state.slot_request = None
+                    # Re-plan with updated context
+                    from app.orchestrator.extractor import extract_entities as _extract_entities
+                    new_entities = _extract_entities(text)
+                    from app.orchestrator.planner import plan as _plan
+                    new_plan = await asyncio.to_thread(_plan, text, ctx, chat_id, new_entities)
+                    async for event in _execute_plan(
+                        db, user_id, text, chat_id, state, ctx, new_entities, new_plan,
+                        planner_latency_ms=0,
+                        student_session=student_session,
+                        student_auth_kind=student_auth_kind,
+                    ):
+                        yield event
+                    return
+
             resolved_slot = await _try_resolve_slot_fill(db, text, chat_id, state)
             if resolved_slot is not None:
                 async for event in resolved_slot:
@@ -148,14 +226,20 @@ async def process(
 
 
         # ----- Stage 4: Planner -----
+        # The planner runs the intent classifier (all-MiniLM embedding encode +
+        # numpy cosine) — 20-100ms of CPU-bound work that must never run on the
+        # FastAPI event loop. Offload the whole sync call to a worker thread.
+        # Cancellation-safety: to_thread's executor keeps running after a
+        # CancelledError (the plan itself is pure & request-scoped), and the
+        # awaited task finishes its bookkeeping without any shared state.
         plan_t0 = time.perf_counter()
-        planner_plan = plan(text, ctx, chat_id, entities)
+        planner_plan = await asyncio.to_thread(plan, planning_text, ctx, chat_id, entities)
         planner_latency_ms = int((time.perf_counter() - plan_t0) * 1000)
         log_stage("planning", f"action={planner_plan.action} target={planner_plan.target} confidence={planner_plan.confidence:.2f} reason={planner_plan.reason} ({planner_latency_ms}ms)")
 
         # ----- Stage 5: Execute plan -----
         async for event in _execute_plan(
-            db, user_id, text, chat_id, state, ctx, entities, planner_plan,
+            db, user_id, planning_text, chat_id, state, ctx, entities, planner_plan,
             planner_latency_ms=planner_latency_ms,
             student_session=student_session,
             student_auth_kind=student_auth_kind,
@@ -257,6 +341,10 @@ async def _execute_plan(
         response = plan_result.response
         if response:
             _update_context_from_plan(ctx, plan_result)
+            # "← Back" leaves the selected Model Paper flow: the single-document
+            # scope must not survive, or later browsing would stay pinned to it.
+            if getattr(entities, "is_back", False) and ctx.domain == "examination":
+                clear_exam_scope(ctx)
             await _update_nav_breadcrumb(chat_id, state, response, message)
             _add_context_to_response(response, ctx)
             yield response
@@ -288,6 +376,13 @@ async def _execute_plan(
             query_original=ctx.query_original,
             query_corrected=ctx.query_corrected,
         )))
+        return
+
+    if action == "multi_source":
+        async for event in _handle_multi_source(
+            db, user_id, message, chat_id, state, ctx, entities, plan_result
+        ):
+            yield event
         return
 
     if action == "clarify":
@@ -487,6 +582,14 @@ async def _execute_plan(
             yield event
         return
 
+    if action == "official_documents":
+        # Student-facing official notifications / other official documents,
+        # served ONLY from published + verified UniversityDocument rows.
+        extra = plan_result.extra or {}
+        async for event in _handle_official_documents(db, chat_id, state, extra):
+            yield event
+        return
+
     if action == "comparison":
         # Side-by-side programme comparison — structured catalogue data when
         # both programmes exist, else scoped knowledge retrieval.
@@ -494,9 +597,20 @@ async def _execute_plan(
             yield event
         return
 
+    if action == "examination":
+        # Dedicated Examinations services (Model Papers / Exam Fee Structure /
+        # Division Improvement). Facts come ONLY from verified official corpus
+        # rows or an honest not-available message — never from the LLM.
+        _update_context_from_plan(ctx, plan_result)
+        # Persist context immediately so follow-up turns see the updated fee_type
+        # even if the examination handler takes a long time or the client disconnects.
+        await set_state(chat_id, state)
+        async for event in _handle_examination_service(db, chat_id, state, plan_result):
+            yield event
+        return
+
     # Fallback (unknown action) — never silently dead-end
-    from app.utils.logging import log as _log
-    _log.warning("unhandled planner action=%s target=%s — falling back to knowledge", action, plan_result.target)
+    logger.warning("unhandled planner action=%s target=%s — falling back to knowledge", action, plan_result.target)
     state.last_intent = "knowledge"
     async for event in run_chat(db, user_id, message, chat_id):
         yield event
@@ -519,9 +633,41 @@ async def _try_resolve_slot_fill(
     eligibility, ...) and the user now names a programme, this synthesizes
     "<programme> <topic>" and runs it through the same catalogue detector so
     the ORIGINAL request is answered directly.
+
+    Also handles "fee_type" slot: user replies "programme fee" or "examination fee".
     """
     ctx = state.context
     pending_topic = state.slot_topic
+    slot_request = state.slot_request or {}
+    slot_field = slot_request.get("slot", "programme")
+
+    # Handle fee_type slot
+    if slot_field == "fee_type":
+        # User's reply should indicate which fee type
+        fee_type = None
+        text_lower = text.strip().lower()
+        if "programme" in text_lower or "course" in text_lower or "tuition" in text_lower or "admission" in text_lower or "programme_fee" in text_lower:
+            fee_type = "programme"
+        elif "examination" in text_lower or "exam" in text_lower or "examination_fee" in text_lower:
+            fee_type = "examination"
+        if fee_type is None:
+            return None
+        # Store fee_type in context so it's available for the re-planned request
+        ctx.fee_type = fee_type
+        state.slot_topic = None
+        state.slot_request = None
+        # Re-plan with the original message + fee type context
+        # The planner will now see ctx.fee_type and route accordingly
+        # We synthesize a new message that includes the fee type for clarity
+        synthetic_message = f"{text} {pending_topic.replace('_', ' ')}"
+        # Run planner again with updated context
+        from app.orchestrator.extractor import extract_entities as _extract_entities
+        new_entities = _extract_entities(synthetic_message)
+        from app.orchestrator.planner import plan as _plan
+        new_plan = await asyncio.to_thread(_plan, synthetic_message, ctx, chat_id, new_entities)
+        return _execute_plan(db, "slot_resolve", synthetic_message, chat_id, state, ctx, new_entities, new_plan)
+
+    # Original programme slot-fill logic
     try:
         syn_entities = extract_entities(f"{text} {pending_topic.replace('_', ' ')}")
         if not syn_entities.programme and not ctx.programme:
@@ -648,6 +794,120 @@ async def _handle_comparison(
         yield event
 
 
+async def _handle_multi_source(
+    db: Session,
+    user_id: str,
+    message: str,
+    chat_id: str,
+    state: ConversationState,
+    ctx: ConversationContext,
+    entities: Any,
+    plan_result: Any,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Answer a compound question by decomposing it into sub-questions,
+    collecting evidence from multiple university sources and synthesising one
+    grounded answer.
+
+    Honesty rules (no fabrication, no model-memory substitution):
+      * evidence is collected per sub-question from the most authoritative
+        source — structured programme facts, verified examination pages,
+        verified date sheets, or the existing hybrid RAG retriever;
+      * structured data is authoritative, RAG only supplements it;
+      * sub-questions with no evidence are answered with the exact fallback
+        sentence; conflicting sources produce a cautious, non-fabricating
+        answer;
+      * the synthesis LLM runs behind the SAME shared global gate as every
+        other LLM path and streams a validated answer only.
+    """
+    from app.multi_source.decompose import SourceType, SubQuery
+    from app.multi_source.evidence import collect_evidence, validate
+    from app.multi_source.synthesize import synthesize_answer
+    from app.utils.logging import log
+
+    subs_raw = (plan_result.extra or {}).get("multi_source") or []
+    subs = []
+    for raw in subs_raw:
+        try:
+            subs.append(SubQuery(text=str(raw.get("text")), source=SourceType(str(raw.get("source")))))
+        except (ValueError, TypeError) as exc:
+            log.warning("multi-source plan carried an invalid sub-query: %s", exc)
+    original_query = (plan_result.extra or {}).get("original_query") or message
+
+    if not subs:
+        # Defensive: a malformed plan must never dead-end the conversation.
+        _update_context_from_rag(ctx, entities, message)
+        state.last_intent = "knowledge"
+        async for event in run_chat(db, user_id, message, chat_id, context=_build_rag_context(ctx, entities)):
+            yield event
+        return
+
+    rag_ctx = _build_rag_context(ctx, entities)
+    t0 = time.perf_counter()
+
+    try:
+        pool = await collect_evidence(db, subs, entities, ctx, rag_ctx=rag_ctx)
+    except Exception as exc:
+        log.error("multi-source evidence collection failed chat=%s: %s", chat_id, exc)
+        yield {
+            "type": "error",
+            "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        return
+
+    collection_ms = int((time.perf_counter() - t0) * 1000)
+    validation = validate(pool, subs)
+
+    # Minimal provenance: one cited entry per distinct evidence source.
+    cited: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in pool.items:
+        key = (item.title, item.source.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        cited.append({
+            "document_title": item.title or item.source.value,
+            "source": item.source.value,
+            "score": item.relevance,
+        })
+
+    try:
+        async for text in synthesize_answer(original_query, subs, pool, chat_id=chat_id):
+            yield {"type": "token", "text": text}
+    except Exception as exc:
+        log.error("multi-source synthesis failed chat=%s: %s", chat_id, exc)
+        yield {
+            "type": "error",
+            "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": cited}
+        return
+
+    yield {
+        "type": "done",
+        "chat_id": chat_id,
+        "cited_chunks": cited,
+        "multi_source_debug": {
+            "sub_queries": [s.as_dict() for s in subs],
+            "evidence_items": [i.as_dict() for i in pool.items],
+            "validation": validation.as_dict(),
+            "evidence_latency_ms": collection_ms,
+        },
+    }
+    state.last_intent = "knowledge"
+    asyncio.ensure_future(collect_event(
+        anon_session_id=_anon_session_id(chat_id),
+        conversation_id=chat_id,
+        planner_action="multi_source",
+        response_source="multi_source",
+        route_chosen="multi_source",
+        detected_programme=entities.programme or ctx.programme,
+        detected_topic=entities.topic or ctx.topic,
+        conversation_completed=True,
+    ))
+
+
 async def _handle_university_notices(
     db: Session,
     chat_id: str,
@@ -753,6 +1013,269 @@ async def _handle_university_notices(
             "_query": {"via": "university_notices"},
         }
         yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+
+
+# Safe upper bound for a single official-document answer. Rows are already
+# gated to verified + published; the limit only bounds the rendered list.
+_OFFICIAL_DOCUMENTS_LIMIT = 50
+
+
+async def _handle_official_documents(
+    db: Session,
+    chat_id: str,
+    state: ConversationState,
+    intent: dict[str, Any],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Serve official notifications / other official documents (Rule 3ab).
+
+    `intent` is the planner's extra dict. Only published + verified
+    UniversityDocument rows are ever returned; when nothing matches, the
+    fallback is an honest not-available message — never an LLM guess and never
+    a RAG chunk rendered as an official document.
+    """
+    from app.university_documents import service as _ud
+
+    try:
+        doc_types = intent.get("doc_types") or list(_ud.PUBLIC_OFFICIAL_DOC_TYPES)
+        programme = (intent.get("programme") or "").strip().lower() or None
+        q = (intent.get("q") or "").strip() or None
+        docs = _ud.list_published_documents(
+            db,
+            doc_types=doc_types,
+            q=q,
+            programme=programme,
+            limit=_OFFICIAL_DOCUMENTS_LIMIT,
+        )
+        cards = [_ud.document_public_dto(d) for d in docs]
+        if cards:
+            message = (
+                "Here are the published official documents"
+                + (f" for {programme.upper()}" if programme else "")
+                + ". Open a document to view or download the official file."
+            )
+        else:
+            message = (
+                "I don't have information available on official documents"
+                + (f" for {programme.upper()}" if programme else "")
+                + " right now. The university publishes these only after review; "
+                "please check the official website or ask again later."
+            )
+        yield {
+            "type": "official_document_list",
+            "documents": cards,
+            "message": message,
+            "_query": {"via": "official_documents"},
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        state.last_intent = "official_documents"
+    except Exception:
+        yield {
+            "type": "official_document_list",
+            "documents": [],
+            "message": "I couldn't fetch the official documents right now. Please try again in a moment.",
+            "_query": {"via": "official_documents"},
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+
+
+# Honest not-available texts for the official-source-only fee / division
+# services (planner action `examination`). They are the fallback contract: no
+# fabricated values, and the gap is reported so a future verified official
+# source lights a structured path up automatically.
+_EXAM_FEE_UNAVAILABLE = (
+    "I don't have information available on the official examination fee "
+    "structure yet. Examination fees are set by the University Finance Office; "
+    "please check the published notifications or contact the Controller of "
+    "Examinations."
+)
+
+_DIVISION_IMPROVEMENT_UNAVAILABLE = (
+    "I don't have information available on the official division improvement "
+    "policy yet. Please check the university's published policy documents or "
+    "contact the Controller of Examinations."
+)
+
+# Strict no-substitution message (spec): when a typed Model Paper request has
+# explicit filters (programme/semester/subject/batch/academic year) but no
+# matching verified paper exists, the bot MUST respond EXACTLY this text — it
+# must never substitute a different programme's paper.
+_MODEL_PAPER_NO_SUBSTITUTION = "I don't have information available."
+
+
+def _model_paper_list_message(constraints: dict[str, Any]) -> str:
+    """Human-readable filter descriptor for a constrained model-paper list."""
+    parts: list[str] = []
+    for key, label in (
+        ("programme", None),
+        ("semester", "semester {v}"),
+        ("subject", None),
+        ("batch", "batch {v}"),
+        ("academic_year", "academic year {v}"),
+    ):
+        value = constraints.get(key)
+        if value not in (None, ""):
+            parts.append(label.format(v=value) if label else str(value).upper() if key == "programme" else str(value).title())
+    if not parts:
+        return "Here are the official model papers available for review. Open a paper to view or download it."
+    return f"Here are the official model papers for {', '.join(parts)}. Open a paper to view or download it."
+
+
+def clear_exam_scope(ctx: ConversationContext) -> None:
+    """Clear any single-paper model-paper scope (selection + document scope)."""
+    ctx.selected_model_paper_id = None
+    ctx.selected_document_id = None
+    ctx.exam_document_ids = None
+
+
+def apply_model_paper_selection(ctx: ConversationContext, paper: dict[str, Any]) -> None:
+    """Server-side single-paper selection: scope RAG to exactly ONE document.
+
+    Uses the card dict returned by ``examination.service.select_model_paper``
+    — i.e. only verified, live, on-disk papers. The client-supplied page ID is
+    never trusted; the resolved document_id belongs to the validated paper.
+    """
+    doc_id = paper.get("document_id")
+    ctx.domain = "examination"
+    ctx.selected_model_paper_id = str(paper.get("id") or "")
+    ctx.selected_document_id = doc_id
+    ctx.exam_document_ids = [doc_id] if doc_id else None
+
+
+async def _handle_examination_service(
+    db: Session,
+    chat_id: str,
+    state: ConversationState,
+    plan_result: Any,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Serve the Examinations dedicated services (planner action `examination`).
+
+    ``model_papers`` renders a ``model_paper_list`` from verified model-paper
+    corpus rows only (see app.examination.service); fee / division render a
+    structured detail when a verified official source exists, otherwise an
+    honest not-available token. The LLM produces no examination facts.
+
+    The navigation path is pushed deterministically so the "← Back" chip
+    returns to the Examinations menu for BOTH chip clicks and typed messages.
+    """
+    from app.chat.intent_router import advance_path, get_nav_path
+    from app.examination import service as exam_svc
+
+    extra = plan_result.extra or {}
+    target = plan_result.target or "model_papers"
+    ctx = state.context
+
+    try:
+        path = get_nav_path(chat_id)
+        if not path or path[-1] != "examination":
+            advance_path(chat_id, "examination")
+        advance_path(chat_id, target)
+    except Exception:
+        pass
+
+    ctx.domain = "examination"
+
+    # Any new Examinations service request (a fresh list, exam-fee or
+    # division-Improvement lookup) deliberately ends an earlier single-paper
+    # scope. Without this, an old selection would keep leaking into follow-up
+    # RAG for papers never chosen in front of the student (spec: scope is
+    # established ONLY by an explicit single-paper selection).
+    clear_exam_scope(ctx)
+
+    if target == "model_papers":
+        extra = plan_result.extra or {}
+        constraints = {
+            "programme": (extra.get("programme") or "").strip().lower() or None,
+            "semester": extra.get("semester") or None,
+            "subject": (extra.get("subject") or "").strip() or None,
+            "batch": (extra.get("batch") or "").strip() or None,
+            "academic_year": (extra.get("academic_year") or "").strip() or None,
+        }
+        # Bear-bare filters must be silent when the values are empty strings.
+        constrained = any(v not in (None, "") for v in constraints.values())
+        papers: list[dict[str, Any]] = []
+        try:
+            papers = exam_svc.list_model_papers(db, **constraints)
+        except Exception:
+            papers = []
+        if constrained and not papers:
+            yield {"type": "token", "text": _MODEL_PAPER_NO_SUBSTITUTION}
+            yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+            state.last_intent = "examination"
+            return
+        if papers:
+            cards = [
+                {
+                    "id": p["id"],
+                    "title": p.get("title") or "Model Paper",
+                    "file_url": exam_svc.model_paper_file_url(p["id"]),
+                    # Official metadata fields render ONLY when truly present.
+                    **{k: p[k] for k in ("subject", "programme", "semester",
+                                         "batch", "academic_year", "published_at")
+                       if p.get(k) is not None and str(p.get(k)).strip()},
+                }
+                for p in papers
+            ]
+            message = _model_paper_list_message(constraints) if constrained else (
+                "Here are the official model papers available for review. "
+                "Open a paper to view or download it."
+            )
+            yield {
+                "type": "model_paper_list",
+                "papers": cards,
+                "message": message,
+                "_query": {"via": "examination_service"},
+            }
+        else:
+            yield {
+                "type": "model_paper_list",
+                "papers": [],
+                "message": (
+                    "No verified model papers are available right now. The "
+                    "university publishes model papers only after review; try "
+                    "asking again later."
+                ),
+                "_query": {"via": "examination_service"},
+            }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        state.last_intent = "examination"
+        return
+
+    if target == "fee_structure_exam":
+        try:
+            source = exam_svc.exam_fee_source(db)
+        except Exception:
+            source = None
+        if source:
+            yield {
+                "type": "detail",
+                "title": "Examination Fee Structure",
+                "message": source.get("title", ""),
+                "fields": [{"label": "Source", "value": source.get("url") or "Official notification"}],
+                "context": {"breadcrumbs": ["Examinations", "Examination Fee Structure"]},
+            }
+        else:
+            yield {"type": "token", "text": _EXAM_FEE_UNAVAILABLE}
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        state.last_intent = "examination"
+        return
+
+    # target == "division_improvement"
+    try:
+        source = exam_svc.division_improvement_source(db)
+    except Exception:
+        source = None
+    if source:
+        yield {
+            "type": "detail",
+            "title": "Division Improvement",
+            "message": source.get("title", ""),
+            "fields": [{"label": "Source", "value": source.get("url") or "Official policy"}],
+            "context": {"breadcrumbs": ["Examinations", "Division Improvement"]},
+        }
+    else:
+        yield {"type": "token", "text": _DIVISION_IMPROVEMENT_UNAVAILABLE}
+    yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+    state.last_intent = "examination"
 
 
 def _notice_card(n: Any) -> dict[str, Any]:
@@ -1335,6 +1858,13 @@ def _update_context_from_plan(ctx: ConversationContext, plan_result: Any) -> Non
     """Update context fields based on the executed plan."""
     extra = plan_result.extra or {}
 
+    # Persist fee_type from contract if present
+    contract = extra.get("contract")
+    if isinstance(contract, dict):
+        fee_type = contract.get("fee_type")
+        if fee_type in ("programme", "examination"):
+            ctx.fee_type = fee_type
+
     # College context update from extra data
     college_id = extra.get("college_id")
     if college_id:
@@ -1455,6 +1985,11 @@ def _build_rag_context(ctx: ConversationContext, entities: Any) -> dict[str, Any
             pass
     if getattr(ctx, "catalogue_category", None):
         rag_ctx["category"] = ctx.catalogue_category
+    # Document-scoped follow-ups (e.g. right after a Model Paper list was
+    # shown) restrict retrieval to the conversation's documents — the filter
+    # is applied post-retrieval in chat/service.py.
+    if getattr(ctx, "exam_document_ids", None):
+        rag_ctx["document_ids"] = list(ctx.exam_document_ids)
     rag_ctx["scope"] = "college" if ctx.college else "university"
     return rag_ctx
 
@@ -1470,6 +2005,11 @@ def _update_context_from_rag(ctx: ConversationContext, entities: Any, query: str
     if entities.domain:
         ctx.domain = entities.domain
     ctx.last_document = None
+    # The document scope from a dedicated service (selected Model Paper) is a
+    # deliberate, persistent choice: a RAG follow-up must NOT silently wipe it
+    # (that previously leaked the scope on the very first question). Only an
+    # explicit action — a new list, fee/division service, back-navigation or a
+    # new selection — clears it (see _handle_examination_service / plans).
     ctx.pending_clarification = None
     ctx.clarification_field = None
 
@@ -1503,6 +2043,18 @@ def _build_clarification(ctx: ConversationContext, field: str | None) -> dict[st
                 {"id": "ba", "label": "BA"},
                 {"id": "bsc", "label": "B.Sc"},
                 {"id": "bcom", "label": "B.Com"},
+            ],
+        }
+    if field == "fee_type":
+        programme = ctx.programme or ctx.catalogue_programme_code
+        prog_label = programme.upper() if programme else "the programme"
+        return {
+            "type": "options",
+            "title": "Which fee?",
+            "message": f"Which fee do you mean for {prog_label} — programme/course fee or examination fee?",
+            "options": [
+                {"id": "programme_fee", "label": "Programme / Course Fee"},
+                {"id": "examination_fee", "label": "Examination Fee"},
             ],
         }
     if field == "domain":

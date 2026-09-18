@@ -70,6 +70,7 @@ from app.models.demo_models import (
     XeroxRequest,
 )
 from app.models.sync_source import SyncSource
+from app.models.university_document import UniversityDocument
 from app.models.website_sync import CrawlRun, WebsitePage, WebsitePageVersion
 
 __all__ = [

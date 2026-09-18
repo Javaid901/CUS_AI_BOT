@@ -482,6 +482,85 @@
     addMsg("bot", html);
   }
 
+  function renderModelPaperList(payload) {
+    // Dedicated Model Papers service — cards come ONLY from verified official
+    // corpus rows (server-gated); the board never fabricates a paper. Meta
+    // fields (Programme/Semester/Subject/Batch/Academic Year) render only
+    // when the official metadata actually carries them.
+    var message = payload.message || "";
+    var papers = payload.papers || [];
+    var html = "";
+    if (message) html += "<p>" + escapeHtml(message) + "</p>";
+    if (papers.length) {
+      html += '<div class="notice-list">';
+      papers.forEach(function (p) {
+        var title = String(p.title || "Model Paper");
+        var meta = [];
+        if (p.subject) meta.push("Subject " + String(p.subject));
+        if (p.programme) meta.push("Programme " + String(p.programme).toUpperCase());
+        if (p.semester != null && p.semester !== "") meta.push("Semester " + String(p.semester));
+        if (p.batch) meta.push("Batch " + String(p.batch));
+        if (p.academic_year) meta.push("Academic Year " + String(p.academic_year));
+        html += '<div class="ds-notice-card">';
+        html += '<div class="notice-head">';
+        html += '<span class="nicon" role="img" aria-label="Model paper">📄</span>';
+        html += '<div class="notice-title">' + escapeHtml(title) + "</div>";
+        html += "</div>";
+        if (meta.length) html += '<div class="notice-meta">' + escapeHtml(meta.join(" · ")) + "</div>";
+        html += '<div class="notice-actions">';
+        html += '<a class="chip" target="_blank" rel="noopener" href="' + escapeHtml(String(p.file_url || "")) + '">View Model Paper</a>';
+        html += '<a class="chip" href="' + escapeHtml(String(p.file_url || "")) + '?download=1" download>Download</a>';
+        html += '<button class="chip ask" data-mp-select="1" data-value="' + escapeHtml(String(p.id || "")) + '" title="Ask a follow-up question about this one paper">Ask about this paper</button>';
+        html += "</div></div>";
+      });
+      html += "</div>";
+    } else if (!message) {
+      html += "<p>No verified model papers are available right now.</p>";
+    }
+    html += '<button class="chip back" data-role="option" data-value="back">← Back</button>';
+    addMsg("bot", html);
+  }
+
+  function renderOfficialDocumentList(payload) {
+    // Student-facing Official Notifications / Other Official Documents.
+    // Cards come ONLY from published + verified canonical repository rows
+    // (server-gated); the board never fabricates a document, and meta fields
+    // render only when the official record actually carries them.
+    var message = payload.message || "";
+    var docs = payload.documents || [];
+    var typeLabels = {
+      official_notification: "Official Notification",
+      other_official_document: "Official Document"
+    };
+    var html = "";
+    if (message) html += "<p>" + escapeHtml(message) + "</p>";
+    if (docs.length) {
+      html += '<div class="notice-list">';
+      docs.forEach(function (d) {
+        var title = String(d.title || "Official Document");
+        var meta = [];
+        if (d.doc_type && typeLabels[d.doc_type]) meta.push(typeLabels[d.doc_type]);
+        if (d.programme_name || d.programme_id) meta.push("Programme " + String(d.programme_name || d.programme_id).toUpperCase());
+        if (d.published_at) meta.push("Published " + String(d.published_at).slice(0, 10));
+        html += '<div class="ds-notice-card">';
+        html += '<div class="notice-head">';
+        html += '<span class="nicon" role="img" aria-label="Official document">📄</span>';
+        html += '<div class="notice-title">' + escapeHtml(title) + "</div>";
+        html += "</div>";
+        if (meta.length) html += '<div class="notice-meta">' + escapeHtml(meta.join(" · ")) + "</div>";
+        html += '<div class="notice-actions">';
+        html += '<a class="chip" target="_blank" rel="noopener" href="' + escapeHtml(String(d.file_url || "")) + '">View Official Document</a>';
+        html += '<a class="chip" href="' + escapeHtml(String(d.file_url || "")) + '?download=1" download>Download Original</a>';
+        html += "</div></div>";
+      });
+      html += "</div>";
+    } else if (!message) {
+      html += "<p>No published official documents are available right now.</p>";
+    }
+    html += '<button class="chip back" data-role="option" data-value="back">← Back</button>';
+    addMsg("bot", html);
+  }
+
   function showTyping() { var row = document.createElement("div"); row.className = "row bot"; row.id = "cus-typing"; row.innerHTML = '<div class="avatar">C</div><div class="msg typing"><span></span><span></span><span></span></div>'; body.appendChild(row); body.scrollTop = body.scrollHeight; }
   function removeTyping() { var t = document.getElementById("cus-typing"); if (t) t.remove(); }
   function showSpinner() {
@@ -746,6 +825,8 @@
     if (acdEl) { acdOnClick(acdEl); return; }
     var efdEl = e.target.closest("button[data-efd], button[data-efp]");
     if (efdEl) { ExamFormOnClick(efdEl); return; }
+    var mpSelectEl = e.target.closest("button[data-mp-select]");
+    if (mpSelectEl) { mpSelectOnClick(mpSelectEl); return; }
     var t = e.target.closest("button");
     if (!t) return;
     var role = t.getAttribute("data-role");
@@ -888,6 +969,54 @@ var label = t.textContent.replace("←", "").trim();
     doChat(text);
   }
 
+  /* ---------- Model Paper selection (single-document scope) ---------- */
+  function mpSelectOnClick(btn) {
+    if (state.streaming) return;
+    var pid = (btn.getAttribute("data-value") || "").trim();
+    if (!pid) { addMsg("bot", "<p>That model paper is not available right now.</p>"); return; }
+    if (state.firstMsg) { suggest.classList.add("hidden"); state.firstMsg = false; }
+    addMsg("user", escapeHtml("Ask about this paper"));
+    showSpinner(); showTyping();
+    selectModelPaper(pid);
+  }
+
+  function selectModelPaper(pid) {
+    ensureAuth().then(function () {
+      if (!state.token) {
+        removeTyping(); hideSpinner();
+        addMsg("bot", "<p>⚠️ Authentication failed. Please refresh the page to try again.</p>");
+        return;
+      }
+      var url = API + "/api/examinations/model-papers/" + encodeURIComponent(pid) + "/select";
+      return fetch(url, {
+        method: "POST", credentials: "include", headers: authHeaders(),
+        body: JSON.stringify({ chat_id: state.chatId }),
+      }).then(function (resp) {
+        if (resp.status === 401) {
+          state.token = null; state.authReady = false;
+          removeTyping(); hideSpinner();
+          addMsg("bot", "<p>⚠️ Session expired. Please try asking again.</p>");
+          return;
+        }
+        if (!resp.ok) {
+          removeTyping(); hideSpinner();
+          addMsg("bot", "<p>That model paper is not available right now.</p>");
+          return;
+        }
+        return resp.json();
+      }).then(function (d) {
+        if (!d) return;
+        removeTyping(); hideSpinner();
+        var title = String(d.title || "this paper");
+        addMsg("bot", "<p>Now asking about <strong>" + escapeHtml(title) + "</strong>.</p><p>Your questions will be answered from this paper only. You can ask now, or choose another paper.</p>");
+        body.scrollTop = body.scrollHeight;
+      });
+    }).catch(function (e) {
+      removeTyping(); hideSpinner();
+      addMsg("bot", "<p>⚠️ Cannot reach the backend (" + API + "). Please ensure FastAPI is running.</p>");
+    });
+  }
+
   function doChat(text, isRetry) {
     var assistantHtml = ""; var msgObj = null; var cites = [];
 
@@ -1007,6 +1136,15 @@ var label = t.textContent.replace("←", "").trim();
                 // DateSheetEntry records only — never LLM-generated facts)
                 removeTyping(); hideSpinner();
                 try { var dsData = JSON.parse(data); renderDateSheet(dsData); } catch (e) { addMsg("bot", "<p>⚠️ Could not load the date sheet.</p>"); }
+              } else if (ev === "model_paper_list") {
+                // Dedicated Model Papers service (verified corpus rows only)
+                removeTyping(); hideSpinner();
+                try { var mpData = JSON.parse(data); renderModelPaperList(mpData); } catch (e) { addMsg("bot", "<p>⚠️ Could not load model papers.</p>"); }
+              } else if (ev === "official_document_list") {
+                // Official notifications / other official documents (published
+                // + verified canonical repository rows only)
+                removeTyping(); hideSpinner();
+                try { var odData = JSON.parse(data); renderOfficialDocumentList(odData); } catch (e) { addMsg("bot", "<p>⚠️ Could not load official documents.</p>"); }
               } else if (ev === "grievance") {
                 // Grievance intake: start the in-chat workflow with prefill
                 removeTyping(); hideSpinner();

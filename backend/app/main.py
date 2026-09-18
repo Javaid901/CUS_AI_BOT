@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -29,6 +30,7 @@ from app.admin.profile import router as admin_profile_router
 from app.admin.routes import router as admin_router
 from app.admin.notices import router as admin_notices_router
 from app.admin.sync_documents import router as admin_sync_documents_router
+from app.admin.university_documents import router as admin_university_documents_router
 from app.analytics.routes import router as analytics_router
 from app.auth.routes import router as auth_router
 from app.authority.routes import public_router as authority_lookup_router
@@ -40,6 +42,7 @@ from app.chat.routes import router as chat_router
 from app.college.routes import router as college_router
 from app.config import settings
 from app.database import create_all
+from app.examination.routes import router as examination_router
 from app.grievance.routes import router as grievance_router
 from app.notices.routes import router as notices_router
 from app.public.routes import router as public_router
@@ -52,8 +55,10 @@ from app.student_admit_card.routes import router as student_admit_card_router
 from app.student_exam_form.routes import admin_router as student_exam_form_admin_router
 from app.student_exam_form.routes import router as student_exam_form_router
 from app.student_exam_form.session_routes import router as exam_session_admin_router
+from app.university_documents.routes import router as university_documents_router
 from app.utils.errors import register_exception_handlers
 from app.utils.logging import log
+from app.utils.postgres_ensure import ensure_postgresql_running
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -80,11 +85,14 @@ app.include_router(admin_router)
 app.include_router(admin_profile_router)
 app.include_router(admin_notices_router)
 app.include_router(admin_sync_documents_router)
+app.include_router(admin_university_documents_router)
 app.include_router(college_router)
 app.include_router(analytics_router)
 app.include_router(catalogue_router)
 app.include_router(public_router)
 app.include_router(notices_router)
+app.include_router(examination_router)
+app.include_router(university_documents_router)
 app.include_router(authority_admin_router)
 app.include_router(authority_lookup_router)
 app.include_router(authority_admins_router)
@@ -141,6 +149,7 @@ app.add_api_route(
 @app.on_event("startup")
 def on_startup() -> None:
     log.info("Starting %s (env=%s)", settings.APP_NAME, settings.ENVIRONMENT)
+    ensure_postgresql_running()
     create_all()
     _seed_admin()
     if settings.DEMO_MODE:
@@ -149,7 +158,9 @@ def on_startup() -> None:
     else:
         # Non-demo: seed only the minimal 5 test students
         _seed_students()
+    _init_redis()
     _warmup_models()
+    _start_ollama_watchdog()
     _warmup_intent_classifier()
     _warmup_retrieval()
     _start_analytics_scheduler()
@@ -159,6 +170,40 @@ def on_startup() -> None:
     _start_request_queue_worker()
     _warmup_authority_cache()
     log.info("Analytics module initialized")
+
+
+def _init_redis() -> None:
+    """Startup probe for the Redis layer (non-fatal).
+
+    Runs the async probe in a dedicated thread so it can never block the app's
+    event loop for the Redis socket timeout, and never aborts startup.
+    """
+    from app.utils import redis_client
+
+    holder: dict[str, bool] = {}
+
+    def _runner() -> None:
+        try:
+            asyncio.run(redis_client.startup_check())
+            holder["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Redis startup probe failed: %s", exc)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join(timeout=8.0)
+    log.info("Redis layer initialized (enabled=%s)", redis_client.runtime.enabled())
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    from app.utils import redis_client
+
+    try:
+        redis_client.shutdown_close()
+        log.info("Redis client pools closed")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Redis shutdown: %s", exc)
 
 
 def _start_analytics_scheduler() -> None:
@@ -237,43 +282,157 @@ def _start_request_queue_worker() -> None:
         log.warning("Request queue worker start deferred: %s", exc)
 
 
+_OLLAMA_RETRY_BUDGET = 300.0  # seconds — total bounded retry window for model warmup
+_OLLAMA_RETRY_BASE = 2.0      # seconds — initial backoff wait between warmup attempts
+_OLLAMA_RETRY_MAX = 30.0      # seconds — upper bound for each backoff wait
+_OLLAMA_WATCH_INTERVAL = 30.0 # seconds — how often the recovery watchdog probes Ollama
+
+
+def _warmup_when_ready(
+    warmup_fn,
+    label,
+    probe_fn=None,
+    retry_budget=None,
+    retry_base=None,
+    retry_max=None,
+) -> bool:
+    """Run ``warmup_fn`` once Ollama is reachable, with bounded retry/backoff.
+
+    Probe failures and warmup exceptions are retried until ``retry_budget``
+    seconds have elapsed (default 300s). Returns True when the warmup ran,
+    False when the budget was exhausted (non-fatal). Used by the startup
+    warmup threads and the Ollama recovery watchdog.
+    """
+    import time
+
+    from app.ingest.generator import is_ollama_available
+
+    probe = probe_fn or is_ollama_available
+    budget = retry_budget if retry_budget is not None else _OLLAMA_RETRY_BUDGET
+    base = retry_base if retry_base is not None else _OLLAMA_RETRY_BASE
+    cap = retry_max if retry_max is not None else _OLLAMA_RETRY_MAX
+
+    deadline = time.monotonic() + budget
+    wait = base
+    while True:
+        if probe():
+            try:
+                warmup_fn()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s warmup failed (will retry): %s", label, exc)
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(wait)
+                wait = min(wait * 2.0, cap)
+                continue
+        if time.monotonic() >= deadline:
+            log.warning("%s warmup deferred (Ollama not ready within budget)", label)
+            return False
+        time.sleep(wait)
+        wait = min(wait * 2.0, cap)
+
+
 def _warmup_models() -> None:
-    """Pre-load Ollama models so first user request is fast."""
+    """Pre-load Ollama models so first user request is fast.
+
+    Retries with bounded backoff while Ollama is not yet ready, so a startup
+    that briefly precedes Ollama still ends up healthy instead of permanently
+    degraded. If Ollama is down at startup the daemon threads keep retrying in
+    the background and the Ollama watchdog re-warms when it recovers.
+    Skipped under the test runner like the other heavy warmups, so the suite
+    never spawns retry threads against a live Ollama.
+    """
+    if _is_testing():
+        log.debug("Ollama model warmup skipped (test runner)")
+        return
     import threading
 
-    from app.ingest.embed import _ollama_embed
-    from app.ingest.generator import _build_payload as _build_llm_payload
+    from app.ingest.generator import is_ollama_available
 
     def _warmup_llm():
-        try:
-            payload = _build_llm_payload("warmup", "CUS is a university")
-            import httpx
-            with httpx.Client(timeout=300.0) as c:
-                resp = c.post(
-                    f"{settings.OLLAMA_BASE_URL}/api/generate",
-                    json={**payload, "stream": False, "keep_alive": f"{settings.OLLAMA_KEEP_ALIVE}s", "options": {**payload.get("options", {}), "num_predict": 1}},
-                )
-                if resp.status_code == 200:
-                    log.info("LLM model '%s' warmed up", settings.LLM_MODEL)
-                else:
-                    log.warning("LLM warmup returned HTTP %s", resp.status_code)
-        except Exception as exc:
-            log.warning("LLM warmup failed (non-fatal): %s", exc)
+        from app.ingest.generator import _build_payload as _build_llm_payload
+        payload = _build_llm_payload("warmup", "CUS is a university")
+        import httpx
+        with httpx.Client(timeout=300.0) as c:
+            resp = c.post(
+                f"{settings.OLLAMA_BASE_URL}/api/generate",
+                json={**payload, "stream": False, "keep_alive": f"{settings.OLLAMA_KEEP_ALIVE}s", "options": {**payload.get("options", {}), "num_predict": 1}},
+            )
+            if resp.status_code == 200:
+                log.info("LLM model '%s' warmed up", settings.LLM_MODEL)
+            else:
+                raise RuntimeError(f"LLM warmup returned HTTP {resp.status_code}")
 
     def _warmup_embed():
-        try:
-            _ollama_embed(["warmup"])
-            log.info("Embed model '%s' warmed up", settings.EMBED_MODEL)
-        except Exception as exc:
-            log.warning("Embed warmup failed (non-fatal): %s", exc)
+        from app.ingest.embed import _ollama_embed
+        _ollama_embed(["warmup"])
+        log.info("Embed model '%s' warmed up", settings.EMBED_MODEL)
 
-    # Warm up in parallel threads — this can take time
-    t1 = threading.Thread(target=_warmup_embed, daemon=True)
-    t2 = threading.Thread(target=_warmup_llm, daemon=True)
+    # Warm up in parallel daemon threads — retries run inside them, so startup
+    # is never blocked beyond the existing join budget.
+    t1 = threading.Thread(target=_warmup_when_ready, args=(_warmup_embed, "Embed"), daemon=True)
+    t2 = threading.Thread(target=_warmup_when_ready, args=(_warmup_llm, "LLM"), daemon=True)
     t1.start()
     t2.start()
+
+    if not is_ollama_available():
+        # Ollama not up yet — do not hold startup. The daemon threads keep
+        # retrying with bounded backoff and the watchdog re-warms on recovery.
+        log.info("Ollama not ready at startup — model warmup continues in the background")
+        return
+
+    # Ollama is reachable right now — wait for the warmups to finish so the
+    # first user request is served with models already loaded.
     t1.join(timeout=120)
     t2.join(timeout=120)
+
+
+def _ollama_probe() -> bool:
+    """Quiet Ollama reachability probe with a short, bounded timeout.
+
+    Deliberately not the shared 180s generation client — the watchdog must
+    never hang on a half-open connection, and must not spam warning logs while
+    Ollama is down.
+    """
+    import httpx
+    try:
+        with httpx.Client(timeout=5.0) as c:
+            r = c.get(f"{settings.OLLAMA_BASE_URL}/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _start_ollama_watchdog() -> None:
+    """Recover the AI layer automatically when Ollama becomes unavailable.
+
+    Health endpoints already probe Ollama per request, so the dashboard status
+    is always truthful. This watchdog only reacts to a down->up transition by
+    re-running the model warmup (keep-alive restoration), so a temporary
+    Ollama outage heals without restarting FastAPI. Daemon thread, quiet
+    bounded probes; never blocks, never crashes the app.
+    """
+    if _is_testing():
+        log.debug("Ollama watchdog skipped (test runner)")
+        return
+    import threading
+    import time
+
+    def _loop() -> None:
+        available = _ollama_probe()
+        while True:
+            time.sleep(_OLLAMA_WATCH_INTERVAL)
+            now = _ollama_probe()
+            if now and not available:
+                log.info("Ollama became available — re-warming models")
+                _warmup_models()
+            elif available and not now:
+                log.warning("Ollama became unavailable — will recover when it returns")
+            available = now
+
+    threading.Thread(target=_loop, daemon=True, name="ollama-watchdog").start()
+    log.info("Ollama watchdog started (probe every %.0fs)", _OLLAMA_WATCH_INTERVAL)
 
 
 def _is_testing() -> bool:

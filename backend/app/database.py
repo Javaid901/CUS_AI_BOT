@@ -11,6 +11,7 @@ DATABASE_URL (e.g. postgresql+psycopg://user:pass@host:5432/cus_ai).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Generator
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.types import CHAR, TypeDecorator
 
 from app.config import settings
+
+logger = logging.getLogger("cus_ai")
 
 
 def utcnow() -> datetime:
@@ -74,16 +77,54 @@ class _UUID(TypeDecorator):
 
 def _make_engine():
     url = settings.DATABASE_URL
-    connect_args = {}
+    connect_args: dict = {}
+    pool_kwargs: dict = {}
+    is_pg = url.startswith("postgresql")
     # SQLite needs check_same_thread=False for use across FastAPI threads.
     if url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
+    else:
+        # PostgreSQL-specific connection-pool tuning. The pool is sized from the
+        # AGGREGATE budget (DB_MAX_AGGREGATE_POOL = 30 by default, exactly the
+        # old DB_POOL_SIZE+DB_MAX_OVERFLOW) divided across UVICORN_WORKERS, so
+        # 1 worker keeps today's exact sizing while 2/4 workers can never
+        # exhaust the server's max_connections (100). Excess demand beyond a
+        # worker's share queues on pool_timeout instead of opening sockets.
+        workers = max(1, int(getattr(settings, "UVICORN_WORKERS", 1) or 1))
+        base_pool = max(1, int(settings.DB_POOL_SIZE) or 1)
+        base_overflow = max(0, int(settings.DB_MAX_OVERFLOW) or 0)
+        single_budget = (
+            int(getattr(settings, "DB_MAX_AGGREGATE_POOL", 0) or 0)
+            or (base_pool + base_overflow)
+        )
+        share = max(2, single_budget // workers)
+        pool_size = max(1, min(base_pool, base_pool * share // (base_pool + base_overflow)))
+        max_overflow = max(0, share - pool_size)
+        pool_kwargs = {
+            "pool_size": pool_size,
+            "max_overflow": max_overflow,
+            "pool_timeout": settings.DB_POOL_TIMEOUT,
+            "pool_recycle": settings.DB_POOL_RECYCLE,
+        }
+        logger.info(
+            "dbpool: workers=%d aggregate_budget=%d -> per-worker pool_size=%d max_overflow=%d",
+            workers, single_budget, pool_size, max_overflow,
+        )
+    # --- safe-to-log description (never prints passwords) ---
+    try:
+        scheme, _, rest = url.partition("://")
+        host_db = rest.rsplit("@", 1)[-1] if "@" in rest else rest.split("/", 1)[-1]
+        logger.info("database: dialect=%s target=%s", scheme.split("+")[0], host_db)
+    except Exception:
+        logger.info("database: dialect=unknown")
+
     return create_engine(
         url,
         echo=settings.DB_ECHO,
         future=True,
         pool_pre_ping=True,
         connect_args=connect_args,
+        **pool_kwargs,
     )
 
 
@@ -114,9 +155,24 @@ def _upgrade_schema() -> None:
 
     create_all() only creates missing tables; existing tables keep their old
     shape, so newly added columns are patched in with ALTER TABLE ADD COLUMN
-    (safe on SQLite for nullable columns). Runs idempotently on every startup.
+    (safe on SQLite for nullable columns).  Runs idempotently on every startup.
+
+    PostgreSQL note: the DDL type tokens in ``additions`` are the raw strings
+    passed to ``ALTER TABLE … ADD COLUMN``.  ``DATETIME`` is not a valid
+    PostgreSQL type (the correct keyword is ``TIMESTAMP``).  The dialect-aware
+    ``_translate_type`` helper below rewrites the token when the target is PG.
+    ``BOOLEAN``, ``VARCHAR(n)`` and ``INTEGER`` are valid on both dialects and
+    are left untouched.
     """
     from sqlalchemy import inspect, text
+
+    is_pg = engine.dialect.name == "postgresql"
+
+    def _translate_type(raw: str) -> str:
+        """Map SQLite-idiomatic DDL tokens to their PostgreSQL equivalents."""
+        if is_pg and raw == "DATETIME":
+            return "TIMESTAMP"
+        return raw
 
     additions = {
         "users": {
@@ -217,10 +273,10 @@ def _upgrade_schema() -> None:
                 if name in existing:
                     continue
                 try:
-                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {col_type}'))
+                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {_translate_type(col_type)}'))
                 except Exception:
-                    # Dialect doesn't support DDL here — ignore and keep going.
-                    pass
+                    # Dialect doesn't support this DDL here — ignore and keep going.
+                    logger.debug("upgrade skip ALTER %s.%s (%s)", table, name, col_type)
 
     # Ensure the category FK column has an index on pre-existing databases
     # (SQLite cannot add FK constraints via ALTER; the constraint itself is

@@ -565,28 +565,43 @@ _COLLEGE_DETAILS: dict[str, dict[str, Any]] = {
 # We store a simple path list: e.g. ["admissions", "ug"] means the user
 # is browsing UG programmes under Admissions.
 import threading
+from app.utils import redis_client
 
 _nav_state: dict[str, list[str]] = {}
 _nav_lock = threading.Lock()
 
 
 def get_nav_path(chat_id: str) -> list[str]:
+    if redis_client.runtime.enabled() and redis_client.runtime.available_now():
+        items = redis_client.nav_get_sync(chat_id)
+        if items is not None:
+            return items
     with _nav_lock:
         return list(_nav_state.get(chat_id, []))
 
 
 def set_nav_path(chat_id: str, path: list[str]) -> None:
+    if redis_client.runtime.enabled() and redis_client.runtime.available_now():
+        redis_client.nav_replace_sync(chat_id, list(path))
     with _nav_lock:
         _nav_state[chat_id] = list(path)
 
 
 def clear_nav(chat_id: str) -> None:
+    if redis_client.runtime.enabled() and redis_client.runtime.available_now():
+        redis_client.nav_clear_sync(chat_id)
     with _nav_lock:
         _nav_state.pop(chat_id, None)
 
 
 def advance_path(chat_id: str, selection: str) -> list[str]:
     """Append a selection to the navigation path."""
+    if redis_client.runtime.enabled() and redis_client.runtime.available_now():
+        result = redis_client.nav_advance_sync(chat_id, selection)
+        if result is not None:
+            with _nav_lock:
+                _nav_state[chat_id] = result
+            return result
     with _nav_lock:
         path = _nav_state.get(chat_id, [])
         path = list(path)

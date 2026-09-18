@@ -272,6 +272,18 @@ class BM25Index:
         with self._lock:
             chunks = get_all_chunks(limit=20000)
             if not chunks:
+                # The authoritative source is empty (nothing indexed, or every
+                # vector was removed). Never keep serving a previously built
+                # index in that case — drop to the unready state so search()
+                # yields no stale hits until a non-empty refresh succeeds.
+                self._chunks = []
+                self._doc_lens = []
+                self._term_freqs = []
+                self._idf = {}
+                self._avg_doc_len = 0.0
+                self._last_refresh = now_t
+                self._ready = False
+                log.info("BM25 index cleared: source has no chunks")
                 return
             self._chunks = chunks
             self._doc_lens = []
@@ -368,6 +380,12 @@ def build_metadata_filter(context: dict[str, Any] | None) -> dict | None:
     Only context fields with a known value become clauses. All values are
     normalized to lowercase strings to match how chunk metadata is stored.
     Returns None when no filterable context is present (unfiltered search).
+
+    A document scope (``document_id`` / ``document_ids``) restricts the actual
+    search to those documents: a single ID becomes an equality clause, several
+    IDs become an ``$or`` of equality clauses. This is the search-level half of
+    document-scoped RAG (e.g. after a single Model Paper was selected); the
+    post-retrieval scope check in chat/service.py remains as a backstop.
     """
     if not context:
         return None
@@ -381,6 +399,16 @@ def build_metadata_filter(context: dict[str, Any] | None) -> dict | None:
             if not value.isdigit():
                 continue
         clauses.append({key: str(value).strip().lower()})
+    doc_id = context.get("document_id")
+    doc_ids = context.get("document_ids")
+    if doc_id not in (None, ""):
+        clauses.append({"document_id": str(doc_id).strip().lower()})
+    elif doc_ids:
+        values = [str(i).strip().lower() for i in doc_ids if str(i).strip()]
+        if len(values) == 1:
+            clauses.append({"document_id": values[0]})
+        elif values:
+            clauses.append({"$or": [{"document_id": v} for v in values]})
     if not clauses:
         return None
     if len(clauses) == 1:

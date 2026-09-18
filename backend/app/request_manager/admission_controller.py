@@ -18,6 +18,7 @@ Replaces the old `chat_rate_limit` dependency.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
@@ -31,6 +32,7 @@ from app.request_manager.request_queue import QueueFullError, request_queue
 from app.request_manager.response_cache import response_cache
 from app.request_manager.service_semaphores import service_semaphores
 from app.request_manager.token_bucket import token_bucket
+from app.utils import redis_client
 from app.utils.logging import log
 
 
@@ -183,6 +185,16 @@ class AdmissionController:
             yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
             request_metrics.record_response(0, "total")
             return
+        except asyncio.CancelledError:
+            # Client disconnected while this request was sitting in the queue.
+            # Drop the queue entry (best-effort) so an abandoned request can
+            # never later be dequeued and run expensive work for a ghost
+            # client, then propagate the cancellation.
+            try:
+                await request_queue.cancel(slot.request.id)
+            except asyncio.CancelledError:
+                log.debug("queue cancel interrupted by disconnect")
+            raise
 
         yield {"type": "processing", "action": classification.action}
 
@@ -206,10 +218,45 @@ class AdmissionController:
         t0: float,
         executor: Callable | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Execute a request with per-service semaphore protection."""
+        """Execute a request with per-service semaphore protection.
+
+        Phase 3C-5: expensive actions (rag / llm) additionally coalesce identical
+        concurrent requests across workers via Redis — one generation, and the
+        duplicates replay its text answer instead of generating again.
+        """
         sem_name = self._semaphore_name(classification.action)
         sem_acquired = False
         active_executor = executor or self._executor
+        coalesce_owner: str | None = None
+        coalesce_key: str | None = None
+
+        # --- cross-worker coalescing for the expensive non-navigation paths ----
+        if (
+            classification.priority > Priority.NAVIGATION
+            and redis_client.runtime.enabled()
+            and redis_client.runtime.available_now()
+            and (message or "").strip()
+        ):
+            try:
+                coalesce_key = hashlib.md5(
+                    f"{(message or '').strip()}\x00{classification.action}".encode()
+                ).hexdigest()
+                coalesce_owner = await redis_client.coalesce_claim(coalesce_key)
+                if coalesce_owner is None:
+                    # Another worker is already generating this identical request.
+                    answer = await redis_client.coalesce_wait(
+                        coalesce_key, settings.REDIS_COALESCE_WAIT
+                    )
+                    if answer is not None:
+                        request_metrics.record_cache_hit()
+                        yield {"type": "token", "text": answer}
+                        yield {"type": "done", "chat_id": chat_id, "cited_chunks": [], "cached": True}
+                        request_metrics.record_response(0, "coalesced")
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                coalesce_owner = None  # never let coalescing break execution
 
         try:
             # Acquire service semaphore (non-blocking for fast services)
@@ -243,6 +290,11 @@ class AdmissionController:
                             captured_text, ttl=classification.cache_ttl,
                             q=message, action=classification.action,
                         )
+                if coalesce_key and coalesce_owner and captured_text:
+                    # Publish the result so waiting duplicates get the answer and
+                    # the claim is released (coalesce_publish deletes the claim).
+                    await redis_client.coalesce_publish(coalesce_key, captured_text)
+                    coalesce_owner = None
                 elapsed_ms = int((time.perf_counter() - stage_t0) * 1000)
                 request_metrics.record_response(elapsed_ms, classification.action)
             else:
@@ -250,13 +302,23 @@ class AdmissionController:
                 yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
 
         except asyncio.CancelledError:
-            yield {"type": "error", "message": "Request was cancelled"}
-            yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+            # Never swallow a cancellation and never convert it into a normal
+            # error response: a disconnected client must unwind the stream and
+            # release its resources (semaphores, queue slots, the shared LLM
+            # gate) without emitting fake "error" events for nobody.
+            raise
         except Exception as exc:
             log.error("Execution failed: %s", exc)
             yield {"type": "error", "message": f"Processing failed: {exc}"}
             yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
         finally:
+            if coalesce_key and coalesce_owner:
+                # Only reached when the answer could not be published (exception,
+                # cancellation, or non-serializable result) — release our claim.
+                try:
+                    await redis_client.coalesce_cleanup(coalesce_key, coalesce_owner)
+                except Exception:  # noqa: BLE001
+                    pass
             if sem_name and sem_acquired and classification.priority > Priority.NAVIGATION:
                 service_semaphores.release(sem_name)
             total_ms = int((time.perf_counter() - t0) * 1000)

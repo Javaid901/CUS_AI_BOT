@@ -159,8 +159,16 @@ class ConversationContext:
     department: str | None = None
     topic: str | None = None
     last_document: str | None = None
+    # Document scope for follow-ups after a dedicated examination service
+    # (e.g. Model Papers) was shown — restricts RAG to those documents.
+    exam_document_ids: list[str] | None = None
+    # Explicitly selected model paper (server-validated). When set, RAG scope
+    # is exactly ONE document — the document_id of this selected paper.
+    selected_model_paper_id: str | None = None
+    selected_document_id: str | None = None
     pending_clarification: str | None = None
     clarification_field: str | None = None
+    fee_type: str | None = None  # "programme" | "examination" — inferred or clarified
 
     # College Intelligence fields
     college: str | None = None        # college ID
@@ -329,6 +337,217 @@ def is_short_followup(message: str) -> bool:
         return False
     # Single word that looks like a known programme alias -> not a follow-up
     return not (len(words) == 1 and clean in PROGRAMME_ALIASES)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic follow-up / reference resolution (Phase 4 P1-A)
+# ---------------------------------------------------------------------------
+#
+# When a message references something discussed earlier ("those exams", "what
+# about it?", "and the fee?"), the engine resolves the reference against the
+# conversation context BEFORE planning. Everything here is pure rules — no LLM,
+# no retrieval, no database. Explicit entities in the current message always
+# win; context is only consulted when the message itself is silent.
+
+# Academic vocabulary that marks a message as being ABOUT the university.
+# Used to keep unrelated questions ("what is the capital of France?") from
+# inheriting the last programme / topic from conversation context.
+_UNIVERSITY_TERMS: frozenset[str] = frozenset({
+    "admission", "admissions", "course", "courses", "programme", "programmes",
+    "program", "programs", "subject", "subjects", "paper", "papers",
+    "module", "modules", "semester", "semesters", "sem", "sems",
+    "syllabus", "syllabi", "curriculum", "curricula", "study", "studies",
+    "exam", "exams", "examination", "examinations", "test", "tests",
+    "result", "results", "mark", "marks", "grade", "grades", "cgpa", "sgpa",
+    "fee", "fees", "tuition", "cost", "costs", "charge", "charges",
+    "eligibility", "eligible", "qualification", "qualifications",
+    "scholarship", "scholarships", "hostel", "college", "colleges",
+    "university", "universities", "department", "departments", "faculty",
+    "degree", "degrees", "diploma", "credits", "credit", "notice", "notices",
+    "notification", "notifications", "circular", "circulars", "datesheet",
+    "date sheet", "timetable", "time table", "schedule", "schedules",
+    "seat", "seats", "intake", "placement", "placements", "prospectus",
+    "document", "documents", "registration", "enrollment", "enrolment",
+    "enroll", "enrol", "attendance", "lecture", "lectures", "class",
+    "classes", "campus", "library", "laboratory", "laboratories", "lab",
+    "labs", "dean", "registrar", "principal", "convocation", "graduation",
+    "session", "batch", "stream", "duration", "fees structure",
+    "fee structure", "admission process", "admission procedure",
+    "admission mode", "specialization", "specializations",
+    "undergraduate", "postgraduate", "doctorate", "ug", "pg", "phd",
+    "integrated", "form", "forms", "application", "applications",
+})
+
+_UNIVERSITY_TERMS_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in sorted(_UNIVERSITY_TERMS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+# Pronouns / demonstratives that point back at a previously discussed entity.
+_REFERENTIAL_TERMS: tuple[str, ...] = (
+    "it", "its", "itself", "they", "them", "their", "theirs",
+    "that", "those", "these", "this", "there",
+    "same", "above", "aforementioned", "mentioned", "previous", "last",
+)
+_REFERENTIAL_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in sorted(_REFERENTIAL_TERMS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+# Exam / schedule references that can be resolved to the conversation's
+# programme + semester (e.g. "when are those exams?").
+_EXAM_REFERENCE_PATTERN = re.compile(
+    r"\b(exams?|examinations?|date[ -]?sheets?|schedules?|time[ -]?tables?|timetables?|tests?)\b",
+    re.IGNORECASE,
+)
+_EXAM_TIMING_CUE_PATTERN = re.compile(
+    r"\b(when|date|dates|day|days|schedule|timing|timings|start|starts|"
+    r"begin|begins|held|conduct|conducted|month|months)\b",
+    re.IGNORECASE,
+)
+# Competing service/topic signals that must keep their own dedicated route
+# (exam fee, exam form, model paper, results, ...) — never a date sheet.
+_EXAM_COMPETING_PATTERN = re.compile(
+    r"\b(fee|fees|form|forms|admit card|hall ticket|model papers?|previous year|"
+    r"pyq|result|results|reval|re-?evaluation|marks|improvement|syllabus|"
+    r"subjects?|credits?|eligibility)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class FollowUpResolution:
+    """Outcome of deterministic reference resolution for one message."""
+
+    is_followup: bool = False
+    planning_text: str | None = None   # rewritten text for the planner, if any
+    kind: str | None = None            # e.g. "exam_schedule"
+    reason: str = ""
+
+
+def is_university_related(message: str, entities: Any | None = None) -> bool:
+    """True when the message is about the university / its academic data.
+
+    A message is university-related when entity extraction found a university
+    field (programme / level / topic / service / scheme / semester / domain) or
+    when the text contains academic vocabulary. Unrelated questions ("what is
+    the capital of France?") return False so they never inherit conversation
+    context.
+    """
+    if entities is not None:
+        for attr in ("programme", "level", "topic", "service", "scheme", "domain"):
+            if getattr(entities, attr, None):
+                return True
+        if getattr(entities, "semester", None) is not None:
+            return True
+        if getattr(entities, "programmes", None):
+            return True
+    text = str(message or "")
+    if not text:
+        return False
+    if _UNIVERSITY_TERMS_PATTERN.search(text):
+        return True
+    if _PROGRAMME_PATTERN.search(text) or _ACADEMIC_SCHEME_PATTERN.search(text):
+        return True
+    return bool(_CONTEXT_TOPIC_PATTERN.search(text))
+
+
+def is_referential_followup(message: str) -> bool:
+    """True when the message contains an anaphoric reference (it/those/...)."""
+    return bool(_REFERENTIAL_PATTERN.search(str(message or "")))
+
+
+def detect_exam_reference(message: str) -> bool:
+    """True when the message asks about exam timing / date-sheet / schedule.
+
+    A bare exam noun alone ("exam fee", "model paper") is NOT an exam-schedule
+    reference — a timing cue or an anaphoric reference must be present, and no
+    competing service/topic signal may be.
+    """
+    text = str(message or "").lower()
+    if not _EXAM_REFERENCE_PATTERN.search(text):
+        return False
+    if _EXAM_COMPETING_PATTERN.search(text):
+        return False
+    return bool(_EXAM_TIMING_CUE_PATTERN.search(text) or is_referential_followup(text))
+
+
+def resolve_followup(
+    message: str,
+    entities: Any | None,
+    ctx: ConversationContext | None,
+) -> FollowUpResolution:
+    """Resolve a follow-up message against the conversation context.
+
+    Deterministic and side-effect free:
+
+      * Returns an EMPTY resolution when there is no inheritable context, when
+        the message names its own programme (explicit beats context), or when
+        the message is neither referential nor an exam reference.
+      * Resolves an exam/date-sheet follow-up ("when are those exams?") into a
+        planning string that carries the conversation's programme + semester so
+        the existing date-sheet pipeline can serve it.
+      * Resolves a fee follow-up ("how much is it?") into a planning string
+        that includes the fee type (examination/programme) from context.
+
+    The caller applies `planning_text` (when set) to the planner only; the
+    original message is still what the user said.
+    """
+    empty = FollowUpResolution()
+    if ctx is None:
+        return empty
+
+    prog = getattr(ctx, "programme", None) or getattr(ctx, "catalogue_programme_code", None)
+    if not prog:
+        return empty
+
+    # Explicit current-message programme always wins — nothing to resolve.
+    if getattr(entities, "programme", None):
+        return empty
+
+    if detect_exam_reference(message):
+        label = _get_programme_label(prog) or str(prog).upper()
+        parts = [label]
+        sem = getattr(ctx, "semester", None)
+        if sem is not None and str(sem).strip():
+            parts.extend(["semester", str(sem)])
+        parts.extend(["date sheet", "exam schedule"])
+        return FollowUpResolution(
+            is_followup=True,
+            planning_text=" ".join(parts),
+            kind="exam_schedule",
+            reason=f"Exam follow-up resolved to {label} schedule from conversation context",
+        )
+
+    # Fee follow-up resolution: if context has fee_type (from context or persisted contract)
+    # and message is referential, rewrite to include the fee type so planner routes correctly.
+    fee_type = getattr(ctx, "fee_type", None)
+    if fee_type is None:
+        # Fallback: check persisted contract's fee_type
+        last_contract = getattr(ctx, "_last_contract", None)
+        if isinstance(last_contract, dict):
+            fee_type = last_contract.get("fee_type")
+
+    if is_referential_followup(message) and fee_type:
+        label = _get_programme_label(prog) or str(prog).upper()
+        if fee_type == "examination":
+            parts = [label, "examination fee"]
+        else:
+            parts = [label, "programme fee"]
+        return FollowUpResolution(
+            is_followup=True,
+            planning_text=" ".join(parts),
+            kind="fee_followup",
+            reason=f"Fee follow-up resolved to {label} {fee_type} fee from conversation context",
+        )
+
+    if is_referential_followup(message):
+        return FollowUpResolution(
+            is_followup=True,
+            kind="referential",
+            reason="Referential follow-up (" + prog + " in context)",
+        )
+    return empty
 
 
 # ---------------------------------------------------------------------------

@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # SQLite by default so the app runs immediately; override with Postgres in prod.
     DATABASE_URL: str = "sqlite:///./cus_ai.db"
     DB_ECHO: bool = False
+    # PostgreSQL pool settings (ignored by SQLite; see database.py _make_engine).
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 1800  # seconds
+    # Aggregate PostgreSQL pool ceiling across ALL FastAPI workers. Each worker
+    # sizes its SQLAlchemy pool to (budget // UVICORN_WORKERS) so N workers can
+    # never exceed the single-worker connection budget. Default 30 keeps the
+    # 1-worker deployment byte-for-byte identical to DB_POOL_SIZE+DB_MAX_OVERFLOW.
+    DB_MAX_AGGREGATE_POOL: int = 30
 
     # ----- Security / JWT -----
     SECRET_KEY: str = "change-me-in-production-please-use-a-long-random-string"
@@ -81,7 +91,11 @@ class Settings(BaseSettings):
     RERANK_K: int = 6  # Keep top K after reranking before context compression
     CONTEXT_COMPRESSION: bool = True  # Group chunks by source document before LLM
     ENABLE_ANSWER_VERIFICATION: bool = True  # Refuse if evidence is weak
-    MAX_QUERY_LENGTH: int = 300  # Truncate overly long queries
+    MAX_QUERY_LENGTH: int = 300  # Truncate overly long queries (retrieval layer)
+    # Hard chat input cap enforced at the API boundary BEFORE any processing
+    # (planning, retrieval, LLM). Requests longer than this are rejected with a
+    # controlled error instead of consuming event-loop time on expensive work.
+    MAX_CHAT_MESSAGE_LENGTH: int = 2000
     BM25_INDEX_REFRESH_INTERVAL: int = 300  # Seconds between BM25 index rebuilds
 
     # ----- File upload -----
@@ -112,9 +126,37 @@ class Settings(BaseSettings):
     CACHE_DEFAULT_TTL: int = 300     # seconds (5 min)
     CACHE_MAX_SIZE: int = 1000       # entries
 
+    # ----- Redis shared state (Phase 3C-5) -----
+    # Empty/blank disables the Redis layer entirely: the application then keeps
+    # its pre-existing single-process behavior (all state process-local).
+    REDIS_URL: str = ""
+    # Bounded connections per process (async + sync pools share this cap).
+    REDIS_POOL_MAX: int = 30
+    REDIS_POOL_TIMEOUT: float = 10.0
+    REDIS_SOCKET_TIMEOUT: float = 3.0
+    REDIS_CONNECT_TIMEOUT: float = 2.0
+    REDIS_KEY_PREFIX: str = "cus"
+    # How often sync consumers re-probe Redis availability after a failure
+    # (adaptive availability cache; never pings inside the event loop).
+    REDIS_HEALTH_INTERVAL: float = 30.0
+    # Distributed state / cache lifetimes (seconds).
+    REDIS_STATE_TTL: int = 1800          # conversation + nav state (matches 30-min eviction)
+    REDIS_CACHE_TTL_CAP: int = 900       # hard cap on any shared cache TTL
+    REDIS_LLM_GATE_TTL: int = 300        # distributed LLM gate slot lease (crash recovery)
+    REDIS_SYNC_LOCK_TTL: int = 600       # website sync distributed lock
+    REDIS_COALESCE_TTL: int = 30         # in-flight duplicate claim TTL
+    REDIS_COALESCE_WAIT: float = 6.0     # max seconds a coalesced duplicate waits for the answer
+    REDIS_COALESCE_ANSWER_TTL: int = 600 # answer replay key lifetime
+    REDIS_MAINT_GUARD_TTL: int = 900     # single-owner background maintenance guard
+
     # ----- Worker Pool -----
     WORKER_MIN: int = 1
     WORKER_MAX: int = 6
+
+    # ----- Multi-worker (Phase 3C-5) -----
+    # Explicit worker count used for pool/static sizing. MUST match the actual
+    # uvicorn --workers <N> flag at deploy time. Default 1 = current behavior.
+    UVICORN_WORKERS: int = 1
 
     # ----- Backpressure -----
     BACKPRESSURE_SLOWDOWN_PCT: float = 80.0
@@ -125,6 +167,13 @@ class Settings(BaseSettings):
     TIMEOUT_STRUCTURED: float = 3.0
     TIMEOUT_RAG: float = 15.0
     TIMEOUT_LLM: float = 60.0
+
+    # ----- Intelligence Foundation (Phase 1 — feature-flagged, OFF by default) -----
+    # Master toggle for the future Intelligent Answering layer. When False —
+    # the default — the existing application behaves EXACTLY as today: no
+    # intelligence code executes, no extra retrieval or model calls, no extra
+    # latency, no user-visible change.
+    INTELLIGENCE_ENABLED: bool = False
 
     # ----- Knowledge Sync (admin-only document acquisition) -----
     # Comma-separated approved domains for Knowledge Sync downloads.

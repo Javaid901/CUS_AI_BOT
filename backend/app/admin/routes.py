@@ -23,6 +23,7 @@ Spec-listed aliases are also mounted (see main.py) so both contract styles work:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from app.auth.security import require_admin, require_superadmin
@@ -268,6 +269,20 @@ def _db_size() -> int:
             db_path = Path.cwd() / db_path
         if db_path.exists():
             return db_path.stat().st_size
+    elif url.startswith("postgresql"):
+        # PostgreSQL has no single file to stat; report the live database size.
+        # Errors (unreachable DB, missing privileges) return 0 — never credentials.
+        try:
+            from sqlalchemy import text as sa_text
+            from app.database import engine
+
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa_text("SELECT pg_database_size(current_database())")
+                ).scalar()
+                return int(row or 0)
+        except Exception:
+            return 0
     return 0
 
 
@@ -457,7 +472,7 @@ async def website_sync_run(
     is rejected (409) before any crawl starts, regardless of how the request
     arrives (dashboard, direct API call, dev tools, another client).
     """
-    from app.knowledge_sync.web_engine import WebsiteSyncEngine, load_state
+    from app.knowledge_sync.web_engine import load_state
 
     state = load_state()
     if not state.get("enabled", False):
@@ -466,11 +481,27 @@ async def website_sync_run(
             detail="Website Sync is disabled. Enable it before starting a sync.",
         )
 
-    engine = WebsiteSyncEngine(db)
-    result = await engine.run_async(
-        trigger=(body.trigger if body else "manual"),
-        seed_urls=(body.urls if body else None),
-    )
+    def _run_in_worker() -> dict:
+        # Run the crawl off the FastAPI event loop in a dedicated worker thread
+        # (mirrors the scheduler's proven pattern). The worker opens its OWN
+        # SessionLocal — the request's session is bound to the request thread
+        # and is never touched by the crawl.
+        from app.database import SessionLocal
+        from app.knowledge_sync.web_engine import WebsiteSyncEngine
+
+        worker_db = SessionLocal()
+        try:
+            engine = WebsiteSyncEngine(worker_db)
+            return asyncio.run(
+                engine.run_async(
+                    trigger=(body.trigger if body else "manual"),
+                    seed_urls=(body.urls if body else None),
+                )
+            )
+        finally:
+            worker_db.close()
+
+    result = await asyncio.to_thread(_run_in_worker)
     audit(db, "website_sync", actor_id=str(current.id), actor_role=current.role,
           detail=f"{result.get('status')} · {result.get('new_pages', 0)} new, "
                  f"{result.get('updated_pages', 0)} updated")

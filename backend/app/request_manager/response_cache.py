@@ -19,6 +19,12 @@ from collections import OrderedDict
 from typing import Any
 
 from app.config import settings
+from app.utils import redis_client
+
+
+# Distributed store key: the ResponseCache key is already a deterministic md5 of
+# the sorted parts; namespacing under "cache:resp" keeps it clear of other uses.
+_NS = "resp"
 
 
 class ResponseCache:
@@ -26,6 +32,11 @@ class ResponseCache:
 
     Key is derived from the request parameters (programme, topic, college, etc.)
     Value is the serializable response dict or string.
+
+    Phase 3C-5: when Redis is enabled the store is shared across workers
+    (JSON, TTL-capped). The process-local LRU stays as the fallback store so a
+    Redis outage degrades to single-process behavior. Values that are not
+    JSON-safe are kept local only (never stored shared).
     """
 
     def __init__(
@@ -43,8 +54,16 @@ class ResponseCache:
         raw = json.dumps({k: v for k, v in sorted(parts.items()) if v is not None}, sort_keys=True)
         return hashlib.md5(raw.encode()).hexdigest()
 
+    def _redis_try(self) -> bool:
+        """Whether a distributed op should be attempted now (cheap, no ping)."""
+        return redis_client.runtime.enabled() and redis_client.runtime.available_now()
+
     def get(self, key: str) -> tuple[bool, Any]:
         """Look up a key. Returns (hit: bool, value: Any)."""
+        if self._redis_try():
+            value = redis_client.cache_get_sync(_NS, key)
+            if value is not None:
+                return True, value
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -58,6 +77,8 @@ class ResponseCache:
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         """Store a value with optional TTL (seconds)."""
+        if self._redis_try():
+            redis_client.cache_set_sync(_NS, key, value, ttl or self._default_ttl)
         with self._lock:
             if key in self._store:
                 self._store.move_to_end(key)
@@ -70,6 +91,11 @@ class ResponseCache:
 
     def invalidate(self, pattern: str | None = None) -> int:
         """Invalidate entries matching a key prefix pattern. Returns count."""
+        if pattern is None and self._redis_try():
+            try:
+                redis_client.cache_purge_sync(_NS)
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
             if pattern is None:
                 count = len(self._store)

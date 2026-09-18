@@ -103,6 +103,89 @@ OTHER_OFFICIAL_MARKERS = [
     r"curriculum", r"course\s*scheme",
 ]
 
+# Content-only structural evidence. December 2025 defect: real CUS model
+# papers carry "Maximum Marks", "Time Allowed", and enumerated questions only
+# in the BODY with opaque filenames; the same body shapes must be matched
+# against the extracted text so content (not the URL path) decides.
+MODEL_TEXT_STRUCTURE_MARKERS = [
+    r"max(?:imum)?\s*marks", r"full\s*marks",
+    r"time\s*allowed", r"allowed\s*time",
+    r"\b[123]\s*(?:hrs?\.?|hours)\b",
+    r"instructions?\s*to\s*candidates",
+    r"attempt\s*(?:all|any)\s",
+    r"paper\s*code",
+]
+
+_QUESTION_LINE_RE = re.compile(r"(?im)^\s{0,8}(?:q\.?\s*)?\d{1,3}\s*[.)]\s+\S")
+_DAY_RE = re.compile(r"\b(?:mon|tue|wed|thu|fri|sat|sun)\w*\b", re.I)
+_TIME_RE = re.compile(r"\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)\b", re.I)
+
+# Canonical repository doc_type (university_documents.doc_type).
+CATEGORY_TO_DOC_TYPE = {
+    "date-sheet": "date_sheet",
+    "model-paper": "model_paper",
+    "official-notification": "official_notification",
+    "other-official-document": "other_official_document",
+}
+
+
+def canonical_doc_type_for(classification: dict[str, Any]) -> str:
+    """Map a Phase 1 classification contract to the canonical doc_type."""
+    doc_type = (classification.get("doc_type") or "").strip().lower()
+    category = (classification.get("category") or "").strip().lower()
+    if doc_type == "official":
+        return CATEGORY_TO_DOC_TYPE.get(category, "official_notification")
+    if doc_type == "knowledge":
+        return "knowledge"
+    return "needs_review"
+
+
+def canonical_doc_type(category: str) -> str:
+    """Map a category string (official categories) to canonical doc_type."""
+    cat = (category or "").strip().lower()
+    if cat in CATEGORY_TO_DOC_TYPE:
+        return CATEGORY_TO_DOC_TYPE[cat]
+    if cat == "ambiguous":
+        return "needs_review"
+    return "knowledge"
+
+
+def _content_structure_votes(text: str) -> dict[str, Any]:
+    """Derive deterministic content-structure evidence from extracted text."""
+    if not text:
+        return {
+            "question_lines": 0,
+            "structure_hits": [],
+            "model_structure": False,
+            "model_phrase": [],
+            "date_table_rows": 0,
+            "meaningful_length": 0,
+        }
+    text = text.strip()
+    starts = {m.start() for m in _QUESTION_LINE_RE.finditer(text)}
+    question_lines = len(starts)
+    structure_hits = _hit_fragments(
+        text, _patterns("model-structure", MODEL_TEXT_STRUCTURE_MARKERS)
+    )
+    day_starts = {m.start() for m in _DAY_RE.finditer(text)}
+    date_rows = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if _DAY_RE.search(line) and _TIME_RE.search(line):
+            date_rows += 1
+    meaningful_length = len(text)
+    return {
+        "question_lines": question_lines,
+        "structure_hits": structure_hits,
+        "model_structure": bool(question_lines >= 4 and structure_hits),
+        "model_phrase": _hit_fragments(
+            text, _patterns("model-phrase", MODEL_PAPER_MARKERS)
+        ),
+        "date_table_rows": date_rows,
+        "meaningful_length": meaningful_length,
+    }
+
 # Binary magic-byte sniffers: (extension, test(raw) -> bool).
 _BINARY_SNIFFERS: list[tuple[str, Any]] = []
 
@@ -307,13 +390,83 @@ def classify_document(
     )
 
     # Model paper: markers subject to hard exclusions.
-    model_text = _hit_fragments(f"{title_l}\n{url_l}", _patterns("model", MODEL_PAPER_MARKERS))
+    model_text = _hit_fragments(
+        f"{title_l}\n{url_l}\n{text_l}", _patterns("model", MODEL_PAPER_MARKERS)
+    )
     excluded = _hit_fragments(
         f"{title_l}\n{url_l}\n{text_l}", _patterns("excl", MODEL_PAPER_EXCLUSIONS)
     )
     model_allowed = bool(model_text) and not excluded
     if model_text and not model_allowed:
         signals.append(f"model-paper excluded: {', '.join(excluded)}")
+
+    # Content-structure evidence (body-first classification): enumerated
+    # question lines + "Maximum Marks"/"Time Allowed"/"Instructions to
+    # Candidates" strongly indicate a question paper; repeated weekday+time
+    # rows strongly indicate a date sheet. Content evidence overrides noisy
+    # title/URL hints (e.g. a model paper hiding under a /notices/ path). The
+    # exclusion list is applied to the BODY for these content-driven paths —
+    # an URL bearing "notice" or "notification" is hosting noise, not content.
+    votes = _content_structure_votes(text_l)
+    date_strong = bool(title_url_date_hits or date_text_repeated)
+    date_table_structural = votes["date_table_rows"] >= 2
+    content_model = bool(votes["model_phrase"]) or votes["model_structure"]
+    text_excluded = _hit_fragments(text_l, _patterns("excl-body", MODEL_PAPER_EXCLUSIONS))
+
+    if content_model and not text_excluded and not (
+        date_strong or date_table_structural
+    ):
+        evidence = len(votes["model_phrase"]) * 2
+        if votes["model_structure"]:
+            evidence += 4 + min(votes["question_lines"], 4)
+            signals.append(
+                f"model-paper content structure: {votes['question_lines']} enumerated questions"
+            )
+        evidence += len(_hit_fragments(title_l, _patterns("model", MODEL_PAPER_MARKERS))) * 4
+        evidence += len(_hit_fragments(url_l, _patterns("model", MODEL_PAPER_MARKERS))) * 2
+        band, score = _band(evidence)
+        signals.append("model paper: label + hold for review")
+        return {
+            "doc_type": "official",
+            "category": "model-paper",
+            "confidence": {"band": band, "score": score},
+            "signals": signals,
+        }
+
+    # A bare question paper (enumerated questions + "Maximum Marks"/"Time
+    # Allowed"/"Instructions to Candidates") with no exclusion phrase is a
+    # model/question paper even when the filename/URL are silent about it.
+    if votes["model_structure"] and not text_excluded and not (
+        date_strong or date_table_structural
+    ):
+        evidence = 4 + min(votes["question_lines"], 4) + len(votes["structure_hits"])
+        signals.append(
+            f"model-paper content structure: {votes['question_lines']} enumerated questions"
+        )
+        signals.append("model paper: label + hold for review")
+        band, score = _band(evidence)
+        return {
+            "doc_type": "official",
+            "category": "model-paper",
+            "confidence": {"band": band, "score": score},
+            "signals": signals,
+        }
+
+    if date_table_structural and not date_strong and not content_model:
+        winner_score = max(
+            4, _weighted_score(title_l, slug, url_l, text_l, date_pats)
+        )
+        band, score = _band(winner_score)
+        signals.append(
+            f"date-sheet content structure: {votes['date_table_rows']} date rows"
+        )
+        signals.extend(_where(date_hits, "date-sheet"))
+        return {
+            "doc_type": "official",
+            "category": "date-sheet",
+            "confidence": {"band": band, "score": score},
+            "signals": signals,
+        }
 
     scores: dict[str, int] = {}
     if date_hits:
