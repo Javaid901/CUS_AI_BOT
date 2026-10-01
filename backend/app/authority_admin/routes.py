@@ -53,6 +53,7 @@ from app.authority_admin.service import (
     assign_authority,
     change_own_password,
     create,
+    delete_admin,
     get_row,
     list_rows,
     self_scope,
@@ -184,6 +185,26 @@ def assign_authority_admin(
         ip=request.client.host if request.client else None,
     )
     return row
+
+
+@router.delete("/{admin_id}")
+@router.delete("/{admin_id}/")
+def delete_authority_admin(
+    admin_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current: User = _superadmin,
+):
+    try:
+        deleted = delete_admin(db, admin_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    audit(
+        db, "authority_admin.delete", actor_id=str(current.id), actor_role=current.role,
+        target=deleted["username"], detail=f"Permanently deleted Authority Admin {deleted['username']} (was assigned to {deleted.get('authority_name', 'unassigned')})",
+        ip=request.client.host if request.client else None,
+    )
+    return {"deleted": True, "username": deleted["username"]}
 
 
 # ---------------------------------------------------------------------------

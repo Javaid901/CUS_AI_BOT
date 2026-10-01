@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from app.analytics.collector import (
     collect_event,
     collect_knowledge_gap,
+    collect_performance,
 )
 from app.chat.intent_router import (
     _PROGRAMME_DETAILS,
@@ -63,6 +64,7 @@ from app.student.gate import (
     hub_options,
     logged_out_gate_message,
 )
+from app.utils.logging import log
 
 
 def _anon_session_id(chat_id: str) -> str:
@@ -172,7 +174,7 @@ async def _process(
                     from app.catalogue.backend import continue_pending
                     events = await continue_pending(db, user_id, text, chat_id, state)
                 except Exception as exc:
-                    logger.error("catalogue continue failed chat=%s: %s", chat_id, exc)
+                    log.error("catalogue continue failed chat=%s: %s", chat_id, exc)
                     events = None
             if events:
                 for event in events:
@@ -201,7 +203,9 @@ async def _process(
                     state.slot_topic = None
                     state.slot_request = None
                     # Re-plan with updated context
-                    from app.orchestrator.extractor import extract_entities as _extract_entities
+                    from app.orchestrator.extractor import (
+                        extract_entities as _extract_entities,
+                    )
                     new_entities = _extract_entities(text)
                     from app.orchestrator.planner import plan as _plan
                     new_plan = await asyncio.to_thread(_plan, text, ctx, chat_id, new_entities)
@@ -233,7 +237,8 @@ async def _process(
         # CancelledError (the plan itself is pure & request-scoped), and the
         # awaited task finishes its bookkeeping without any shared state.
         plan_t0 = time.perf_counter()
-        planner_plan = await asyncio.to_thread(plan, planning_text, ctx, chat_id, entities)
+        with stage_timer("planning"):
+            planner_plan = await asyncio.to_thread(plan, planning_text, ctx, chat_id, entities)
         planner_latency_ms = int((time.perf_counter() - plan_t0) * 1000)
         log_stage("planning", f"action={planner_plan.action} target={planner_plan.target} confidence={planner_plan.confidence:.2f} reason={planner_plan.reason} ({planner_latency_ms}ms)")
 
@@ -301,6 +306,24 @@ async def _execute_plan(
         base.update(kw)
         return {k: v for k, v in base.items() if v is not None}
 
+    if action == "blocked":
+        # P2-A: manipulation attempts are refused deterministically. No RAG, no
+        # LLM, no student service, no website action — just the fixed message
+        # plus the done event, so nothing downstream can be reached.
+        state.last_intent = "none"
+        yield {"type": "token", "text": (
+            "I can't help with bypassing or manipulating university records or "
+            "systems. If you believe your marks or result are incorrect, tell me "
+            "and I'll point you to the official correction or grievance process."
+        )}
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        asyncio.ensure_future(collect_event(**_make_event(
+            response_source="blocked", route_chosen="blocked",
+            llm_used=False, rag_used=False, structured_lookup_used=False,
+            conversation_completed=True,
+        )))
+        return
+
     if action == "welcome":
         yield WELCOME_OPTIONS
         yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
@@ -366,8 +389,9 @@ async def _execute_plan(
         _update_context_from_rag(ctx, entities, query)
         state.last_intent = "knowledge"
         rag_t0 = time.perf_counter()
-        async for event in run_chat(db, user_id, query, chat_id, context=_build_rag_context(ctx, entities)):
-            yield event
+        with stage_timer("rag_generation"):
+            async for event in run_chat(db, user_id, query, chat_id, context=_build_rag_context(ctx, entities)):
+                yield event
         rag_ms = int((time.perf_counter() - rag_t0) * 1000)
         asyncio.ensure_future(collect_event(**_make_event(
             response_source="rag", route_chosen=action,
@@ -379,10 +403,19 @@ async def _execute_plan(
         return
 
     if action == "multi_source":
-        async for event in _handle_multi_source(
-            db, user_id, message, chat_id, state, ctx, entities, plan_result
-        ):
-            yield event
+        with stage_timer("multi_source"):
+            async for event in _handle_multi_source(
+                db, user_id, message, chat_id, state, ctx, entities, plan_result
+            ):
+                yield event
+        return
+
+    if action == "intelligent":
+        with stage_timer("intelligent"):
+            async for event in _handle_intelligent(
+                db, user_id, message, chat_id, state, ctx, entities, plan_result
+            ):
+                yield event
         return
 
     if action == "clarify":
@@ -396,6 +429,22 @@ async def _execute_plan(
         ))
         asyncio.ensure_future(collect_event(**_make_event(
             response_source="clarification", route_chosen=action,
+        )))
+        return
+
+    if action == "scope":
+        # Out-of-scope university query - return a fast deterministic response
+        scope_message = (
+            "I can't provide information about that topic. "
+            "I can help you with information related to Cluster University "
+            "Srinagar, such as admissions, courses, examinations, notices, "
+            "student services, and other university-related information."
+        )
+        yield {"type": "token", "text": scope_message}
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        state.last_intent = "scope"
+        asyncio.ensure_future(collect_event(**_make_event(
+            response_source="scope", route_chosen=action,
         )))
         return
 
@@ -425,8 +474,9 @@ async def _execute_plan(
     if action == "llm":
         state.last_intent = "knowledge"
         llm_t0 = time.perf_counter()
-        async for event in run_chat(db, user_id, message, chat_id):
-            yield event
+        with stage_timer("llm_generation"):
+            async for event in run_chat(db, user_id, message, chat_id):
+                yield event
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
         asyncio.ensure_future(collect_event(**_make_event(
             response_source="llm", route_chosen=action,
@@ -590,6 +640,33 @@ async def _execute_plan(
             yield event
         return
 
+    if action == "general_knowledge":
+        # Curated general university knowledge (Rule 3ab-bis). The planner
+        # already resolved the question against source-bound curated records,
+        # so there is no retrieval, no re-rank and no planning call here: at
+        # most ONE guarded generation call turns those facts into an answer.
+        # Any failure (no usable records, generation error, unsafe output)
+        # falls through to the existing knowledge path unchanged.
+        _update_context_from_plan(ctx, plan_result)
+        # `served` lets the handler report whether it answered from the curated
+        # records (analytics) or degraded to the untouched RAG path, without
+        # the handler needing the local _make_event closure.
+        served: dict[str, bool] = {"curated": False}
+        gen_t0 = time.perf_counter()
+        with stage_timer("general_knowledge"):
+            async for event in _handle_general_knowledge(
+                db, user_id, message, chat_id, state, ctx, plan_result, served
+            ):
+                yield event
+        if served["curated"]:
+            gen_ms = int((time.perf_counter() - gen_t0) * 1000)
+            asyncio.ensure_future(collect_event(**_make_event(
+                response_source="general_knowledge", route_chosen=action,
+                llm_used=True, knowledge_sync_used=True,
+                llm_latency_ms=gen_ms, conversation_completed=True,
+            )))
+        return
+
     if action == "comparison":
         # Side-by-side programme comparison — structured catalogue data when
         # both programmes exist, else scoped knowledge retrieval.
@@ -610,7 +687,7 @@ async def _execute_plan(
         return
 
     # Fallback (unknown action) — never silently dead-end
-    logger.warning("unhandled planner action=%s target=%s — falling back to knowledge", action, plan_result.target)
+    log.warning("unhandled planner action=%s target=%s — falling back to knowledge", action, plan_result.target)
     state.last_intent = "knowledge"
     async for event in run_chat(db, user_id, message, chat_id):
         yield event
@@ -908,6 +985,280 @@ async def _handle_multi_source(
     ))
 
 
+async def _handle_intelligent(
+    db: Session,
+    user_id: str,
+    message: str,
+    chat_id: str,
+    state: ConversationState,
+    ctx: ConversationContext,
+    entities: Any,
+    plan_result: Any,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Answer a general student-assistant question (P0, extended by P1).
+
+    The planner routed the message to ``intelligent`` AFTER every protected /
+    specialised rule, so only genuinely university-related knowledge, procedure,
+    document-comparison or current-status questions arrive here. The question
+    stays bounded; evidence is gathered per source (structured programme
+    facts, verified official documents, verified website pages, published
+    notices, and the existing knowledge-base retriever) and synthesised by the
+    same guarded generator under the student-assistant mode prompt.
+
+    Honesty rules:
+      * verified evidence is the only source of truth; sub-parts with no
+        evidence use the exact fallback sentence;
+      * CURRENT-STATUS questions with NO status-authoritative evidence
+        (a dated official announcement: verified notice, official-notification
+        document, or dated verified website page) short-circuit to the
+        deterministic unavailability sentence — general RAG knowledge and
+        programme-profile facts are NEVER treated as evidence of current
+        status and no old material is presented as current;
+      * COMPLEX knowledge questions may run ONE bounded, JSON-only information
+        plan (P1-B) to name the facts/sources the answer must cover; any plan
+        failure degrades to the exact P0 behavior;
+      * DOCUMENT-COMPARISON questions are answered from dated official
+        evidence, without inventing cancellation or supersession (P1-D);
+      * verified https URLs surface as safe source links, never invented ones;
+        internal retrieval terminology never appears in the reply.
+    """
+    from app.ingest.prompts import (
+        CURRENT_STATUS_UNAVAILABLE,
+        DOCUMENT_COMPARISON_RULES,
+        STUDENT_ASSISTANT_SYSTEM_PROMPT,
+    )
+    from app.multi_source.decompose import SourceType, build_intelligent_subs
+    from app.multi_source.evidence import (
+        collect_evidence,
+        dated_notice_conflicts,
+        filter_status_evidence,
+        validate,
+    )
+    from app.multi_source.synthesize import synthesize_answer
+    from app.utils.logging import log
+
+    extra = plan_result.extra or {}
+    kind = (extra.get("intelligent_kind") or "knowledge").strip().lower()
+    original_query = (extra.get("original_query") or message or "").strip()
+
+    subs = build_intelligent_subs(original_query, entities, ctx, kind=kind)
+    if not subs:
+        # Defensive: a malformed plan must never dead-end the conversation.
+        _update_context_from_rag(ctx, entities, message)
+        state.last_intent = "knowledge"
+        async for event in run_chat(db, user_id, message, chat_id, context=_build_rag_context(ctx, entities)):
+            yield event
+        return
+
+    rag_ctx = _build_rag_context(ctx, entities)
+
+    # P1-B: ONE bounded information-plan call for genuinely complex knowledge
+    # questions only. Any failure returns None and the P0 path continues.
+    information_plan = None
+    plan_used = False
+    plan_ms = 0
+    if kind == "knowledge":
+        from app.orchestrator.info_plan import (
+            expand_subs_with_plan,
+            plan_information,
+            should_information_plan,
+        )
+        if should_information_plan(original_query, kind):
+            plan_t0 = time.perf_counter()
+            information_plan = await plan_information(
+                original_query,
+                programme=(getattr(entities, "programme", None)
+                           or getattr(ctx, "programme", None)),
+            )
+            plan_ms = int((time.perf_counter() - plan_t0) * 1000)
+            plan_used = information_plan is not None
+            if information_plan is not None:
+                subs = expand_subs_with_plan(subs, information_plan, original_query)
+
+    t0 = time.perf_counter()
+    try:
+        pool = await collect_evidence(db, subs, entities, ctx, rag_ctx=rag_ctx)
+    except Exception as exc:
+        log.error("intelligent evidence collection failed chat=%s: %s", chat_id, exc)
+        yield {
+            "type": "error",
+            "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        return
+    collection_ms = int((time.perf_counter() - t0) * 1000)
+    validation = validate(pool, subs)
+
+    # P1-A: current-status evidence isolation. Only status-authoritative items
+    # (dated official announcements) may ground a current-state claim; when
+    # none exist the deterministic short-circuit fires (no LLM call).
+    system_prompt = STUDENT_ASSISTANT_SYSTEM_PROMPT
+    synthesis_context: dict[str, Any] | None = None
+    if kind == "status":
+        # P2-B: subject-aligned authority filtering — the status answer may be
+        # grounded only in dated official evidence about the SAME subject the
+        # question asks about (an exam notice can never establish an admission
+        # state, and vice versa).
+        from app.orchestrator.current_status import status_subjects_of
+
+        status_subjects = frozenset(status_subjects_of(original_query))
+        authority, context_only = filter_status_evidence(
+            pool.items, "status", status_subjects=status_subjects
+        )
+        status_types = sorted({i.source.value for i in authority})
+        context_types = sorted({i.source.value for i in context_only})
+        if not authority:
+            state.last_intent = "knowledge"
+            yield {"type": "token", "text": CURRENT_STATUS_UNAVAILABLE}
+            yield {
+                "type": "done",
+                "chat_id": chat_id,
+                "cited_chunks": [],
+                "intelligent_debug": {
+                    "kind": kind,
+                    "sub_queries": [s.as_dict() for s in subs],
+                    "evidence_items": [i.as_dict() for i in pool.items],
+                    "validation": validation.as_dict(),
+                    "evidence_latency_ms": collection_ms,
+                    "short_circuit": "no_current_official_evidence",
+                    "authority_sources": status_types,
+                    "context_only_sources": context_types,
+                },
+            }
+            asyncio.ensure_future(collect_event(
+                anon_session_id=_anon_session_id(chat_id),
+                conversation_id=chat_id,
+                planner_action="intelligent",
+                response_source="intelligent",
+                route_chosen="intelligent",
+                detected_programme=entities.programme or ctx.programme,
+                detected_topic=entities.topic or ctx.topic,
+                service_requested=kind,
+                detected_service=kind,
+                llm_used=False,
+                rag_used=any(i.source == SourceType.RAG for i in pool.items),
+                structured_lookup_used=any(i.source == SourceType.PROGRAMME for i in pool.items),
+                conversation_completed=True,
+            ))
+            asyncio.ensure_future(collect_performance(
+                stage="intelligent_evidence", latency_ms=collection_ms,
+                anon_session_id=_anon_session_id(chat_id),
+            ))
+            log.info(
+                "intelligent-analytics task_kind=%s answer_mode=status "
+                "no_current_info=True used_llm=False evidence_sources=%s "
+                "authority_sources=%s context_only_sources=%s",
+                kind, ",".join(sorted({i.source.value for i in pool.items})) or "-",
+                ",".join(status_types) or "-", ",".join(context_types) or "-",
+            )
+            return
+        synthesis_context = {
+            "mark_status": True,
+            "authority_ids": {id(i) for i in authority},
+        }
+    elif kind == "documents":
+        # P1-D: comparison honesty lives in the mode prompt, applied ONLY here.
+        system_prompt = STUDENT_ASSISTANT_SYSTEM_PROMPT + DOCUMENT_COMPARISON_RULES
+
+    # Surface dated official-source conflicts instead of silently choosing.
+    conflict_notes = dated_notice_conflicts(pool) if kind in ("status", "documents") else []
+    if conflict_notes or plan_used:
+        synthesis_context = dict(synthesis_context or {})
+    if conflict_notes:
+        synthesis_context.setdefault("conflict_notes", set()).update(conflict_notes)
+    if plan_used and information_plan is not None:
+        synthesis_context["expected_facts"] = list(information_plan.required_facts)
+
+    # Minimal provenance: one cited entry per distinct evidence source, with
+    # the verified https URL attached when one exists (never fabricated).
+    cited: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in pool.items:
+        key = (item.title, item.source.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {
+            "document_title": item.title or item.source.value,
+            "source": item.source.value,
+            "score": item.relevance,
+        }
+        if item.url:
+            entry["url"] = item.url
+        if item.issued_at:
+            entry["issued_at"] = item.issued_at
+        cited.append(entry)
+
+    try:
+        synth_kwargs: dict[str, Any] = {"chat_id": chat_id, "system": system_prompt}
+        if synthesis_context is not None:
+            synth_kwargs["context"] = synthesis_context
+        async for text in synthesize_answer(
+            original_query,
+            subs,
+            pool,
+            **synth_kwargs,
+        ):
+            yield {"type": "token", "text": text}
+    except Exception as exc:
+        log.error("intelligent synthesis failed chat=%s: %s", chat_id, exc)
+        yield {
+            "type": "error",
+            "message": "The knowledge service is temporarily unavailable. Please try again in a moment.",
+        }
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": cited}
+        return
+
+    used_sources = sorted({i.source.value for i in pool.items})
+    conflicted = bool(conflict_notes or validation.conflicting)
+    yield {
+        "type": "done",
+        "chat_id": chat_id,
+        "cited_chunks": cited,
+        "intelligent_debug": {
+            "kind": kind,
+            "sub_queries": [s.as_dict() for s in subs],
+            "evidence_items": [i.as_dict() for i in pool.items],
+            "validation": validation.as_dict(),
+            "evidence_latency_ms": collection_ms,
+            "plan_used": plan_used,
+            "plan_latency_ms": plan_ms,
+            "information_plan": information_plan.as_dict() if plan_used else None,
+        },
+    }
+    state.last_intent = "knowledge"
+    asyncio.ensure_future(collect_event(
+        anon_session_id=_anon_session_id(chat_id),
+        conversation_id=chat_id,
+        planner_action="intelligent",
+        response_source="intelligent",
+        route_chosen="intelligent",
+        detected_programme=entities.programme or ctx.programme,
+        detected_topic=entities.topic or ctx.topic,
+        service_requested=kind,
+        detected_service=kind,
+        llm_used=True,
+        rag_used="rag" in used_sources,
+        structured_lookup_used="programme" in used_sources,
+        conversation_completed=True,
+    ))
+    asyncio.ensure_future(collect_performance(
+        stage="intelligent_evidence", latency_ms=collection_ms,
+        anon_session_id=_anon_session_id(chat_id),
+    ))
+    if plan_used:
+        asyncio.ensure_future(collect_performance(
+            stage="intelligent_plan", latency_ms=plan_ms,
+            anon_session_id=_anon_session_id(chat_id),
+        ))
+    log.info(
+        "intelligent-analytics task_kind=%s needs_current=%s no_current_info=False "
+        "used_llm=True evidence_sources=%s evidence_conflicts=%s "
+        "information_plan_used=%s",
+        kind, kind == "status", ",".join(used_sources) or "-", conflicted, plan_used,
+    )
+
+
 async def _handle_university_notices(
     db: Session,
     chat_id: str,
@@ -1076,6 +1427,155 @@ async def _handle_official_documents(
             "_query": {"via": "official_documents"},
         }
         yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+
+
+async def _handle_general_knowledge(
+    db: Session,
+    user_id: str,
+    message: str,
+    chat_id: str,
+    state: ConversationState,
+    ctx: ConversationContext,
+    plan_result: Any,
+    served: dict[str, bool] | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Answer from the curated general-knowledge records (Rule 3ab-bis).
+
+    The planner resolved the question against a small, curated, source-bound
+    record set (``app.orchestrator.general_knowledge``). This handler does no
+    retrieval and no planning: it renders the matched verified facts with at
+    most ONE guarded generation call, reusing the same shared LLM gate,
+    streaming head gate and poison detectors the rest of the pipeline uses.
+
+    Honesty contract:
+      * the model may only restate the curated verified facts, and every link
+        it may print is already in those facts;
+      * an empty, parroted, collapsed or internal-structure-echoing
+        generation collapses to the deterministic fallback sentence;
+      * ANY failure (no records, gate timeout, generation error, bad plan
+        payload) degrades to the existing knowledge path, so this fast path
+        can never be the reason a student gets no answer.
+    """
+    from app.config import settings
+    from app.ingest.generator import GenerationError, stream_answer_async
+    from app.llm.gate import shared_llm_gate
+    from app.multi_source.synthesize import (
+        MISSING_EVIDENCE_FALLBACK,
+        _collapsed_to_fallback,
+        _echoed_internal_structure,
+        _head_is_safe,
+        _parroted_prompt,
+    )
+    from app.orchestrator.general_knowledge import (
+        GENERAL_KNOWLEDGE_SYSTEM_PROMPT,
+        build_generation_prompt,
+        resolve_general_knowledge,
+    )
+    from app.utils.logging import log
+
+    # Re-resolve defensively: the planner payload is advisory, and this keeps
+    # the handler correct when it is called directly (tests, future routes).
+    extra = plan_result.extra or {}
+    answer = None
+    try:
+        curated_ids = extra.get("curated_record_ids") or []
+        if curated_ids:
+            # Compound question: the planner already resolved each clause and
+            # unioned the record ids, so one context covers every clause. Falls
+            # back to a normal resolve if the ids no longer validate.
+            from app.orchestrator.general_knowledge import answer_from_record_ids
+
+            answer = answer_from_record_ids(curated_ids)
+        if answer is None:
+            answer = resolve_general_knowledge(plan_result.target or message, ctx)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("general knowledge resolve failed chat=%s: %s", chat_id, exc)
+        answer = None
+    if answer is None:
+        raw_records = extra.get("records") or []
+        if not raw_records:
+            _update_context_from_rag(ctx, getattr(plan_result, "entities", None), message)
+            state.last_intent = "knowledge"
+            async for event in run_chat(db, user_id, message, chat_id):
+                yield event
+            return
+
+    try:
+        question, fact_block = build_generation_prompt(
+            plan_result.target or message, answer
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("general knowledge prompt build failed chat=%s: %s", chat_id, exc)
+        state.last_intent = "knowledge"
+        async for event in run_chat(
+            db, user_id, message, chat_id, context=_build_rag_context(ctx, None)
+        ):
+            yield event
+        return
+
+    acquired = await shared_llm_gate.acquire(timeout=settings.MAX_SEMAPHORE_WAIT)
+    if not acquired:
+        state.last_intent = "knowledge"
+        async for event in run_chat(
+            db, user_id, message, chat_id, context=_build_rag_context(ctx, None)
+        ):
+            yield event
+        return
+
+    text = ""
+    head = ""
+    streaming = False
+    try:
+        async for token in stream_answer_async(
+            question,
+            fact_block,
+            system=GENERAL_KNOWLEDGE_SYSTEM_PROMPT,
+        ):
+            text += token
+            if streaming:
+                yield {"type": "token", "text": token}
+            else:
+                head += token
+                if _head_is_safe(head):
+                    streaming = True
+                    yield {"type": "token", "text": head}
+    except GenerationError as exc:
+        # Generation never started: degrade to the existing path so this fast
+        # path can never be the reason a student gets no answer.
+        log.warning("general knowledge generation failed chat=%s: %s", chat_id, exc)
+        state.last_intent = "knowledge"
+        async for event in run_chat(
+            db, user_id, message, chat_id, context=_build_rag_context(ctx, None)
+        ):
+            yield event
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("general knowledge generation error chat=%s: %s", chat_id, exc)
+        text = ""
+    finally:
+        shared_llm_gate.release()
+
+    if streaming:
+        if served is not None:
+            served["curated"] = True
+        state.last_intent = "knowledge"
+        yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
+        return
+
+    if not text.strip():
+        body = MISSING_EVIDENCE_FALLBACK
+    elif _parroted_prompt(text) or _collapsed_to_fallback(text) or _echoed_internal_structure(text):
+        body = MISSING_EVIDENCE_FALLBACK
+    else:
+        body = text.strip()
+
+    if served is not None:
+        served["curated"] = True
+    state.last_intent = "knowledge"
+    # A collapsed generation still ends in the honest fallback sentence — never
+    # a partially streamed fragment, and never a second LLM call.
+    yield {"type": "token", "text": body}
+    yield {"type": "done", "chat_id": chat_id, "cited_chunks": []}
 
 
 # Honest not-available texts for the official-source-only fee / division

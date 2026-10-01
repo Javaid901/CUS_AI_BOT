@@ -35,6 +35,8 @@ class SourceType(str, Enum):
     EXAMINATION = "examination"    # exam fee / model papers / division improvement
     NOTICES = "notices"            # verified date sheets / reports
     RAG = "rag"                    # hybrid Chroma + BM25 documentary retrieval
+    DOCUMENTS = "documents"        # verified + published official university documents
+    WEBSITE = "website"            # verified crawler snapshot pages (official site)
 
 
 _UNIVERSITY_SOURCES = {SourceType.PROGRAMME, SourceType.EXAMINATION, SourceType.NOTICES}
@@ -157,6 +159,33 @@ _DATESHEET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Deadline vocabulary — a concrete "by when" information need that only the
+# verified NOTICES source can answer ("last date", "deadline", "due date").
+# Without this a "fee, documents and last date" compound question split its
+# deadline off into the current-status funnel and answered it with an old
+# notice; here it becomes its own NOTICES sub-question.
+_DEADLINE_RE = re.compile(
+    r"\blast\s?dates?\b|\bclosing\s?dates?\b|\bdeadline(s)?\b|\bdue\s?dates?\b|"
+    r"\blast\s?days?\b|\bclosing\s?days?\b",
+    re.IGNORECASE,
+)
+
+# Procedure / process vocabulary. A process fragment ("admission process",
+# "how to apply", "revaluation process") is a knowledge need of its own — it is
+# kept as a fragment and answered from the documentary RAG source (ProgrammeFacts
+# carries NO admission process data, so it must never map to PROGRAMME).
+_PROCESS_RE = re.compile(
+    r"\badmission\s+(process|procedure)\b|\bapplication\s+(process|procedure)\b|"
+    r"\bhow\s+to\s+apply\b|\b(?:re-?evaluation|revaluation|admission)\s+"
+    r"(?:process|procedure)\b|\bprocedures?\b|\bprocesses?\b",
+    re.IGNORECASE,
+)
+
+
+def is_deadline_text(text: str) -> bool:
+    """True when the fragment/text asks for a concrete deadline date."""
+    return bool(_DEADLINE_RE.search(str(text or "")))
+
 # Vocabulary that ties a fragment to the university corpus (vs. generic text).
 _UNI_VOCAB_RE = re.compile(
     r"\b(mca|mba|bca|bba|bsc|msc|mcom|bcom|btech|bachelor|master|programme|program|"
@@ -184,6 +213,13 @@ def _detect_attribute(frag: str) -> str | None:
         return "model_papers"
     if _WHEN_EXAM_RE.search(frag) or _DATESHEET_RE.search(frag):
         return "schedule"
+    # A deadline need ("last date", "deadline", "due date") routes to NOTICES.
+    if _DEADLINE_RE.search(frag):
+        return "deadline"
+    # A procedure / process need is a kept knowledge fragment (RAG), never a
+    # programme-profile attribute (ProgrammeFacts carries no admission process).
+    if _PROCESS_RE.search(frag):
+        return "process"
     for attr, regex in _PROGRAMME_ATTR_RES.items():
         if regex.search(frag):
             return attr
@@ -201,6 +237,15 @@ def _source_for(frag: str, full: str) -> SourceType:
         return SourceType.EXAMINATION
     if attr == "schedule":
         return SourceType.NOTICES
+    if attr == "deadline":
+        return SourceType.NOTICES
+    if attr == "process":
+        return SourceType.RAG
+    # A BARE fee fragment ("what is the fee") is a programme-facts request —
+    # only the programme fee is stored in ProgrammeFacts (the P2-D fix for
+    # "eligibility, fee and last date" splitting its fee into the wrong place).
+    if _FEE_WORD.search(frag):
+        return SourceType.PROGRAMME
     if attr in _PROGRAMME_ATTR_RES:
         return SourceType.PROGRAMME
     return SourceType.RAG
@@ -310,3 +355,88 @@ def query_category(subs: list[SubQuery]) -> str:
     if any(s in _UNIVERSITY_SOURCES for s in sources):
         return "UNIVERSITY_KNOWLEDGE" if len(sources - _UNIVERSITY_SOURCES) == 0 else "MIXED_QUERY"
     return "GENERAL_KNOWLEDGE"
+
+
+def _build_programme_label(message: str, entities: Any, ctx: Any) -> str | None:
+    """Resolve a programme for the intelligent fragment the same way the
+    evidence collector does (sub-text > whole-message entities > context)."""
+    try:
+        from app.examination.metadata import extract_programme
+    except Exception:
+        return _programme_from(message)
+    for candidate in (
+        message,
+        getattr(entities, "programme", None) or "",
+        getattr(ctx, "programme", None) or "",
+    ):
+        prog = extract_programme(candidate)
+        if prog:
+            return str(prog)
+    return None
+
+
+def build_intelligent_subs(
+    message: str,
+    entities: Any | None = None,
+    ctx: Any | None = None,
+    kind: str = "knowledge",
+) -> list[SubQuery]:
+    """Address a single implicit intelligent fragment from bounded sources.
+
+    The general student-assistant path keeps the question as ONE fragment (the
+    message is never over-split); the evidence layer below collects per-source
+    views of it. Each generated SubQuery carries its own source class and a
+    DISTINCT sub-text so the evidence pool groups them cleanly and cross-source
+    content divergence inside one intelligent answer is never mis-flagged as a
+    conflict between two answers to the same sub-question.
+
+    ``kind`` is ``"status"`` (current-status questions — notices first),
+    ``"documents"`` (document/notice comparison — notices and dated
+    notifications first) or ``"knowledge"`` (procedures / multi-aspect
+    university knowledge — structured programme facts first).
+    """
+    text = (message or "").strip()
+    if not text:
+        return []
+    prog = _build_programme_label(text, entities, ctx)
+    prefix = f"{prog.upper()}: " if prog else ""
+
+    subs: list[SubQuery] = []
+    if kind == "status":
+        # Status questions: the flagship sub-question is the notices view.
+        subs.append(SubQuery(text=text, source=SourceType.NOTICES))
+        if prog:
+            subs.append(SubQuery(text=f"{prefix}{text}", source=SourceType.PROGRAMME))
+    elif kind == "documents":
+        # Document comparison questions: notices and dated notifications are
+        # the sources whose dates decide "newer" / "still valid".
+        subs.append(SubQuery(text=text, source=SourceType.NOTICES))
+        if prog:
+            subs.append(SubQuery(text=f"{prefix}{text}", source=SourceType.PROGRAMME))
+    else:
+        if prog:
+            subs.append(SubQuery(text=f"{prefix}{text}", source=SourceType.PROGRAMME))
+        subs.append(SubQuery(text=text, source=SourceType.NOTICES))
+    # For comparison the documents view is phrased to surface dated
+    # notifications/notices (whose published dates the answer can compare);
+    # the status/knowledge wording is unchanged.
+    docs_text = (
+        f"Official CUS notices and notifications with their published dates "
+        f"relevant to: {text}"
+        if kind == "documents"
+        else f"Official CUS documents relevant to: {text}"
+    )
+    subs.append(SubQuery(text=docs_text, source=SourceType.DOCUMENTS))
+    subs.append(
+        SubQuery(
+            text=f"Pages on the official CUS website relevant to: {text}",
+            source=SourceType.WEBSITE,
+        )
+    )
+    subs.append(
+        SubQuery(
+            text=f"Supporting detail from the university knowledge base for: {text}",
+            source=SourceType.RAG,
+        )
+    )
+    return subs

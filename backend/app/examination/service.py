@@ -66,7 +66,13 @@ def _doc_meta_fields(row: WebsitePage) -> dict[str, Any]:
     ``academic_year`` are surfaced when the crawler-sourced ``doc_meta``
     JSON carries a non-empty value. All other keys are silently ignored.
     """
+    import json
     meta = row.doc_meta or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
     out: dict[str, Any] = {}
     for key in ("subject", "programme", "semester", "batch", "academic_year"):
         val = meta.get(key)

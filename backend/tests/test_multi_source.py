@@ -201,10 +201,12 @@ def _plan_action(raw: str, ctx: ConversationContext | None = None):
 
 
 def test_single_source_exam_fee_not_rerouted():
-    """A lone exam-fee question keeps the dedicated examination service."""
+    """An exam-fee question WITH a programme uses the catalogue for programme-specific fee."""
     p = _plan_action("what is the MCA exam fee")
     assert p.action != "multi_source"
-    assert p.action == "examination", f"expected examination, got {p.action}"
+    # Now uses catalogue for programme-specific examination fee
+    assert p.action == "structured", f"expected structured (catalogue), got {p.action}"
+    assert "examination_fee" in p.target or "fee" in p.target
 
 
 def test_division_improvement_single_task_not_rerouted():

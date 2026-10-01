@@ -274,8 +274,8 @@ ollama serve
 Pull required models
 ollama pull llama3.2:1b
 ollama pull nomic-embed-text
-Start backend
-python -m uvicorn app.main:app --reload
+Start backend (serves the UI and API on http://localhost:8001)
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 📌 Future Enhancements
 PostgreSQL support
 Mobile application

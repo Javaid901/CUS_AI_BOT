@@ -124,6 +124,19 @@ def toggle_active(db: Session, user_id: str) -> dict:
     return _user_view(db, user)
 
 
+def delete_admin(db: Session, user_id: str) -> dict:
+    """Permanently delete an Authority Admin account.
+
+    The Authority itself is preserved (only the admin account is removed).
+    Grievances are linked to the Authority, not the admin account, so they remain intact.
+    """
+    user = _user_or_raise(db, user_id)
+    deleted_info = _user_view(db, user)
+    db.delete(user)
+    db.commit()
+    return deleted_info
+
+
 def list_rows(
     db: Session,
     query: str | None = None,

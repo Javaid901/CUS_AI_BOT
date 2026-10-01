@@ -202,6 +202,41 @@ def _subjects_list(db, prog: dict[str, Any]) -> list[dict[str, Any]]:
         return []
 
 
+def _extract_fee_by_type(prog: dict[str, Any], fee_type: str) -> str | None:
+    """Extract a specific fee type value from the programme's fee_structure.
+
+    Matches fee_type against entry labels (case-insensitive):
+      - "examination" -> "examination fee", "exam fee", "exam form fee"
+      - "admission"   -> "admission fee", "admission charges"
+      - "tuition"     -> "tuition fee", "tuition fees", "annual tuition"
+      - "late"        -> "late fee", "late payment fee"
+      - "programme"   -> "programme fee", "course fee" (fallback)
+    Returns the fee value string or None if not found.
+    """
+    fee_structure = prog.get("fee_structure") or []
+    if not fee_structure:
+        return None
+
+    fee_type = (fee_type or "").strip().lower()
+    type_keywords: dict[str, list[str]] = {
+        "examination": ["examination fee", "exam fee", "exam form fee", "examination charges", "exam charges"],
+        "admission": ["admission fee", "admission charges", "admission cost"],
+        "tuition": ["tuition fee", "tuition fees", "annual tuition", "semester tuition", "tuition"],
+        "late": ["late fee", "late payment fee", "late fine", "penalty"],
+        "programme": ["programme fee", "course fee", "program fee", "total fee"],
+    }
+    keywords = type_keywords.get(fee_type, [fee_type])
+
+    for entry in fee_structure:
+        label = str(entry.get("label") or "").strip().lower()
+        value = str(entry.get("value") or "").strip()
+        if not value:
+            continue
+        if any(kw in label for kw in keywords):
+            return value
+    return None
+
+
 def _fee(prog, db):
     entries = [e for e in (prog.get("fee_structure") or []) if str(e.get("value") or "").strip()]
     if entries:

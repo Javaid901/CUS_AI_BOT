@@ -172,6 +172,16 @@ def on_startup() -> None:
     log.info("Analytics module initialized")
 
 
+@app.on_event("startup")
+async def _install_llm_streaming_client() -> None:
+    """Install the shared Ollama streaming client so HTTP connections are
+    reused across SSE generations instead of being created per call."""
+    from app.ingest.generator import install_async_client
+
+    install_async_client()
+    log.info("Shared LLM streaming client installed")
+
+
 def _init_redis() -> None:
     """Startup probe for the Redis layer (non-fatal).
 
@@ -204,6 +214,14 @@ def on_shutdown() -> None:
         log.info("Redis client pools closed")
     except Exception as exc:  # noqa: BLE001
         log.debug("Redis shutdown: %s", exc)
+
+
+@app.on_event("shutdown")
+async def _close_llm_streaming_client() -> None:
+    from app.ingest.generator import close_async_client
+
+    await close_async_client()
+    log.info("Shared LLM streaming client closed")
 
 
 def _start_analytics_scheduler() -> None:

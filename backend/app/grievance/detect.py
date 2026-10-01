@@ -110,6 +110,8 @@ _COMPLAINT_MARKERS: list[str] = [
     # explicit complaint words
     "complaint",
     "complaining",
+    "complain about",
+    "complain",
     "grievance",
     "harassment",
     "discriminated",

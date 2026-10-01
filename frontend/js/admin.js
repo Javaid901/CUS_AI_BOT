@@ -70,14 +70,24 @@
     fetch(url, {
       method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "username=" + encodeURIComponent(f.username.value) + "&password=" + encodeURIComponent(f.password.value),
-    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+    }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, status: r.status, d: d }; }); })
       .then(function (res) {
         if (res.ok && res.d.access_token) {
           setToken(res.d.access_token);
           if (res.d.refresh_token) setRefreshToken(res.d.refresh_token);
           showDash();
         } else {
-          toast("Login failed: " + (res.d.detail || "invalid credentials"), "error");
+          // Only a 401 means bad credentials — that message is unchanged. Any
+          // other status is a backend / database fault and must never be
+          // reported to the user as "invalid credentials".
+          var err = res.d.detail || "";
+          if (!err) {
+            if (res.status === 401) err = "invalid credentials";
+            else if (res.d.error && res.d.error.message) err = String(res.d.error.message);
+            else if (res.status >= 500) err = "server error (" + res.status + ") — please try again later";
+            else err = "unexpected response from the server";
+          }
+          toast("Login failed: " + err, "error");
         }
       })
       .catch(function () { toast("Cannot reach backend (" + API + ")", "error"); });
@@ -2437,6 +2447,25 @@ function wsRunNow() {
       apiJson(API + "/api/admin/authority-admins/" + encodeURIComponent(a.id) + "/toggle", "POST").then(function (res) {
         if (res.ok) { toast("Account " + (a.is_active ? "deactivated" : "activated"), "success"); openAADetail(a.id); loadAuthorityAdmins(); }
         else toast("Failed: " + extractApiError(res), "error");
+      });
+    });
+    if ($("aaDetailDelete")) $("aaDetailDelete").addEventListener("click", function () {
+      if (!_aaDetail) return;
+      var a = _aaDetail;
+      var msg = "Are you sure you want to permanently delete this authority administrator?\n\n" +
+        "Account: " + (a.full_name || a.username) + " (" + a.username + ")\n" +
+        "Authority: " + (a.authority_name || "Unassigned") + "\n\n" +
+        "This will permanently delete the administrator account. " +
+        "The associated Authority and all grievances/history will be PRESERVED.\n\n" +
+        "Type DELETE to confirm:";
+      var typed = prompt(msg);
+      if (typed !== "DELETE") return;
+      apiJson(API + "/api/admin/authority-admins/" + encodeURIComponent(a.id), "DELETE").then(function (res) {
+        if (res.ok) {
+          toast("Authority Admin permanently deleted", "success");
+          closeAADetail();
+          loadAuthorityAdmins();
+        } else toast("Failed: " + extractApiError(res), "error");
       });
     });
     if ($("aaAuthoritySelect")) $("aaAuthoritySelect").addEventListener("change", updateAAPreview);

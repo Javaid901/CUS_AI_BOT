@@ -85,10 +85,13 @@ _SUBJECT_ALIASES: dict[str, str] = {
 }
 
 # Longest phrase first so "computer science" wins over "computer".
+# The pattern matches subject names even when concatenated with "ModelPaper", "QP", etc.
+# We use a negative lookbehind to avoid matching in the middle of words (e.g., "CyberZoology"),
+# and allow the subject to be followed by "ModelPaper", "QuestionPaper", "QP", or standard word boundaries.
 _SUBJECT_PATTERN = re.compile(
-    r"\b(" + "|".join(
+    r"(?<![A-Za-z])(" + "|".join(
         re.escape(a) for a in sorted(_SUBJECT_ALIASES, key=len, reverse=True)
-    ) + r")\b",
+    ) + r")(?=(?:Model\s*Paper|Model\s*Question\s*Paper|Question\s*Paper|QP|Paper|QP\s*\d*|_|-|\s|\b|$))",
     re.IGNORECASE,
 )
 

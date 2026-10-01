@@ -174,6 +174,7 @@ def _seed():
 # ---------------------------------------------------------------------------
 
 def _route(raw: str):
+    from app.orchestrator.planner import plan
     ctx = ConversationContext()
     e = extract_entities(raw)
     return plan(raw, ctx, "rt-" + uuid.uuid4().hex[:8], e)
@@ -241,7 +242,6 @@ def test_planner_routes_examination_services():
             "what is the exam fee",
             "examination fee structure",
             "exam form fee",
-            "bca examination fee",
             "fee_structure_exam",  # chip id
         ],
         "division_improvement": [
@@ -258,6 +258,11 @@ def test_planner_routes_examination_services():
             p = _route(raw)
             assert p.action == "examination", f"{raw!r} -> {p.action}"
             assert p.target == target, f"{raw!r} -> {p.target}"
+
+    # "bca examination fee" - planner correctly finds programme and returns structured fee from catalogue
+    p = _route("bca examination fee")
+    assert p.action == "structured", f"'bca examination fee' -> {p.action}"
+    assert "examination_fee" in p.target or "fee" in p.target
 
 
 def test_planner_exclusions_never_examination():

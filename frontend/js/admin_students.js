@@ -558,7 +558,7 @@
         "<li>Student profile</li><li>Results</li><li>Admit Cards</li><li>Exam Forms</li><li>Sessions</li></ul>" +
         '<p style="color:#b91c1c;font-weight:700;font-size:14px;margin-bottom:10px;">This action cannot be undone.</p>' +
         _field("Type <b>DELETE</b> to continue", "delete_confirm", "", { required: true, maxlength: 20 });
-      var ov = _modalForm("&#9888; Delete Student", body, function (err) {
+      var ov = _modalForm("\u26A0 Delete Student", body, function (err) {
         var typed = _readForm(["delete_confirm"]).delete_confirm;
         if (typed !== "DELETE") { err("Type DELETE to confirm the permanent delete."); return; }
         del(BASE + "/" + id).then(function () {

@@ -112,7 +112,12 @@
       .then(function (res) {
         loginBusy = false; $("loginBtn").disabled = false; $("loginBtn").textContent = "Login";
         if (!res.ok || !res.data.access_token) {
-          var msg = apiError(res, "Invalid username or password.") || "Invalid username or password.";
+          // Only a 401 means bad credentials; anything else is a backend fault
+          // and must not be reported as an invalid username or password.
+          var fallback = res.status === 401
+            ? "Invalid username or password."
+            : "Cannot sign in right now. Please try again later.";
+          var msg = apiError(res, fallback) || fallback;
           $("loginError").textContent = msg; $("loginError").style.display = "block";
           return;
         }

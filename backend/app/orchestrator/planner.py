@@ -5,6 +5,7 @@ Decision planner — decides the optimal execution path for each user message.
 
 Planner output (Plan):
   action:   "structured" | "navigation" | "rag" | "llm" | "clarify" | "welcome" | "news" | "authority"
+            | "general_knowledge" | "intelligent" | "catalogue" | "official_documents" | ...
   target:   the object of the action (programme ID, topic, etc.)
   response: pre-built structured response (if action is "structured" or "navigation")
   confidence: 0.0–1.0
@@ -38,6 +39,15 @@ Decision rules (applied in order):
    17. Short ambiguous → clarify
    18. Everything else → rag
 
+Protected / specialised rules that run BEFORE the generic fallthroughs above,
+in this order: student services, results, admit card, exam form, grievance,
+notices / date sheets, examination services, official documents (Rule 3ab),
+then the CURATED GENERAL UNIVERSITY KNOWLEDGE layer (Rule 3ab-bis), then the
+intelligent / current-status gate (Rule 3ac), then the multi-source and RAG
+fallbacks. The curated layer is a FAST PATH for evergreen admission facts; it
+returns None for current-status, programme-specific and notice-freshness
+questions so those keep the route they have today.
+
 Slot-fill: when a concrete topic (fee, eligibility, duration, ...) is requested
 without a programme, the assistant asks a single targeted question for the missing
 slot instead of falling back to browse buttons. The answer continues the original
@@ -70,7 +80,7 @@ from app.catalogue.detect import (
     detect_catalogue_request,
     programme_overview_request,
 )
-from app.catalogue.service import programme_by_id
+from app.catalogue.service import programme_by_id, resolve_programme
 from app.grievance.detect import detect_grievance
 from app.orchestrator.context import (
     COLLEGE_TOPICS,
@@ -80,6 +90,7 @@ from app.orchestrator.context import (
     detect_programme_switch,
     is_referential_followup,
     is_university_related,
+    is_clearly_non_university,
 )
 from app.orchestrator.contract import build_contract, detect_fee_type
 from app.multi_source.decompose import decompose_query, query_category
@@ -272,6 +283,85 @@ def plan(
     return result
 
 
+_COMPOUND_UG_RE = re.compile(
+    r"\b(ug|undergraduate|undergrad|bachelor|bachelors|b\.?sc|fyugp)\b", re.IGNORECASE
+)
+_COMPOUND_PG_RE = re.compile(
+    r"\b(pg|postgraduate|postgrad|master|master'?s|m\.?sc|m\.?com|mba|mca|med|integrated)\b",
+    re.IGNORECASE,
+)
+
+
+def _compound_level_hint(raw: str) -> str | None:
+    """The single level a compound question names, if it names exactly one."""
+    if _COMPOUND_UG_RE.search(raw) and _COMPOUND_PG_RE.search(raw):
+        return None  # genuinely cross-level: keep the records separate
+    if _COMPOUND_PG_RE.search(raw):
+        return "postgraduate"
+    if _COMPOUND_UG_RE.search(raw):
+        return "undergraduate"
+    return None
+
+
+def _level_siblings(record_ids: list[str], hint_level: str | None) -> list[str]:
+    """Add the same topic's record at the level the question actually asked for.
+
+    A generic clause such as "what is the admission process" resolves to the
+    undergraduate record, because that is the default pathway. When the
+    compound question is really about postgraduate admission, the undergraduate
+    process is the wrong record to answer with, so the postgraduate sibling of
+    the same topic is included as well.
+    """
+    if not hint_level or not record_ids:
+        return record_ids
+    from app.orchestrator.general_knowledge import knowledge_records
+
+    records = knowledge_records()
+    by_id = {r.id: r for r in records}
+    by_topic: dict[str, dict[str, object]] = {}
+    for rec in records:
+        by_topic.setdefault(rec.topic, {})[rec.level] = rec
+
+    out = list(record_ids)
+    for rid in record_ids:
+        rec = by_id.get(rid)
+        if rec is None or rec.level in (hint_level, "general"):
+            continue
+        sibling = by_topic.get(rec.topic, {}).get(hint_level)
+        if sibling is not None and sibling.id not in out:
+            out.append(sibling.id)
+    return out
+
+
+def _compound_curated_record_ids(subs, raw_message, ctx, entities) -> list[str]:
+    """Union the curated record ids matching every clause of a compound question.
+
+    Returns an empty list unless EVERY clause resolves to curated admission
+    records, so a genuinely multi-source compound question (one that also needs
+    programme data, examination services or live status) is never diverted. The
+    clause count is capped because a long compound question is a real
+    multi-source question, not a single admission topic asked twice.
+    """
+    if not subs or len(subs) > 3:
+        return []
+    from app.orchestrator.general_knowledge import resolve_general_knowledge
+
+    record_ids: list[str] = []
+    for sub in subs:
+        clause = (getattr(sub, "text", "") or "").strip()
+        if not clause:
+            return []
+        try:
+            answer = resolve_general_knowledge(clause, ctx, entities=entities)
+        except Exception:
+            return []
+        if answer is None or not answer.records:
+            return []
+        record_ids.extend(rec.id for rec in answer.records)
+    record_ids = list(dict.fromkeys(record_ids))
+    return _level_siblings(record_ids, _compound_level_hint(raw_message or ""))
+
+
 def _plan_inner(
     message: str,
     ctx: ConversationContext,
@@ -292,6 +382,26 @@ def _plan_inner(
     text = message.strip().lower()
     clean = text.rstrip("?.,!;:")
     e = entities
+
+    # ---- Stage 0-pre-safety: Blocked manipulation attempts ----
+    # Deterministic pre-filter for attempts to bypass, forge or tamper with
+    # university records / systems. Runs on the RAW message BEFORE any greeting,
+    # grievance, protected student-service, retrieval or LLM path and never
+    # consults the database. Legitimate remedies ("my marks are incorrect, how
+    # do I correct them?") are never blocked.
+    try:
+        from app.orchestrator.safety import detect_blocked_manipulation
+
+        blocked_reason = detect_blocked_manipulation(text)
+        if blocked_reason:
+            return Plan(
+                action="blocked",
+                target=blocked_reason,
+                confidence=0.99,
+                reason=f"Blocked manipulation attempt ({blocked_reason})",
+            )
+    except Exception:
+        pass  # the safety filter must never break the normal flow
 
     # ---- Stage 0-pre: Raw-message intent (greeting / grievance) ----
     # These checks run on the RAW message, BEFORE query understanding. The
@@ -356,6 +466,29 @@ def _plan_inner(
     try:
         subs = decompose_query(message, entities, ctx)
         if subs:
+            # A compound question whose EVERY clause is answerable from the
+            # curated admission records must not be decomposed into the
+            # multi-source retrieval path. Each clause is resolved on its own
+            # and the record ids are unioned, so the whole question is served
+            # by ONE context and ONE generation call (Rule 3ab-bis) instead of
+            # falling through to per-clause retrieval. A question that mixes
+            # curated material with anything else (programme data, examination
+            # services, live status) still takes the multi-source path.
+            curated_ids = _compound_curated_record_ids(subs, message, ctx, entities)
+            if curated_ids:
+                return Plan(
+                    action="general_knowledge",
+                    target=message,
+                    confidence=0.9,
+                    reason=(
+                        "Compound question fully covered by curated admission "
+                        f"records ({len(curated_ids)} records)"
+                    ),
+                    extra={
+                        "curated_record_ids": curated_ids,
+                        "original_query": message.strip(),
+                    },
+                )
             return Plan(
                 action="multi_source",
                 target=clean,
@@ -548,7 +681,22 @@ def _plan_inner(
     # single-programme catalogue rules so both targets survive. Structured
     # side-by-side data is rendered when both exist in the catalogue; the
     # engine falls back to scoped knowledge retrieval otherwise.
-    if len(getattr(e, "programmes", None) or []) >= 2 and not is_college_reference(text):
+    #
+    # P2-C guard: query-understanding preprocessing mangles Hinglish current-
+    # status phrasing ("MCA ka form abhi bhar sakte hain?" -> "MCA ka form abhi
+    # ba date hain?"), producing phantom extra "programmes" ("ba") that would
+    # otherwise land a genuine status question on the comparison route. When
+    # the RAW (pre-preprocessing) message is itself a current-status question,
+    # the comparison route is skipped so the intelligent status gate (Rule 3ac)
+    # decides it.
+    _is_raw_status = False
+    try:
+        from app.orchestrator.current_status import classify_current_status
+
+        _is_raw_status = classify_current_status((message or "").strip().lower())
+    except Exception:
+        _is_raw_status = False
+    if len(getattr(e, "programmes", None) or []) >= 2 and not is_college_reference(text) and not _is_raw_status:
         _comparison_topic = e.topic
         if _comparison_topic is None:
             try:
@@ -611,6 +759,27 @@ def _plan_inner(
         if exam_pid:
             ctx.programme = exam_pid
             ctx.programme_id = exam_pid
+        # For examination fee queries with a resolved programme, check catalogue first
+        # to return programme-specific fee from the academic catalogue.
+        if exam_intent["target"] == "fee_structure_exam" and exam_pid:
+            fee_value = _extract_specific_fee(exam_pid, "examination")
+            if fee_value:
+                detail = lookup_programme(exam_pid)
+                title = detail.get("title", exam_pid.upper()) if detail else exam_pid.upper()
+                fields = [{"label": "Examination Fee", "value": fee_value}]
+                return Plan(
+                    action="structured",
+                    response={
+                        "type": "detail",
+                        "title": f"{title} — Examination Fee",
+                        "fields": fields,
+                        "actions": _build_actions(exam_pid, "examination_fee"),
+                        "context": _build_context_dict(ctx),
+                    },
+                    target=f"{exam_pid}/examination_fee",
+                    confidence=0.98,
+                    reason=f"Examination fee for {exam_pid} from catalogue",
+                )
         return Plan(
             action="examination",
             target=exam_intent["target"],
@@ -641,6 +810,104 @@ def _plan_inner(
                 ),
                 extra=official_doc_intent,
             )
+
+    # ---- Rule 3ab-bis: Curated general university knowledge ----
+    # Evergreen GENERAL admission knowledge ("which website do I apply on",
+    # "which documents do I need for registration", "what is the PG
+    # application fee", "who do I contact about admission") is answered from a
+    # small curated, source-bound record set instead of the generic RAG
+    # loop, which cannot reliably surface these facts.
+    #
+    # Placement is deliberate and load-bearing:
+    #   * AFTER every protected / specialised rule above (student services,
+    #     results, admit card, exam form, grievance, authorities, notices /
+    #     date sheets, examination services, official documents) so this layer
+    #     can never take a request that already has a dedicated owner;
+    #   * BEFORE the intelligent gate below, so a known evergreen question
+    #     never pays for the multi-source evidence sweep;
+    #   * the resolver itself returns None for current-status / deadline
+    #     questions, for programme-specific questions (the catalogue owns
+    #     those) and for notice-freshness comparisons, so those keep their
+    #     existing paths untouched.
+    # A resolver failure is swallowed: the planner continues exactly as it
+    # would have without this block.
+    #
+    # Match against `message` (the RAW user text), never the Stage 0 corrected
+    # `text`: process_query_understanding() fuzzy-spell-corrects the query
+    # ("work" -> "worth", "cluster" -> "clustr"), so matching the corrected
+    # string silently dropped real questions such as "How does UG admission
+    # work?". The curated records are authored against how students actually
+    # phrase things, so the original wording is the correct input. This does
+    # not change any other rule — every other rule still sees `text`.
+    if not (e.word_count <= 1 and is_option_selection(text)):
+        try:
+            from app.orchestrator.general_knowledge import (
+                resolve_general_knowledge,
+            )
+
+            general_answer = resolve_general_knowledge(message, ctx, entities=e)
+        except Exception:  # noqa: BLE001 - never break the planner
+            general_answer = None
+        if general_answer:
+            return Plan(
+                action="general_knowledge",
+                target=message,
+                confidence=0.9,
+                reason=(
+                    "Curated general university knowledge: "
+                    + ", ".join(r.id for r in general_answer.records)
+                ),
+                extra=general_answer.to_dict(),
+            )
+
+    # ---- Rule 3ac: General student-assistant (intelligent) gate ----
+    # Complex university knowledge / procedure questions and current-status
+    # questions ("when will the results be announced?", "is admission open?",
+    # "explain the admission procedure") take the evidence-gathered
+    # student-assistant path instead of the generic catalogue / profile / rag
+    # fallthroughs. The gate runs HERE — after every protected single-service
+    # rule (student services, results, admit card, exam form, grievance,
+    # authorities, notices / date sheets, examination services, official
+    # documents) and after the multi-source decomposition stage — but BEFORE
+    # the generic catalogue / news / programme-profile / programme-topic
+    # routes, so genuinely status- or procedure-flavoured university questions
+    # are never silently answered by a bare profile, overview or rag retrieval
+    # carrying stale or invented "current" facts.
+    #
+    # The gate is deliberately conservative (see
+    # app.orchestrator.current_status): it only fires for genuinely
+    # university-related messages; fee / catalogue / slot-fill / news /
+    # semester / comparison queries keep their existing deterministic routes;
+    # short ambiguous fragments stay in the clarify flow. On this decision
+    # path the engine builds the bounded evidence sub-queries via
+    # app.multi_source.decompose.build_intelligent_subs.
+    try:
+        from app.orchestrator.current_status import gate_intelligent
+
+        # P2-C: query-understanding preprocessing mangles Hinglish current-status
+        # phrasing ("MCA admission band hai?" -> "MCA admission ba hall"), wiping
+        # the very cue words the gate keyed on. Evaluate the gate on BOTH the
+        # cleaned text and the RAW (pre-preprocessing) message; English queries
+        # are effectively identical either way, while Hinglish status questions
+        # keep their cue words.
+        intelligent_kind = gate_intelligent(text, e, ctx)
+        if not intelligent_kind:
+            _raw_for_gate = (message or "").strip().lower()
+            if _raw_for_gate and _raw_for_gate != text:
+                intelligent_kind = gate_intelligent(_raw_for_gate, e, ctx)
+    except Exception:
+        intelligent_kind = None
+    if intelligent_kind:
+        return Plan(
+            action="intelligent",
+            target=text,
+            confidence=0.85,
+            reason=f"General student-assistant ({intelligent_kind}): {text}",
+            extra={
+                "original_query": text,
+                "intelligent_kind": intelligent_kind,
+            },
+        )
 
     # ---- Rule 3b: Academic catalogue (NEP) ----
     # Structured catalogue data (programmes, subjects, VAC/SEC/AEC, credits,
@@ -781,11 +1048,31 @@ def _plan_inner(
         _derive_level_for(ctx, e.programme)
         # Fee type disambiguation: explicit examination fee or context fee_type
         if e.topic == "fee" and (detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination"):
+            # Try to extract specific examination fee from catalogue first
+            fee_value = _extract_specific_fee(e.programme, "examination")
+            if fee_value:
+                detail = lookup_programme(e.programme)
+                title = detail.get("title", e.programme.upper()) if detail else e.programme.upper()
+                fields = [{"label": "Examination Fee", "value": fee_value}]
+                return Plan(
+                    action="structured",
+                    response={
+                        "type": "detail",
+                        "title": f"{title} — Examination Fee",
+                        "fields": fields,
+                        "actions": _build_actions(e.programme, "examination_fee"),
+                        "context": _build_context_dict(ctx),
+                    },
+                    target=f"{e.programme}/examination_fee",
+                    confidence=0.98,
+                    reason=f"Examination fee for {e.programme} from catalogue",
+                )
+            # Fallback to examination service (website pages)
             return Plan(
                 action="examination",
                 target="fee_structure_exam",
                 confidence=0.95,
-                reason=f"Examination fee for {e.programme} (explicit or context)",
+                reason=f"Examination fee for {e.programme} (explicit or context) - no catalogue data",
                 extra={"programme": e.programme},
             )
         value = lookup_field(e.programme, e.topic)
@@ -1400,9 +1687,30 @@ def _plan_inner(
                 )
         else:
             # Fee type was determined (explicit or from context). Route accordingly.
-            # If examination fee, route to examination service (works without programme).
+            # If examination fee AND a programme is resolved, try catalogue first.
             # If programme fee, fall through to programme slot-fill (needs programme).
             if fee_type == "examination":
+                prog = e.programme or ctx.programme
+                if prog:
+                    fee_value = _extract_specific_fee(prog, "examination")
+                    if fee_value:
+                        detail = lookup_programme(prog)
+                        title = detail.get("title", prog.upper()) if detail else prog.upper()
+                        fields = [{"label": "Examination Fee", "value": fee_value}]
+                        return Plan(
+                            action="structured",
+                            response={
+                                "type": "detail",
+                                "title": f"{title} — Examination Fee",
+                                "fields": fields,
+                                "actions": _build_actions(prog, "examination_fee"),
+                                "context": _build_context_dict(ctx),
+                            },
+                            target=f"{prog}/examination_fee",
+                            confidence=0.98,
+                            reason=f"Examination fee for {prog} from catalogue",
+                        )
+                # Fallback to examination service (works without programme or no catalogue data)
                 return Plan(
                     action="examination",
                     target="fee_structure_exam",
@@ -1455,13 +1763,31 @@ def _plan_inner(
     # ---- Rule 11: Programme + topic without structured data → RAG ----
     # Skipped when the message names a different programme (switch → Rule 5b/12).
     if ctx.programme and e.topic and not (e.programme and e.programme != ctx.programme):
-        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        # Fee type disambiguation: if fee_type is "examination", try catalogue first
         if e.topic == "fee" and getattr(ctx, "fee_type", None) == "examination":
+            fee_value = _extract_specific_fee(ctx.programme, "examination")
+            if fee_value:
+                detail = lookup_programme(ctx.programme)
+                title = detail.get("title", ctx.programme.upper()) if detail else ctx.programme.upper()
+                fields = [{"label": "Examination Fee", "value": fee_value}]
+                return Plan(
+                    action="structured",
+                    response={
+                        "type": "detail",
+                        "title": f"{title} — Examination Fee",
+                        "fields": fields,
+                        "actions": _build_actions(ctx.programme, "examination_fee"),
+                        "context": _build_context_dict(ctx),
+                    },
+                    target=f"{ctx.programme}/examination_fee",
+                    confidence=0.95,
+                    reason=f"Examination fee for {ctx.programme} from catalogue",
+                )
             return Plan(
                 action="examination",
                 target="fee_structure_exam",
                 confidence=0.9,
-                reason=f"Examination fee for {ctx.programme} (context fee_type, no structured data)",
+                reason=f"Examination fee for {ctx.programme} (context fee_type, no catalogue data)",
                 extra={"programme": ctx.programme},
             )
         # No structured data found, try RAG
@@ -1481,11 +1807,29 @@ def _plan_inner(
         if e.topic:
             # Fee type disambiguation for programme switch
             if e.topic == "fee" and (detect_fee_type(message, e, ctx) == "examination" or getattr(ctx, "fee_type", None) == "examination"):
+                fee_value = _extract_specific_fee(prog_switch, "examination")
+                if fee_value:
+                    detail = lookup_programme(prog_switch)
+                    title = detail.get("title", prog_switch.upper()) if detail else prog_switch.upper()
+                    fields = [{"label": "Examination Fee", "value": fee_value}]
+                    return Plan(
+                        action="structured",
+                        response={
+                            "type": "detail",
+                            "title": f"{title} — Examination Fee",
+                            "fields": fields,
+                            "actions": _build_actions(prog_switch, "examination_fee"),
+                            "context": _build_context_dict(ctx),
+                        },
+                        target=f"{prog_switch}/examination_fee",
+                        confidence=0.98,
+                        reason=f"Examination fee for {prog_switch} from catalogue",
+                    )
                 return Plan(
                     action="examination",
                     target="fee_structure_exam",
                     confidence=0.95,
-                    reason=f"Examination fee for {prog_switch} (explicit or context)",
+                    reason=f"Examination fee for {prog_switch} (explicit or context) - no catalogue data",
                     extra={"programme": prog_switch},
                 )
             value = lookup_field(prog_switch, e.topic)
@@ -1539,13 +1883,31 @@ def _plan_inner(
 
     # ---- Rule 14: Short follow-up with programme context ----
     if ctx.programme and _is_short_followup(text, e):
-        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        # Fee type disambiguation: if fee_type is "examination", try catalogue first
         if (e.topic == "fee" or ctx.topic == "fee") and getattr(ctx, "fee_type", None) == "examination":
+            fee_value = _extract_specific_fee(ctx.programme, "examination")
+            if fee_value:
+                detail = lookup_programme(ctx.programme)
+                title = detail.get("title", ctx.programme.upper()) if detail else ctx.programme.upper()
+                fields = [{"label": "Examination Fee", "value": fee_value}]
+                return Plan(
+                    action="structured",
+                    response={
+                        "type": "detail",
+                        "title": f"{title} — Examination Fee",
+                        "fields": fields,
+                        "actions": _build_actions(ctx.programme, "examination_fee"),
+                        "context": _build_context_dict(ctx),
+                    },
+                    target=f"{ctx.programme}/examination_fee",
+                    confidence=0.95,
+                    reason=f"Examination fee follow-up for {ctx.programme} from catalogue",
+                )
             return Plan(
                 action="examination",
                 target="fee_structure_exam",
                 confidence=0.85,
-                reason=f"Examination fee follow-up for {ctx.programme} (context fee_type)",
+                reason=f"Examination fee follow-up for {ctx.programme} (context fee_type, no catalogue data)",
                 extra={"programme": ctx.programme},
             )
         augmented = _augment_for_rag(ctx, clean, e)
@@ -1559,13 +1921,31 @@ def _plan_inner(
 
     # ---- Rule 15: Broad question with context → RAG ----
     if e.is_question and ctx.programme:
-        # Fee type disambiguation: if fee_type is "examination", route to examination service
+        # Fee type disambiguation: if fee_type is "examination", try catalogue first
         if (e.topic == "fee" or ctx.topic == "fee") and getattr(ctx, "fee_type", None) == "examination":
+            fee_value = _extract_specific_fee(ctx.programme, "examination")
+            if fee_value:
+                detail = lookup_programme(ctx.programme)
+                title = detail.get("title", ctx.programme.upper()) if detail else ctx.programme.upper()
+                fields = [{"label": "Examination Fee", "value": fee_value}]
+                return Plan(
+                    action="structured",
+                    response={
+                        "type": "detail",
+                        "title": f"{title} — Examination Fee",
+                        "fields": fields,
+                        "actions": _build_actions(ctx.programme, "examination_fee"),
+                        "context": _build_context_dict(ctx),
+                    },
+                    target=f"{ctx.programme}/examination_fee",
+                    confidence=0.95,
+                    reason=f"Examination fee question for {ctx.programme} from catalogue",
+                )
             return Plan(
                 action="examination",
                 target="fee_structure_exam",
                 confidence=0.8,
-                reason=f"Examination fee question for {ctx.programme} (context fee_type)",
+                reason=f"Examination fee question for {ctx.programme} (context fee_type, no catalogue data)",
                 extra={"programme": ctx.programme},
             )
         augmented = _augment_for_rag(ctx, text, e)
@@ -1575,6 +1955,19 @@ def _plan_inner(
             confidence=0.7,
             reason=f"Question with programme context: {text}",
             extra={"original_query": text, "augmented_query": augmented},
+        )
+
+    # ---- Scope guard: Clearly non-university queries ----
+    # This check runs early (before Rule 16/17/18) to prevent clearly
+    # non-university questions (e.g., "explain laws of motion", "what is
+    # photosynthesis") from entering the university RAG pipeline.
+    if is_clearly_non_university(message):
+        return Plan(
+            action="scope",
+            target=message,
+            confidence=0.95,
+            reason=f"Clearly non-university query: {message}",
+            extra={"scope_response": True},
         )
 
     # ---- Rule 16: Broad question without context → RAG ----
@@ -1673,6 +2066,47 @@ def _is_short_followup(text: str, entities: Any) -> bool:
     if clean in DOMAIN_KEYWORDS:
         return False
     return not (entities.word_count == 1 and clean in PROGRAMME_ALIASES)
+
+
+def _extract_specific_fee(programme_code_or_id: str, fee_type: str) -> str | None:
+    """Extract a specific fee type value from the programme's catalogue fee_structure.
+
+    programme_code_or_id: programme code (e.g., "bba"), UUID id, or alias
+    fee_type: "examination", "admission", "tuition", "late", "programme"
+    Returns the fee value string or None if not found.
+    """
+    # First resolve the programme (handles code, name, alias, or UUID)
+    resolved = resolve_programme(programme_code_or_id)
+    if not resolved:
+        return None
+    prog_id = resolved.get("id")
+    if not prog_id:
+        return None
+    prog = programme_by_id(prog_id)
+    if not prog:
+        return None
+    fee_structure = prog.get("fee_structure") or []
+    if not fee_structure:
+        return None
+
+    fee_type = (fee_type or "").strip().lower()
+    type_keywords: dict[str, list[str]] = {
+        "examination": ["examination fee", "exam fee", "exam form fee", "examination charges", "exam charges"],
+        "admission": ["admission fee", "admission charges", "admission cost"],
+        "tuition": ["tuition fee", "tuition fees", "annual tuition", "semester tuition", "tuition"],
+        "late": ["late fee", "late payment fee", "late fine", "penalty"],
+        "programme": ["programme fee", "course fee", "program fee", "total fee"],
+    }
+    keywords = type_keywords.get(fee_type, [fee_type])
+
+    for entry in fee_structure:
+        label = str(entry.get("label") or "").strip().lower()
+        value = str(entry.get("value") or "").strip()
+        if not value:
+            continue
+        if any(kw in label for kw in keywords):
+            return value
+    return None
 
 
 def _build_topic_fields(topic: str, value: str, programme: str) -> list[dict[str, str]]:

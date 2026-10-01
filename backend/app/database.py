@@ -258,6 +258,18 @@ def _upgrade_schema() -> None:
             "raw_path": "VARCHAR(500)",
             "raw_sha256": "VARCHAR(64)",
         },
+        # Refresh tokens: databases created by an earlier revision persisted only
+        # a SHA-256 `token_hash`, while the RefreshToken ORM stores the raw
+        # `token`. On those databases the column is missing entirely, so every
+        # login aborts inside create_refresh_token() with
+        # UndefinedColumn: column "token" of relation "refresh_tokens" does not
+        # exist. Added NULLABLE here on purpose — a NOT NULL ADD COLUMN fails
+        # whenever the table already holds rows; the column is tightened back to
+        # NOT NULL (and given its unique index) further down, once the legacy
+        # rows have been given a placeholder value.
+        "refresh_tokens": {
+            "token": "VARCHAR(255)",
+        },
     }
     inspector = inspect(engine)
     try:
@@ -299,6 +311,57 @@ def _upgrade_schema() -> None:
             ))
     except Exception:
         pass
+
+    # ----- refresh_tokens.token (login repair) ------------------------------
+    # Continues the ADD COLUMN above for databases that only ever stored the
+    # hashed `token_hash` variant. Their existing rows are KEPT (never dropped,
+    # never deleted); they simply receive a stable, unique placeholder in the
+    # new column, because a raw token can never be recovered from a hash and
+    # POST /api/auth/login must not depend on them. The placeholder is derived
+    # from the primary key, so it is unique by construction and idempotent
+    # (only rows still NULL are touched). Order matters: backfill, then the
+    # unique index, then NOT NULL — each step is a no-op once the column is
+    # already correct.
+    try:
+        with engine.begin() as conn:
+            unbackfilled = conn.execute(
+                text("SELECT id FROM refresh_tokens WHERE token IS NULL")
+            ).fetchall()
+            for (row_id,) in unbackfilled:
+                conn.execute(
+                    text("UPDATE refresh_tokens SET token = :t WHERE id = :i"),
+                    {"t": f"legacy:{row_id}", "i": row_id},
+                )
+        if unbackfilled:
+            logger.info(
+                "upgrade: backfilled refresh_tokens.token for %d pre-existing row(s)", len(unbackfilled)
+            )
+    except Exception:
+        logger.debug("upgrade skip refresh_tokens.token backfill", exc_info=True)
+
+    # The ORM declares `token` as unique + indexed; recreate that index on
+    # databases that predate it (fresh tables get it from the ORM declaration).
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_refresh_tokens_token "
+                "ON refresh_tokens (token)"
+            ))
+    except Exception:
+        pass
+
+    # Only now that no row is NULL can the column match the ORM's
+    # nullable=False. PostgreSQL supports SET NOT NULL; SQLite cannot alter a
+    # column in place, so it is skipped there (its NOT NULL lives in the CREATE
+    # TABLE produced by create_all for fresh databases).
+    if is_pg:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE refresh_tokens ALTER COLUMN token SET NOT NULL"
+                ))
+        except Exception:
+            pass
 
     # Grievance tracking digests: unique index for existing databases (fresh
     # databases get it from the ORM index declaration). Lookups happen only

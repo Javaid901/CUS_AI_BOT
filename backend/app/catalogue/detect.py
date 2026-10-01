@@ -414,8 +414,9 @@ def detect_catalogue_request(
 
     # ---- 6) Fee structure (structured priority over legacy data) ----------
     if _FEE.search(lowered):
-        # Skip catalogue fee if fee_type is explicitly examination (handled by examination service)
-        if ctx is not None and getattr(ctx, "fee_type", None) == "examination":
+        # Skip catalogue fee if fee_type is explicitly examination AND no programme is resolved
+        # (examination service handles programme-less queries; with programme, use catalogue)
+        if ctx is not None and getattr(ctx, "fee_type", None) == "examination" and not resolved:
             return None
         if resolved:
             prog = programme_by_id(prog_id)

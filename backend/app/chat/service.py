@@ -4,16 +4,20 @@ backend/app/chat/service.py
 Chat orchestration:
   - retrieve relevant chunks using hybrid retrieval pipeline
   - if nothing relevant or evidence is weak, return the canned fallback (no LLM call)
-  - otherwise generate the answer fully (no live token streaming), validate it
-    (poisoned/echoed output or a confessed-unknown is replaced/trimmed to the
-    clean fallback), then yield the validated text as a token event
+  - otherwise generate the answer: a validated, safe lead-in head is yielded as
+    soon as it is confirmed (non-empty, no prompt-echo, no confession,
+    sentence-boundary ended) and every following token streams live; a poisoned
+    or confessed-unknown generation collapses to the clean fallback exactly as
+    before. Document-scoped follow-ups keep strict full-buffer generation so the
+    exact no-substitution decision can inspect the whole answer.
   - yield structured events for the SSE layer: tokens, then a final "done" event
     carrying chat_id, cited_chunks, and retrieval diagnostics.
   - Also persists conversation + messages.
 
 Performance:
   - Retrieval results are cached per query (TTL 60s) to avoid repeated embedding calls.
-  - Generation uses a shared HTTP client and keep_alive for warm models.
+  - Generation streams progressively (leading token to first visible answer) and
+    uses a shared HTTP client and keep_alive for warm models.
 """
 
 from __future__ import annotations
@@ -46,6 +50,18 @@ from sqlalchemy.orm import Session
 # selected Model Paper that cannot answer the question must return EXACTLY
 # this string — the bot must never guess or pull facts from another paper.
 _DOC_SCOPED_UNAVAILABLE = "I don't have information available."
+
+# Minimum validated lead-in before live token streaming starts. The leading
+# tokens are buffered only until they form a real, un-poisoned answer fragment;
+# that head is then yielded and the rest streams live. A generation that ends
+# before a safe head exists (empty / short / prompt-parroting / confession) is
+# handled by the full validation chain below, exactly like the previous fully
+# buffered behaviour.
+_STREAM_HEAD_CHARS = 48
+# Hard ceiling: even if no sentence-boundary token ever aligns, release the
+# buffered head once it reaches this size so streaming can never stall on a
+# tokenizer that splits mid-sentence.
+_STREAM_HEAD_MAX_CHARS = 96
 
 
 def _doc_scope_active(context: dict[str, Any] | None) -> bool:
@@ -301,6 +317,47 @@ def _llm_parroted_prompt(text: str) -> bool:
     return re.search(r"\[source\s*\d+\s*:", normalized) is not None
 
 
+def _llm_echoed_internal_structure(text: str) -> bool:
+    """True when the generation reproduces the INTERNAL answer skeleton
+    instead of answering: an explicit template intro ("here are the answers
+    to the questions you asked..."), and/or a numbered sub-question template
+    ("1. ... 2. ...") combined with the internal evidence-card format
+    ("- Source (Title):" with parentheses) or the not-found disclaimer. A
+    human-format answer never combines those signatures (it cites as
+    "[Source: Title, Page]" without numeric labels or parenthesised decks), so
+    their simultaneous presence is the small local model copying the internal
+    context/evidence template — collapse it cleanly.
+
+    Notes: the not-found/not-available markers are compared against the
+    apostrophe-STRIPPED normalization (the same ``replace("'", "")`` used for
+    every other detector), so the marker constants here must be spelled WITHOUT
+    apostrophes — otherwise they could never match a real generation."""
+    normalized = " ".join(text.lower().replace("'", "").split())
+    if not normalized:
+        return False
+    # Signature 1: the LEAD-IN template intro ("here are the answers to the
+    # questions ...") the model emits when it re-organises its reply around the
+    # numbered sub-question list instead of answering. Checked FIRST because
+    # the buffered head reaches it before any numbered item appears; flagging
+    # it (only when it leads the reply, within the first head window) stops the
+    # streaming hole where the head is released live.
+    if re.search(
+        r"\b(?:here are|below are|following are)\s+(?:the\s+)?answers",
+        normalized[:80],
+    ):
+        return True
+    if not re.search(r"(?:^|\s)\d+\.\s", normalized):
+        return False
+    if "- source (" in normalized:
+        return True
+    if (
+        "dont have information available" in normalized
+        or "couldnt find this information" in normalized
+    ):
+        return True
+    return False
+
+
 def _confession_cut(text: str) -> int:
     """End position of the first 'not in knowledge base' confession sentence.
 
@@ -326,6 +383,31 @@ def _llm_fallback_events(message: str) -> list[dict[str, Any]]:
     if fb.get("options"):
         events.append(fb["options"])
     return events
+
+
+def _stream_head_safe(text: str) -> bool:
+    """A buffered lead-in is streamable when it is a substantial, validated
+    answer fragment: non-empty, free of prompt parroting AND free of the
+    'not in knowledge base' confession, and either ended at a natural sentence
+    boundary (so a cut-off can never reach the client) AFTER the minimum length
+    OR grown past the hard ceiling (so a tokenizer that never lands on a
+    sentence boundary cannot stall the stream). Holding back until this is
+    confirmed means a poisoned or confessed-only generation still collapses to
+    the clean fallback instead of leaking into the live token stream."""
+    if not text or not text.strip():
+        return False
+    if _llm_parroted_prompt(text):
+        return False
+    if _llm_confessed_unknown(text):
+        return False
+    if _llm_echoed_internal_structure(text):
+        return False
+    stripped = text.strip()
+    if len(stripped) < _STREAM_HEAD_CHARS:
+        return False
+    if len(stripped) >= _STREAM_HEAD_MAX_CHARS:
+        return True
+    return stripped.endswith((".", "?", "!", ":", "\n"))
 
 
 def _context_cache_key(context: dict[str, Any]) -> str:
@@ -441,15 +523,20 @@ async def run_chat(
             for event in events:
                 yield event
     else:
-        # Generate fully BEFORE streaming anything to the client: with a
-        # small local model, a generation can be poisoned (it echoes the
-        # prompt/context, or hallucinates after confessing it cannot
-        # answer). Only validated text may reach the user; poisoned or
-        # confessed-unknown output is replaced with the clean fallback.
+        # Generate and stream: with a small local model a generation can be
+        # poisoned (it echoes the prompt/context, or hallucinates after
+        # confessing it cannot answer). The leading tokens are buffered only
+        # until a validated, safe head is confirmed; that head is streamed and
+        # every following token arrives live. A poisoned or confessed-only
+        # generation never reaches a streamable head — it collapses through the
+        # validation chain below to the clean fallback exactly as before.
+        # Document-scoped follow-ups stay fully buffered: their exact
+        # no-substitution decision needs the whole answer before release.
         context_block = format_context(chunks)
         scope_note = _scope_note(retrieval_context)
         if scope_note:
             context_block = f"{context_block}\n\n{scope_note}"
+        doc_scoped = _doc_scope_active(retrieval_context)
         acquired = await shared_llm_gate.acquire(timeout=settings.MAX_SEMAPHORE_WAIT)
         if not acquired:
             # Shared LLM budget exhausted (chat + grievance). Fall back cleanly —
@@ -460,20 +547,33 @@ async def run_chat(
             for event in events:
                 yield event
         else:
+            head = ""
+            streaming = False
             try:
                 try:
                     async for token in stream_answer_async(message, context_block):
                         assistant_text += token
+                        if streaming:
+                            # Safe head confirmed earlier; stream live and never
+                            # re-validate (the head gate already passed).
+                            yield {"type": "token", "text": token}
+                        elif not doc_scoped:
+                            head += token
+                            if _stream_head_safe(head):
+                                streaming = True
+                                yield {"type": "token", "text": head}
                 except GenerationError as exc:
                     log.error("Generation failed: %s", exc)
-                    events, assistant_text = _fallback_events(message)
-                    for event in events:
-                        yield event
+                    if not doc_scoped and not streaming:
+                        events, assistant_text = _fallback_events(message)
+                        for event in events:
+                            yield event
                 except Exception as exc:
                     log.error("Generation error chat=%s: %s", chat_id, exc)
-                    events, assistant_text = _fallback_events(message)
-                    for event in events:
-                        yield event
+                    if not doc_scoped and not streaming:
+                        events, assistant_text = _fallback_events(message)
+                        for event in events:
+                            yield event
             finally:
                 # Guaranteed slot release on success, failure AND cancellation —
                 # an asyncio.CancelledError during stream_answer_async unwinds
@@ -481,42 +581,50 @@ async def run_chat(
                 shared_llm_gate.release()
         # Never emit an empty bubble: an empty / whitespace-only generation is
         # replaced with the full professional fallback (text + options).
-        if not assistant_text.strip():
-            log.warning("Generation returned empty text; falling back cleanly")
-            events, assistant_text = _fallback_events(message)
-            for event in events:
-                yield event
-        elif _llm_parroted_prompt(assistant_text):
-            log.warning("Generation parroted the prompt; falling back cleanly")
-            events, assistant_text = _fallback_events(message)
-            for event in events:
-                yield event
-        elif _llm_confessed_unknown(assistant_text):
-            if _doc_scope_active(retrieval_context):
-                # Selected Model Paper (document-scoped) follow-up: the
-                # in-scope evidence does not support the requested answer.
-                # Return the EXACT no-substitution text — never the generic
-                # knowledge-base refusal, and never an unvalidated prefix.
-                assistant_text = _DOC_SCOPED_UNAVAILABLE
-                yield {"type": "token", "text": assistant_text}
-            else:
-                cut = _confession_cut(assistant_text)
-                prefix = assistant_text[:cut].rstrip() if cut > 0 else assistant_text
-                if prefix.strip():
-                    assistant_text = prefix
+        # A doc-scoped generation is always fully validated below; a streamed
+        # generation has already released its validated head + live tail.
+        if doc_scoped or not streaming:
+            if not assistant_text.strip():
+                log.warning("Generation returned empty text; falling back cleanly")
+                events, assistant_text = _fallback_events(message)
+                for event in events:
+                    yield event
+            elif _llm_parroted_prompt(assistant_text):
+                log.warning("Generation parroted the prompt; falling back cleanly")
+                events, assistant_text = _fallback_events(message)
+                for event in events:
+                    yield event
+            elif _llm_echoed_internal_structure(assistant_text):
+                log.warning("Generation echoed the internal answer skeleton; falling back cleanly")
+                events, assistant_text = _fallback_events(message)
+                for event in events:
+                    yield event
+            elif _llm_confessed_unknown(assistant_text):
+                if _doc_scope_active(retrieval_context):
+                    # Selected Model Paper (document-scoped) follow-up: the
+                    # in-scope evidence does not support the requested answer.
+                    # Return the EXACT no-substitution text — never the generic
+                    # knowledge-base refusal, and never an unvalidated prefix.
+                    assistant_text = _DOC_SCOPED_UNAVAILABLE
                     yield {"type": "token", "text": assistant_text}
-                    for event in _llm_fallback_events(message):
-                        yield event
                 else:
-                    # The model answered with ONLY the "not in knowledge base"
-                    # sentence — the prefix is empty. Keep it clean: emit the full
-                    # fallback (text + authority card + options) instead of an
-                    # empty token.
-                    events, assistant_text = _fallback_events(message)
-                    for event in events:
-                        yield event
-        else:
-            yield {"type": "token", "text": assistant_text}
+                    cut = _confession_cut(assistant_text)
+                    prefix = assistant_text[:cut].rstrip() if cut > 0 else assistant_text
+                    if prefix.strip():
+                        assistant_text = prefix
+                        yield {"type": "token", "text": assistant_text}
+                        for event in _llm_fallback_events(message):
+                            yield event
+                    else:
+                        # The model answered with ONLY the "not in knowledge base"
+                        # sentence — the prefix is empty. Keep it clean: emit the full
+                        # fallback (text + authority card + options) instead of an
+                        # empty token.
+                        events, assistant_text = _fallback_events(message)
+                        for event in events:
+                            yield event
+            else:
+                yield {"type": "token", "text": assistant_text}
 
     # Persist assistant message + update conversation timestamp in a fresh
     # short-lived session (the request session was already released).

@@ -150,3 +150,141 @@ def test_revoked_refresh_token_rejected() -> None:
     assert rr.status_code == 401, rr.text
     msg = (rr.json().get("error") or {}).get("message") or rr.json().get("detail")
     assert msg == "Invalid refresh token"
+
+
+# --------------------------------------------------------------------------- #
+# Schema-repair regression (the login outage this guards against)
+# --------------------------------------------------------------------------- #
+def test_legacy_refresh_tokens_schema_is_repaired_without_data_loss(
+    monkeypatch,
+) -> None:
+    """A database created by the earlier `token_hash` revision must gain the
+    `token` column the RefreshToken ORM expects — otherwise every login dies
+    with UndefinedColumn: column "token" of relation "refresh_tokens" does not
+    exist. The repair must keep every pre-existing refresh token, must be
+    idempotent, and must leave an already-correct schema untouched.
+    """
+    import os
+    import tempfile
+
+    import sqlalchemy as sa
+    from app import database as database_module
+
+    legacy_db = os.path.join(tempfile.mkdtemp(prefix="cus_legacy_rt_"), "legacy.db")
+    legacy_engine = sa.create_engine(f"sqlite:///{legacy_db}", future=True)
+    # Exactly the shape the live PostgreSQL database had: `token_hash` instead
+    # of `token`, and already populated with refresh tokens.
+    with legacy_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "CREATE TABLE refresh_tokens ("
+                " id CHAR(32) NOT NULL PRIMARY KEY,"
+                " user_id CHAR(32) NOT NULL,"
+                " token_hash VARCHAR(64),"
+                " expires_at DATETIME NOT NULL,"
+                " created_at DATETIME NOT NULL,"
+                " revoked BOOLEAN NOT NULL)"
+            )
+        )
+        for i in range(3):
+            conn.execute(
+                sa.text(
+                    "INSERT INTO refresh_tokens"
+                    " (id, user_id, token_hash, expires_at, created_at, revoked)"
+                    " VALUES (:id, :uid, :h, '2030-01-01 00:00:00',"
+                    " '2026-01-01 00:00:00', 0)"
+                ),
+                {"id": uuid.uuid4().hex, "uid": uuid.uuid4().hex, "h": f"hash{i}"},
+            )
+
+    monkeypatch.setattr(database_module, "engine", legacy_engine)
+    database_module._upgrade_schema()
+    database_module._upgrade_schema()  # second run must be a no-op
+
+    with legacy_engine.begin() as conn:
+        cols = {c["name"] for c in sa.inspect(legacy_engine).get_columns("refresh_tokens")}
+        rows = conn.execute(
+            sa.text("SELECT id, token, token_hash FROM refresh_tokens")
+        ).fetchall()
+
+    assert "token" in cols, "refresh_tokens.token must exist after the upgrade"
+    assert len(rows) == 3, "no pre-existing refresh token may be dropped"
+    assert all(r[1] for r in rows), "every legacy row needs a non-NULL token"
+    assert len({r[1] for r in rows}) == 3, "backfilled tokens must be unique"
+    assert {r[2] for r in rows} == {"hash0", "hash1", "hash2"}, "token_hash preserved"
+    legacy_engine.dispose()
+
+
+def test_authority_admin_login_persists_refresh_token() -> None:
+    """The Authority Admin portal uses the same endpoint; it must get a usable
+    access token and a persisted refresh token exactly like the Super Admin."""
+    from app.models import Authority
+
+    username = f"__sess_aa_{uuid.uuid4().hex[:8]}"
+    password = "secret123"
+    db = SessionLocal()
+    try:
+        authority = Authority(
+            department_name="Examination Cell",
+            authority_name=f"Test Authority {uuid.uuid4().hex[:6]}",
+            email=f"aa_{uuid.uuid4().hex[:6]}@test.local",
+            phone="0000000000",
+        )
+        db.add(authority)
+        db.commit()
+        db.refresh(authority)
+        user = User(
+            id=uuid.uuid4(),
+            username=username,
+            email=f"{username}@test.local",
+            hashed_password=hash_password(password),
+            role="authority_admin",
+            is_active=True,
+            authority_id=authority.id,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        _CREATED_USER_IDS.append(str(user.id))
+        authority_id = str(authority.id)
+    finally:
+        db.close()
+
+    r = _login(username, password)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["user"]["role"] == "authority_admin"
+    assert body["user"]["authority_id"] == authority_id
+    assert body["access_token"] and body["refresh_token"]
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(RefreshToken)
+            .filter(RefreshToken.token == body["refresh_token"])
+            .first()
+        )
+        assert row is not None, "authority_admin login must persist its refresh token"
+        assert str(row.user_id) == str(user.id)
+        _CREATED_REFRESH_IDS.append(str(row.id))
+    finally:
+        db.close()
+
+    rr = _CLIENT.post("/api/auth/refresh", json={"refresh_token": body["refresh_token"]})
+    assert rr.status_code == 200, rr.text
+    profile = _CLIENT.get(
+        "/api/authority-admin/profile",
+        headers={"Authorization": f"Bearer {rr.json()['access_token']}"},
+    )
+    assert profile.status_code == 200, profile.text
+    assert profile.json()["username"] == username
+
+
+def test_invalid_credentials_still_rejected() -> None:
+    user, password = _create_admin()
+    r = _CLIENT.post(
+        "/api/auth/login",
+        data={"username": user.username, "password": password + "-wrong"},
+    )
+    assert r.status_code == 401, r.text
+    assert not r.json().get("access_token")

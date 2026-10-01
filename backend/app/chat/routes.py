@@ -61,7 +61,14 @@ def _sse(event: str | None, data: str) -> str:
     """
     if event:
         return f"event: {event}\ndata: {data}\n\n"
-    lines = data.splitlines() or [""]
+    # split("\n"), NOT splitlines(): splitlines() also DISCARDS the terminator,
+    # so a token whose whole content is a newline ("\n") collapsed to a single
+    # empty data field and the newline was lost. Every list break between two
+    # streamed tokens then vanished and numbered steps ran together on one line
+    # ("...preferences there.2. The portal publishes...") for the real client
+    # as well. Splitting on "\n" alone keeps a one-to-one round trip, because
+    # EventSource rejoins the data fields of a frame with "\n".
+    lines = data.split("\n")
     return "".join(f"data: {line}\n" for line in lines) + "\n"
 
 
@@ -69,19 +76,23 @@ def _structured_event(event_type: str, payload: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
 
 
-# SSE keepalive cadence. The chat path fully buffers LLM generation (up to the
-# 180s generator timeout) producing no frames in between; without a heartbeat,
-# proxies and EventSource can drop a long idle stream in the middle of an answer.
+# SSE keepalive cadence. Frames are drained as they are produced so tokens can
+# stream to the client progressively; the heartbeat only fires when the wrapped
+# generator is genuinely idle for this long (admission queue wait, retrieval, a
+# slow single data-frame event). Without a heartbeat, proxies and EventSource
+# can still drop a long idle stream, so the comment keeps the socket warm.
 SSE_HEARTBEAT_INTERVAL = 15.0
 
 
 async def _sse_with_heartbeat(frame_iter: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
-    """Inject SSE keepalive comments while the wrapped generator is awaiting.
+    """Forward frames IMMEDIATELY as they arrive and inject keepalive comments
+    only while the wrapped generator is idle.
 
-    Every `SSE_HEARTBEAT_INTERVAL` seconds with no output, a bare `: ping`
-    comment line is emitted. SSE comments carry no data and EventSource ignores
-    them, so no new event type reaches the frontend and the byte-level frame
-    contract of every existing event is unchanged.
+    Frames are drained from the pump queue as soon as they are produced — an
+    LLM token event reaches the client the moment it is yielded instead of
+    sitting in the queue until the whole generation finishes. When the queue
+    has nothing for `SSE_HEARTBEAT_INTERVAL`, a bare `: ping` comment line is
+    emitted (SSE comments carry no data; EventSource ignores them).
 
     Cancellation-safe: on asyncio.CancelledError (client disconnect / server
     shutdown) the pump task is cancelled, which unwinds the wrapped generator
@@ -100,16 +111,21 @@ async def _sse_with_heartbeat(frame_iter: AsyncGenerator[str, None]) -> AsyncGen
     pump = asyncio.create_task(_pump())
     try:
         while True:
-            try:
-                await asyncio.wait_for(done.wait(), timeout=SSE_HEARTBEAT_INTERVAL)
-            except asyncio.TimeoutError:
-                # Still alive (e.g. mid-generation) — keep the socket warm.
-                yield ": ping\n\n"
-                continue
-            # Producer finished: drain remaining frames in order, then stop.
+            # Drain whatever is already available so tokens stream live.
             while not queue.empty():
                 yield queue.get_nowait()
-            return
+            if done.is_set():
+                return
+            # Idle: wait for the next frame OR the keepalive window, whichever
+            # comes first.
+            try:
+                frame = await asyncio.wait_for(
+                    queue.get(), timeout=SSE_HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            yield frame
     finally:
         pump.cancel()
         try:

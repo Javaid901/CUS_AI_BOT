@@ -47,6 +47,18 @@ class EvidenceItem:
     relevance: float = 1.0
     confidence: float = 1.0
     direct: bool = True
+    # --- P0: general student-assistant provenance metadata ---
+    # All optional and appended AFTER the original fields so every existing
+    # positional call site keeps its meaning.
+    url: str = ""            # verified https URL when one exists (never craft)
+    issued_at: str = ""      # ISO date when the fact was published
+    last_synced: str = ""    # ISO date when a source was last synced
+    verified: bool = False   # True when the underlying record is admin-verified
+    source_label: str = ""   # human label of the provenance (e.g. document type)
+    programme: str = ""      # programme id this record belongs to (if any)
+    semester: str = ""       # semester this record belongs to (if any)
+    batch: str = ""          # academic batch this record belongs to (if any)
+    doc_id: str = ""         # canonical document id (UniversityDocument / page)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -58,11 +70,53 @@ class EvidenceItem:
             "relevance": self.relevance,
             "confidence": self.confidence,
             "direct": self.direct,
+            "url": self.url,
+            "issued_at": self.issued_at,
+            "last_synced": self.last_synced,
+            "verified": self.verified,
+            "source_label": self.source_label,
+            "programme": self.programme,
+            "semester": self.semester,
+            "batch": self.batch,
+            "doc_id": self.doc_id,
         }
 
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _https_only(url: str | None) -> str:
+    """Return the URL only when it is a verified https address (never invent)."""
+    url = (url or "").strip()
+    return url if url.startswith("https://") else ""
+
+
+def _norm_programme(programme: str | None) -> str | None:
+    return str(programme or "").strip().lower() or None
+
+
+_STOPWORDS = frozenset({
+    "what", "when", "how", "why", "who", "which", "where", "is", "are", "was",
+    "were", "do", "does", "did", "can", "could", "will", "would", "should",
+    "the", "a", "an", "of", "to", "for", "in", "on", "at", "and", "or", "but",
+    "with", "from", "about", "please", "me", "my", "i", "you", "yes", "no",
+    "tell", "show", "give", "list", "have", "has", "been", "released", "open",
+    "being", "your", "this", "that", "it", "its",
+})
+
+
+def _sig_tokens(text: str, limit: int = 4) -> list[str]:
+    """Significant tokens from the message used as a bounded keyword probe."""
+    seen: list[str] = []
+    for tok in re.findall(r"[a-z0-9]+", (text or "").lower()):
+        if len(tok) < 3 or tok in _STOPWORDS:
+            continue
+        if tok not in seen:
+            seen.append(tok)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 @dataclass
@@ -145,6 +199,127 @@ def validate(pool: EvidencePool, subs: Sequence[SubQuery]) -> ValidationResult:
         missing=tuple(missing),
         conflicting=tuple(conflicting),
     )
+
+
+# ---------------------------------------------------------------------------
+# P1 — Current-status evidence isolation
+# ---------------------------------------------------------------------------
+#
+# A current-status question ("is admission open?", "has the result been
+# declared?", "which notice is newer?") must be answered ONLY from evidence
+# that can actually establish the CURRENT state of something. General RAG
+# knowledge and programme-profile facts (eligibility / fee / duration) can be
+# true and still say nothing about whether something is open / released /
+# announced TODAY — so they can never act as status authority.
+#
+# These helpers are deterministic, use ONLY metadata the evidence already
+# carries, and never touch the retrieval layer. They add a status/currentness
+# lens to the existing intelligent path; ordinary evidence behavior is
+# unchanged for non-status modes.
+
+# UniversityDocument doc_type values that are announcement-shaped (they can
+# communicate a current state) as opposed to evergreen reference material
+# ('other_official_document' regulations / schemes / syllabi).
+_STATUS_AUTHORITY_DOC_TYPES = frozenset({"official_notification"})
+
+
+def _item_status_subjects(item: EvidenceItem) -> frozenset[str]:
+    """Status-capable subjects an evidence item can establish status for,
+    derived from its own provenance (title / text / source label)."""
+    from app.orchestrator.current_status import status_subjects_of
+
+    hay = " ".join((
+        item.title or "",
+        item.text or "",
+        item.source_label or "",
+    ))
+    return status_subjects_of(hay)
+
+
+def is_status_authority(
+    item: EvidenceItem,
+    status_subjects: frozenset[str] | None = None,
+) -> bool:
+    """True when this evidence item is capable of establishing current status.
+
+    Deterministic rules:
+      * verified/published university NOTICES are announcement-shaped by
+        construction -> authority (P2-B: requires ``verified``).
+      * official UniversityDocuments are authority ONLY when they are dated
+        AND classified ``official_notification`` (an actual announcement);
+        evergreen regulations / schemes (``other_official_document``) are NOT.
+      * verified official WebsitePages are authority only when they carry a
+        sync date (a dated, currently-known page).
+      * structured programme facts and general RAG knowledge are NEVER status
+        authority (they may be true background but cannot prove an open /
+        released / announced state).
+
+    ``status_subjects`` is the P2-B subject-alignment lens: when provided (and
+    non-empty), an item is authority ONLY when it concerns the SAME subject the
+    question asks about. An exam-fee notice therefore can never establish that
+    ``admission`` is open, and vice versa. When ``None``/empty (the P0/P1
+    direct-call contract) alignment is skipped and the pre-P2 behavior is
+    preserved exactly.
+    """
+    if status_subjects and not status_subjects & _item_status_subjects(item):
+        return False
+    if item.source == SourceType.NOTICES:
+        return bool(item.verified)
+    if item.source == SourceType.DOCUMENTS:
+        return bool(item.issued_at) and item.source_label in _STATUS_AUTHORITY_DOC_TYPES
+    if item.source == SourceType.WEBSITE:
+        return bool(item.issued_at) and bool(item.verified)
+    return False
+
+
+def filter_status_evidence(
+    items: Sequence[EvidenceItem],
+    kind: str = "status",
+    status_subjects: frozenset[str] | None = None,
+) -> tuple[list[EvidenceItem], list[EvidenceItem]]:
+    """Partition evidence into status-authoritative vs context-only items.
+
+    In ANY non-status mode this is a no-op (``(all_items, [])``) so ordinary
+    intelligent behavior is preserved exactly. In status mode it returns
+    ``(authority, context_only)`` where only ``authority`` may ground a
+    current-state claim; ``context_only`` (RAG snippets, programme-profile
+    facts, undated reference documents) is still supplied to the synthesis as
+    background with an explicit "not a current-status source" label.
+
+    ``status_subjects`` (P2-B) aligns every authority check to the subjects the
+    question actually asks about; pass ``None`` to keep the pure P0/P1
+    partitioning.
+    """
+    if kind != "status":
+        return list(items), []
+    authority: list[EvidenceItem] = []
+    context_only: list[EvidenceItem] = []
+    for item in items:
+        (authority if is_status_authority(item, status_subjects) else context_only).append(item)
+    return authority, context_only
+
+
+def dated_notice_conflicts(pool: EvidencePool) -> list[str]:
+    """Sub-questions backed by ≥2 DIFFERENT dated official sources.
+
+    Scoped to announcement-shaped, DATED evidence only (verified notices and
+    official-notification documents) so a schedule row plus its notice frame
+    can never produce a false conflict. Returns the sub-question texts whose
+    dated official sources disagree, so the synthesis prompt can surface the
+    conflict instead of silently picking a winner.
+    """
+    by_sub: dict[str, set[tuple[str, str, str]]] = {}
+    for item in pool.items:
+        if item.source not in (SourceType.NOTICES, SourceType.DOCUMENTS):
+            continue
+        if item.source == SourceType.DOCUMENTS and item.source_label not in _STATUS_AUTHORITY_DOC_TYPES:
+            continue
+        if not (item.issued_at and item.title):
+            continue
+        by_sub.setdefault(item.sub_question, set()).add(
+            (item.title, item.issued_at, _norm(item.text))
+        )
+    return [sub for sub, rows in by_sub.items() if len(rows) >= 2]
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +535,29 @@ def _evidence_from_notices(sub: SubQuery, db: Any, entities: Any, ctx: Any) -> l
         notices = []
     if not notices:
         return []
+    # P2-D/P2-B subject alignment: a status or deadline sub-question may be
+    # grounded only in official notices about the SAME subject. An exam backlog
+    # notice can never establish an admission deadline; when no notice matches
+    # the subject, NO notice evidence is returned (the honest fallback) instead
+    # of a wrong-subject answer. Deadline sub-questions without an explicit
+    # subject keep the programme-scoped list.
+    from app.multi_source.decompose import is_deadline_text
+    from app.orchestrator.current_status import status_subjects_of
+
+    qsubs = frozenset(status_subjects_of(sub.text))
+    if qsubs or is_deadline_text(sub.text):
+        if qsubs:
+            aligned = [
+                n for n in notices
+                if qsubs & status_subjects_of(
+                    f"{getattr(n, 'title', '') or ''} {getattr(n, 'notice_type', '') or ''}"
+                )
+            ]
+            if not aligned:
+                return []
+            notices = aligned
+    if not notices:
+        return []
     try:
         rows = get_verified_schedule(
             db,
@@ -370,11 +568,9 @@ def _evidence_from_notices(sub: SubQuery, db: Any, entities: Any, ctx: Any) -> l
         )
     except Exception:
         rows = []
-    if not rows:
-        return []
 
     lines: list[str] = []
-    for row in rows[:10]:
+    for row in (rows or [])[:10]:
         parts = []
         if getattr(row, "programme_id", None):
             parts.append(row.programme_id.upper())
@@ -400,21 +596,71 @@ def _evidence_from_notices(sub: SubQuery, db: Any, entities: Any, ctx: Any) -> l
     if notices:
         title = str(getattr(notices[0], "title", None) or "Date sheet")
 
-    if not lines:
+    items: list[EvidenceItem] = []
+    if lines:
+        items.append(EvidenceItem(
+            sub_question=sub.text,
+            source=SourceType.NOTICES,
+            text=" (verified date sheet) ".join(lines)[:1400],
+            title=title,
+            source_id="notices:date_sheet",
+            relevance=1.0,
+            confidence=1.0,
+            direct=True,
+        ))
+    # Notice-frame evidence: the newest verified + published notice title/date.
+    # Additive only — it never replaces schedule rows and never invents a URL
+    # (notices are attached files, not https pages). This is what lets
+    # current-status questions ("has the notification been issued?") be answered
+    # from the authoritative notice metadata even with no schedule rows.
+    items.extend(_notice_frame_items(sub, notices))
+    return items
+
+
+def _notice_frame_items(sub: SubQuery, notices: Sequence[Any]) -> list[EvidenceItem]:
+    """Notice-level framing evidence from verified + published notices."""
+    if not notices:
         return []
 
-    items: list[EvidenceItem] = []
-    items.append(EvidenceItem(
+    def _key(n: Any):
+        for attr in ("published_at", "notification_date", "created_at"):
+            value = getattr(n, attr, None)
+            if value is not None:
+                return value
+        return None
+
+    newest = None
+    for n in notices:
+        key = _key(n)
+        if key is None:
+            continue
+        if newest is None or key > _key(newest):
+            newest = n
+    if newest is None:
+        newest = notices[0]
+
+    title = str(getattr(newest, "title", None) or "").strip()
+    if not title:
+        return []
+    published = ""
+    for attr in ("published_at", "notification_date"):
+        value = getattr(newest, attr, None)
+        if value is not None:
+            published = value.isoformat()
+            break
+    text = f"Latest published university notice: {title}"
+    if published:
+        text += f" (published {published})"
+    return [EvidenceItem(
         sub_question=sub.text,
         source=SourceType.NOTICES,
-        text=" (verified date sheet) ".join(lines)[:1400],
+        text=text[:1400],
         title=title,
-        source_id="notices:date_sheet",
-        relevance=1.0,
-        confidence=1.0,
-        direct=True,
-    ))
-    return items
+        source_id=str(getattr(newest, "id", "") or ""),
+        issued_at=published,
+        verified=bool(getattr(newest, "is_verified", False)),
+        source_label=(getattr(newest, "notice_type", None) or "") if getattr(newest, "notice_type", None) else "",
+    )]
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +712,176 @@ def _evidence_from_rag(
 
 
 # ---------------------------------------------------------------------------
+# Structured collectors (DOCUMENTS / WEBSITE)
+# ---------------------------------------------------------------------------
+
+_DOC_EVIDENCE_LIMIT = 3
+_WEBSITE_EVIDENCE_LIMIT = 3
+_WEBSITE_PROBE_CANDIDATES = 30
+
+
+def _evidence_from_university_documents(
+    sub: SubQuery,
+    db: Any,
+    entities: Any,
+    ctx: Any,
+) -> list[EvidenceItem]:
+    """Verified + published official UniversityDocument records as evidence.
+
+    The canonical repository keeps NO extracted body text — only provenance
+    (title, doc_type, programme, published date and, for crawler-sourced rows,
+    the verified source URL). The collector therefore surfaces the document
+    RECORD itself: which official notification / other official document
+    exists, when it was published and where it lives. Document content is left
+    to the RAG sub-fragment which searches the knowledge base.
+    """
+    if db is None:
+        return []
+    from app.university_documents.service import list_published_documents
+
+    programme = _norm_programme(
+        (getattr(entities, "programme", None) if entities is not None else None)
+        or getattr(ctx, "programme", None)
+    )
+    sig = _sig_tokens(sub.text)
+
+    try:
+        rows = list_published_documents(
+            db,
+            q=None,
+            programme=programme,
+            limit=_DOC_EVIDENCE_LIMIT * 4,
+        )
+    except Exception:
+        return []
+    if not rows:
+        return []
+    # list_published_documents offers only a whole-phrase title LIKE (no
+    # tokenized search), so the candidate list is probed locally by significant
+    # token overlap. Order is preserved from the newest-first repository query.
+    scored: list[tuple[int, Any]] = []
+    for d in rows:
+        hay = (
+            f"{d.title or ''} {d.programme_name or ''} "
+            f"{d.programme_id or ''}".lower()
+        )
+        score = sum(hay.count(tok) for tok in sig)
+        if score:
+            scored.append((score, d))
+    if not scored:
+        return []
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    rows = [d for _score, d in scored[:_DOC_EVIDENCE_LIMIT]]
+
+    items: list[EvidenceItem] = []
+    for d in rows:
+        parts = [str(d.title or "").strip()]
+        if d.doc_type:
+            parts.append(f"[{d.doc_type}]")
+        published = d.published_at.isoformat() if d.published_at else None
+        if published:
+            parts.append(f"published {published}")
+        text = " — ".join(p for p in parts if p)
+        if not text:
+            continue
+        items.append(EvidenceItem(
+            sub_question=sub.text,
+            source=SourceType.DOCUMENTS,
+            text=text[:1400],
+            title=str(d.title or d.doc_type or "University document"),
+            source_id=str(d.id),
+            url=_https_only(d.source_url),
+            issued_at=published or "",
+            verified=bool(d.is_verified),
+            source_label=(d.doc_type or "") if d.doc_type else "",
+            programme=str(d.programme_id or "").strip() if (d.programme_id or "").strip() else "",
+            semester=(d.semester or "") if d.semester else "",
+            batch=(d.batch or "") if d.batch else "",
+            doc_id=str(d.id),
+        ))
+    return items
+
+
+def _evidence_from_website_pages(
+    sub: SubQuery,
+    db: Any,
+    entities: Any,
+    ctx: Any,
+) -> list[EvidenceItem]:
+    """Verified WebsitePage snippets as evidence, newest-first and keyword-
+    probed. Only pages the administrator classified ``verified`` with a healthy
+    crawl result count; the URL is the verified page URL (https only)."""
+    if db is None:
+        return []
+    from sqlalchemy import or_
+
+    from app.models.website_sync import WebsitePage
+
+    sig = _sig_tokens(sub.text)
+    qry = db.query(WebsitePage).filter(
+        WebsitePage.classification_status == "verified",
+        WebsitePage.status.in_(("new", "unchanged", "updated")),
+        WebsitePage.content.isnot(None),
+        WebsitePage.content != "",
+        or_(
+            WebsitePage.http_status.is_(None),
+            WebsitePage.http_status.between(200, 399),
+        ),
+    )
+    if sig:
+        # Narrow the candidate window with a title/category probe on the two
+        # most significant tokens (cheap; the bounded candidate cap stays).
+        probes = sig[:2]
+        qry = qry.filter(or_(*[
+            or_(
+                WebsitePage.title.ilike(f"%{p}%"),
+                WebsitePage.category.ilike(f"%{p}%"),
+            )
+            for p in probes
+        ]))
+    try:
+        rows = qry.order_by(
+            WebsitePage.last_synced.is_(None),
+            WebsitePage.last_synced.desc(),
+        ).limit(_WEBSITE_PROBE_CANDIDATES).all()
+    except Exception:
+        return []
+    if not rows:
+        return []
+
+    scored: list[tuple[int, WebsitePage]] = []
+    for page in rows:
+        hay = f"{page.title or ''} {page.category or ''} {page.content or ''}".lower()
+        score = sum(hay.count(tok) for tok in sig)
+        if score:
+            scored.append((score, page))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    items: list[EvidenceItem] = []
+    for _score, page in scored[:_WEBSITE_EVIDENCE_LIMIT]:
+        content = (page.content or "").strip()
+        if not content:
+            continue
+        items.append(EvidenceItem(
+            sub_question=sub.text,
+            source=SourceType.WEBSITE,
+            text=content[:900] if len(content) > 900 else content,
+            title=str(page.title or page.category or "CUS website page"),
+            source_id=str(page.id),
+            url=_https_only(page.url),
+            issued_at=page.last_synced.isoformat() if page.last_synced else "",
+            last_synced=page.last_synced.isoformat() if page.last_synced else "",
+            verified=True,
+            source_label=(page.category or "") if page.category else "",
+            programme="",
+            semester="",
+            batch="",
+            doc_id=str(page.id),
+        ))
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -492,6 +908,10 @@ async def collect_evidence(
             pool.add_many(_evidence_from_examination(sub, db, entities, ctx))
         elif sub.source == SourceType.NOTICES:
             pool.add_many(_evidence_from_notices(sub, db, entities, ctx))
+        elif sub.source == SourceType.DOCUMENTS:
+            pool.add_many(_evidence_from_university_documents(sub, db, entities, ctx))
+        elif sub.source == SourceType.WEBSITE:
+            pool.add_many(_evidence_from_website_pages(sub, db, entities, ctx))
         elif sub.source == SourceType.RAG:
             try:
                 items = await asyncio.to_thread(_evidence_from_rag, sub, rag_ctx or {})

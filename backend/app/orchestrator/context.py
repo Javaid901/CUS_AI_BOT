@@ -457,6 +457,70 @@ def is_referential_followup(message: str) -> bool:
     return bool(_REFERENTIAL_PATTERN.search(str(message or "")))
 
 
+def is_clearly_non_university(message: str) -> bool:
+    """True when the message is CLEARLY a non-university academic/general question.
+
+    This is a conservative check for questions that are unambiguously about
+    general academic/general knowledge topics with NO university context.
+
+    Examples that return True:
+        "explain laws of motion"
+        "what is photosynthesis"
+        "how to cook biryani"
+        "what is the capital of France"
+        "explain binary search"
+        "who is the president of india"
+
+    Examples that return False (university-related or ambiguous):
+        "what is the admission process"  -> university-related
+        "mca fee"  -> programme + topic
+        "date sheet"  -> university-specific term
+        "explain admission process"  -> university-related term
+        "how to apply"  -> university-related term
+
+    This is INTENTIONALLY conservative - it only returns True for queries that
+    are unambiguously general knowledge with no university context markers.
+    """
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+
+    # If it's already university-related by our existing definition, it's not
+    # "clearly non-university"
+    if is_university_related(message):
+        return False
+
+    # Patterns that indicate clearly non-university academic/general questions
+    # These are question starters followed by general academic/general topics
+    non_university_patterns = [
+        # "explain X" where X is a general academic concept
+        r"^explain\s+(?:the\s+)?(?:laws?\s+of\s+motion|photosynthesis|gravity|relativity|quantum|thermodynamics|evolution|cell\s+(?:theory|biology|division)|mitosis|meiosis|dna|rna|protein|enzyme|hormone|neuron|synapse|atom|molecule|chemical\s+(?:bond|reaction|equation)|periodic\s+table|acid|base|salt|ph|oxidation|reduction|electrolysis|electrochemical|binary\s+search|newton|einstein|darwin|mendel|pasteur|curie|faraday|maxwell|planck|bohr|schrodinger|heisenberg|feynman|hawking|tesla|edison|bell|watt|joule|kelvin|celsius|fahrenheit|pascal|newton|ampere|volt|ohm|watt|joule|coulomb|farad|henry|siemens|tesla|weber|lumen|lux|becquerel|gray|sieve|hertz)\b",
+        
+        # "what is X" / "what are X" for general concepts
+        r"^what\s+(?:is|are)\s+(?:the\s+)?(?:photosynthesis|gravity|relativity|quantum\s+(?:mechanics|physics|theory)|thermodynamics|evolution|cell\s+(?:theory|biology|division)|mitosis|meiosis|dna|rna|protein|enzyme|hormone|neuron|synapse|atom|molecule|chemical\s+(?:bond|reaction|equation)|periodic\s+table|acid|base|salt|ph|oxidation|reduction|electrolysis|electrochemical|binary\s+search|linear\s+search|sorting|algorithm|data\s+structure|machine\s+learning|artificial\s+intelligence|neural\s+network|deep\s+learning|computer\s+science|programming|software|hardware|database|sql|nosql|api|rest|graphql|http|https|tcp|ip|dns|ssl|tls|encryption|hashing|authentication|authorization|oauth|jwt|session|cookie|cache|load\s+balancer|microservice|monolith|docker|kubernetes|ci\/cd|git|version\s+control)\b",
+        
+        # "how to X" for general skills
+        r"^how\s+to\s+(?:cook|bake|make|create|build|write|code|program|debug|deploy|install|configure|setup|learn|study|solve|calculate|derive|prove|integrate|differentiate|integrate|matrix|determinant|eigenvalue|eigenvector|limit|derivative|integral|series|sequence|probability|statistics|regression|classification|clustering)\b",
+        
+        # "who is" for general famous people (not university officials)
+        r"^who\s+is\s+(?:the\s+)?(?:president|prime\s+minister|chief\s+minister|governor|mayor)\s+of\s+(?:india|usa|uk|china|france|germany|japan|russia|brazil|canada|australia)\b",
+        
+        # "what is the capital of" 
+        r"^what\s+is\s+the\s+capital\s+of\s+\w+",
+        
+        # General math/physics/chemistry/biology/CS concepts
+        r"^(?:explain|what\s+is|define)\s+(?:newton|einstein|darwin|mendel|pasteur|curie|faraday|maxwell|planck|bohr|schrodinger|heisenberg|feynman|hawking|tesla|edison|bell|watt|joule|kelvin|celsius|fahrenheit|pascal|newton|ampere|volt|ohm|watt|joule|coulomb|farad|henry|siemens|tesla|weber|lumen|lux|becquerel|gray|sieve|hertz|newton'?s\s+(?:first|second|third|1st|2nd|3rd)\s+law|law\s+of\s+(?:motion|gravity|thermodynamics|conservation))\b",
+    ]
+    
+    for pattern in non_university_patterns:
+        if re.search(pattern, text):
+            return True
+    
+    return False
+    """True when the message contains an anaphoric reference (it/those/...)."""
+    return bool(_REFERENTIAL_PATTERN.search(str(message or "")))
+
+
 def detect_exam_reference(message: str) -> bool:
     """True when the message asks about exam timing / date-sheet / schedule.
 

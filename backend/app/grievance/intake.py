@@ -107,6 +107,28 @@ def hash_tracking_token(token: str) -> str:
 _RECOMMEND_MIN_SCORE = 0.55
 
 
+def _get_active_admin_for_authority(db: Session, authority_id: str) -> dict | None:
+    """Return the first active Authority Admin for the given authority, or None."""
+    from app.models import User
+    admin = (
+        db.query(User)
+        .filter(
+            User.role == "authority_admin",
+            User.is_active.is_(True),
+            User.authority_id == authority_id,
+        )
+        .first()
+    )
+    if not admin:
+        return None
+    return {
+        "admin_id": str(admin.id),
+        "full_name": admin.full_name,
+        "designation": admin.designation,
+        "email": admin.email,
+    }
+
+
 def recommend_authorities(db: Session, text: str, top_k: int = 3) -> list[dict[str, Any]]:
     """Best-fit eligible active authorities for a grievance text.
 
@@ -116,7 +138,8 @@ def recommend_authorities(db: Session, text: str, top_k: int = 3) -> list[dict[s
     the student picker).
 
     Returns up to top_k entries with stable keys
-    (authority_id, authority_name, department_name, email, match_score).
+    (authority_id, authority_name, department_name, email, match_score,
+    admin_full_name, admin_designation, admin_email, admin_id).
     Empty list when nothing clears the threshold.
     """
     eligible = grievance_eligible_ids(db)
@@ -128,12 +151,17 @@ def recommend_authorities(db: Session, text: str, top_k: int = 3) -> list[dict[s
             continue
         if m.get("id") not in eligible:
             continue
+        admin = _get_active_admin_for_authority(db, m.get("id"))
         out.append({
             "authority_id": m.get("id", ""),
             "authority_name": m.get("authority_name", ""),
             "department_name": m.get("department_name", ""),
             "email": m.get("email", ""),
             "match_score": round(score, 2),
+            "admin_full_name": admin.get("full_name") if admin else None,
+            "admin_designation": admin.get("designation") if admin else None,
+            "admin_email": admin.get("email") if admin else None,
+            "admin_id": admin.get("admin_id") if admin else None,
         })
     return out
 
